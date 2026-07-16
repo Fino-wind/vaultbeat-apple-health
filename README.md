@@ -22,19 +22,19 @@ iPhone (Apple Health) ──E2EE──▶ cloud (ciphertext only) ──E2EE─�
 With [uv](https://docs.astral.sh/uv/) (recommended — no clone needed):
 
 ```bash
-uvx --from 'git+https://github.com/Fino-wind/tether-mcp' tether-mcp-local status
+uvx --from 'git+https://github.com/Fino-wind/tether-mcp' tether-mcp status
 ```
 
 Or with pip:
 
 ```bash
-pip install 'tether-mcp-local[qr] @ git+https://github.com/Fino-wind/tether-mcp'
+pip install 'tether-mcp[qr] @ git+https://github.com/Fino-wind/tether-mcp'
 ```
 
 ### 2. Bind your phone
 
 ```bash
-tether-mcp-local bind
+tether-mcp bind
 ```
 
 This generates a keypair on your machine and prints a QR code. In the Tether iOS app, open **Settings → Data & AI → MCP Server** and scan it (or import a QR screenshot from Photos). The app authorizes this machine and starts sealing your health envelopes to its public key. The private key stays in `~/.tether/mcp-local/` (owner-only `0600` permissions, OS keychain where available) — it is never uploaded anywhere.
@@ -44,7 +44,7 @@ This generates a keypair on your machine and prints a QR code. In the Tether iOS
 **Claude Code** (one line):
 
 ```bash
-claude mcp add tether-health -- uvx --from 'git+https://github.com/Fino-wind/tether-mcp' tether-mcp-local serve --transport stdio
+claude mcp add tether-health -- uvx --from 'git+https://github.com/Fino-wind/tether-mcp' tether-mcp serve --transport stdio
 ```
 
 **Claude Desktop** (`claude_desktop_config.json`):
@@ -54,13 +54,17 @@ claude mcp add tether-health -- uvx --from 'git+https://github.com/Fino-wind/tet
   "mcpServers": {
     "tether-health": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/Fino-wind/tether-mcp", "tether-mcp-local", "serve", "--transport", "stdio"]
+      "args": ["--from", "git+https://github.com/Fino-wind/tether-mcp", "tether-mcp", "serve", "--transport", "stdio"]
     }
   }
 }
 ```
 
-Any other MCP client: run `tether-mcp-local serve --transport stdio`, or `serve --transport http` for a loopback streamable-HTTP endpoint with bearer-token auth.
+Any other MCP client: run `tether-mcp serve --transport stdio`, or `serve --transport http` for a loopback streamable-HTTP endpoint with bearer-token auth.
+
+> **Claude Desktop note**: it does not inherit your shell `PATH`. If `uvx` isn't found, use the absolute path (`which uvx`) as `command`.
+
+Debugging: `npx @modelcontextprotocol/inspector uvx --from 'git+https://github.com/Fino-wind/tether-mcp' tether-mcp serve --transport stdio`
 
 Then just ask your agent: *“How did we sleep last night?”*
 
@@ -76,7 +80,7 @@ Then just ask your agent: *“How did we sleep last night?”*
 | `get_symptoms` | HealthKit symptom days grouped by data owner *(sensitive)* |
 | `get_notes` | Free-text day annotations with their writer *(sensitive)* |
 
-Reads are cache-first: decrypted records are cached locally (owner-only files, 600 s TTL, `TETHER_MCP_CACHE_TTL` to override) so repeat queries answer in ~0.2 s with zero network; pass `fresh=true` to force a cloud round trip. The same service layer backs a full CLI (`tether-mcp-local sync / water / menstrual / …`) if you prefer scripts over MCP.
+Reads are cache-first: decrypted records are cached locally (owner-only files, 600 s TTL, `TETHER_MCP_CACHE_TTL` to override) so repeat queries answer in ~0.2 s with zero network; pass `fresh=true` to force a cloud round trip. The same service layer backs a full CLI (`tether-mcp sync / water / menstrual / …`) if you prefer scripts over MCP.
 
 ## Privacy & security model
 

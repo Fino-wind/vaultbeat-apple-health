@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tether-mcp-local"
+name = "tether-mcp"
 version = "0.1.0"
 description = "Local MCP server for Tether — AI Health Sync: your AI agent reads your end-to-end-encrypted Apple Health data (sleep, cycle, weight, water), decrypted only on your machine"
 readme = "README.md"
@@ -47,6 +47,8 @@ qr = [
 ]
 
 [project.scripts]
+tether-mcp = "tether_mcp_local.cli:main"
+# Back-compat alias for the original internal name.
 tether-mcp-local = "tether_mcp_local.cli:main"
 
 [tool.pytest.ini_options]
