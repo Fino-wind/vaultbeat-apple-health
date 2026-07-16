@@ -144,14 +144,14 @@ def handle_sleep_detail(args: argparse.Namespace) -> int:
 
 
 def handle_water(args: argparse.Namespace) -> int:
-    summary = asyncio.run(_service(args).water_intake_summary(limit=args.limit, fresh=args.fresh))
+    summary = asyncio.run(_service(args).water_intake_summary(limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)))
     _emit_decrypted(summary, args, label="water intake")
     return 0 if not summary.get("errors") else 3
 
 
 def handle_weight(args: argparse.Namespace) -> int:
     summary = asyncio.run(
-        _service(args).weight_trend_summary(limit=args.limit, goal_kg=args.goal_kg, fresh=args.fresh)
+        _service(args).weight_trend_summary(limit=args.limit, goal_kg=args.goal_kg, fresh=args.fresh, owner=getattr(args, "owner", None))
     )
     _emit_decrypted(summary, args, label="weight trend")
     return 0 if not summary.get("errors") else 3
@@ -162,43 +162,43 @@ def handle_menstrual(args: argparse.Namespace) -> int:
         "Note: menstrual data is sensitive; it is decrypted locally and never re-exported. "
         "It only appears if the user explicitly opted in on iOS."
     )
-    summary = asyncio.run(_service(args).menstrual_cycle_summary(limit=args.limit, fresh=args.fresh))
+    summary = asyncio.run(_service(args).menstrual_cycle_summary(limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)))
     _emit_decrypted(summary, args, label="menstrual cycle")
     return 0 if not summary.get("errors") else 3
 
 
 def handle_activity(args: argparse.Namespace) -> int:
-    summary = asyncio.run(_service(args).activity_summary(limit=args.limit, fresh=args.fresh))
+    summary = asyncio.run(_service(args).activity_summary(limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)))
     _emit_decrypted(summary, args, label="activity rings")
     return 0 if not summary.get("errors") else 3
 
 
 def handle_resting_hr(args: argparse.Namespace) -> int:
-    result = asyncio.run(_service(args).resting_hr_records(limit=args.limit, fresh=args.fresh))
+    result = asyncio.run(_service(args).resting_hr_records(limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)))
     _emit_decrypted(result, args, label="resting heart rate")
     return 0 if not result.get("errors") else 3
 
 
 def handle_workouts(args: argparse.Namespace) -> int:
-    result = asyncio.run(_service(args).workout_records(limit=args.limit, fresh=args.fresh))
+    result = asyncio.run(_service(args).workout_records(limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)))
     _emit_decrypted(result, args, label="workouts")
     return 0 if not result.get("errors") else 3
 
 
 def handle_mindfulness(args: argparse.Namespace) -> int:
-    result = asyncio.run(_service(args).mindfulness_summary(limit=args.limit, fresh=args.fresh))
+    result = asyncio.run(_service(args).mindfulness_summary(limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)))
     _emit_decrypted(result, args, label="mindfulness")
     return 0 if not result.get("errors") else 3
 
 
 def handle_hrv(args: argparse.Namespace) -> int:
-    result = asyncio.run(_service(args).hrv_records(limit=args.limit, fresh=args.fresh))
+    result = asyncio.run(_service(args).hrv_records(limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)))
     _emit_decrypted(result, args, label="HRV (SDNN)")
     return 0 if not result.get("errors") else 3
 
 
 def handle_wrist_temp(args: argparse.Namespace) -> int:
-    result = asyncio.run(_service(args).wrist_temp_records(limit=args.limit, fresh=args.fresh))
+    result = asyncio.run(_service(args).wrist_temp_records(limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)))
     _emit_decrypted(result, args, label="wrist temperature")
     return 0 if not result.get("errors") else 3
 
@@ -376,6 +376,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     water_parser.add_argument("--limit", type=int)
     water_parser.add_argument(
+        "--owner",
+        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+    )
+    water_parser.add_argument(
         "--fresh",
         action="store_true",
         help="Bypass the local record cache and force a cloud fetch.",
@@ -388,6 +392,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Decrypt recent body weight (kg) and compute the trend (latest/avg/min/max/weekly rate).",
     )
     weight_parser.add_argument("--limit", type=int, help="Keep at most N most recent body days.")
+    weight_parser.add_argument(
+        "--owner",
+        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+    )
     weight_parser.add_argument(
         "--fresh",
         action="store_true",
@@ -408,6 +416,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     menstrual_parser.add_argument("--limit", type=int)
     menstrual_parser.add_argument(
+        "--owner",
+        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+    )
+    menstrual_parser.add_argument(
         "--fresh",
         action="store_true",
         help="Bypass the local record cache and force a cloud fetch.",
@@ -419,6 +431,10 @@ def build_parser() -> argparse.ArgumentParser:
         "activity", help="Decrypt recent daily activity rings (steps, energy, exercise, stand, distance)."
     )
     activity_parser.add_argument("--limit", type=int)
+    activity_parser.add_argument(
+        "--owner",
+        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+    )
     activity_parser.add_argument(
         "--fresh",
         action="store_true",
@@ -432,6 +448,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resting_hr_parser.add_argument("--limit", type=int)
     resting_hr_parser.add_argument(
+        "--owner",
+        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+    )
+    resting_hr_parser.add_argument(
         "--fresh",
         action="store_true",
         help="Bypass the local record cache and force a cloud fetch.",
@@ -443,6 +463,10 @@ def build_parser() -> argparse.ArgumentParser:
         "workouts", help="Decrypt recent workout sessions."
     )
     workouts_parser.add_argument("--limit", type=int)
+    workouts_parser.add_argument(
+        "--owner",
+        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+    )
     workouts_parser.add_argument(
         "--fresh",
         action="store_true",
@@ -456,6 +480,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mindfulness_parser.add_argument("--limit", type=int)
     mindfulness_parser.add_argument(
+        "--owner",
+        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+    )
+    mindfulness_parser.add_argument(
         "--fresh",
         action="store_true",
         help="Bypass the local record cache and force a cloud fetch.",
@@ -468,6 +496,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hrv_parser.add_argument("--limit", type=int)
     hrv_parser.add_argument(
+        "--owner",
+        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+    )
+    hrv_parser.add_argument(
         "--fresh",
         action="store_true",
         help="Bypass the local record cache and force a cloud fetch.",
@@ -479,6 +511,10 @@ def build_parser() -> argparse.ArgumentParser:
         "wrist-temp", help="Decrypt recent sleeping wrist temperature samples."
     )
     wrist_temp_parser.add_argument("--limit", type=int)
+    wrist_temp_parser.add_argument(
+        "--owner",
+        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+    )
     wrist_temp_parser.add_argument(
         "--fresh",
         action="store_true",

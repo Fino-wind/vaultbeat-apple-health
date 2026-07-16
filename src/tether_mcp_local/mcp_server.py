@@ -122,47 +122,51 @@ def run_mcp_server(
         return service.status()
 
     @mcp.tool()
-    async def tether_sync_sleep(limit: int = 50, fresh: bool = False) -> dict[str, Any]:
+    async def tether_sync_sleep(
+        limit: int = 50, owner: str | None = None, fresh: bool = False
+    ) -> dict[str, Any]:
         """Fetch encrypted Tether sleep records, decrypt them locally, and return
         per-day primary session summaries matching the iOS app's display.
 
         Returns `daily_summary` (one primary session per local date, selected by
         iOS priority: Watch > iPhone > inBedOnly) and `sessions` (all raw records).
         The `limit` controls how many raw blobs are fetched; 50 covers ~2-3 weeks.
+        Use `owner` prefix to filter by person (e.g. "dce9" for one user,
+        "f835" for the other) — without it, both partners' data is mixed and
+        per-day selection may pick the wrong person's session.
         Results are served from a short-lived local cache (default 10 min);
         pass fresh=True to force a cloud round trip.
         """
 
-        return await service.sleep_records(limit=limit, fresh=fresh)
+        return await service.sleep_records(limit=limit, owner=owner, fresh=fresh)
 
     @mcp.tool()
-    async def get_partner_water_intake(limit: int = 30, fresh: bool = False) -> dict[str, Any]:
-        """Decrypt the partner's recent daily water intake locally and compute the average.
+    async def get_water_intake(
+        limit: int = 30, owner: str | None = None, fresh: bool = False
+    ) -> dict[str, Any]:
+        """Decrypt recent daily water intake locally and compute the average.
 
         Returns one entry per day (newest first) with refill count, container volume, and
-        derived intake in liters, plus `average_daily_intake_liters` over the window. Only
-        locally-decrypted data is returned; ciphertext and keys never leave the device.
+        derived intake in liters, plus `average_daily_intake_liters` over the window.
+        Use `owner` prefix to filter by person (e.g. "dce9" or "f835").
+        Each record carries `owner_user_id` to identify whose data it is.
         """
 
-        return await service.water_intake_summary(limit=limit, fresh=fresh)
+        return await service.water_intake_summary(limit=limit, owner=owner, fresh=fresh)
 
     @mcp.tool()
-    async def get_partner_weight_trend(
-        limit: int = 90, goal_kg: float | None = None, fresh: bool = False
+    async def get_weight_trend(
+        limit: int = 90, goal_kg: float | None = None, owner: str | None = None, fresh: bool = False
     ) -> dict[str, Any]:
-        """Decrypt the partner's recent body-weight records locally and compute the trend.
+        """Decrypt recent body-weight records locally and compute the trend.
 
-        SENSITIVE health data, but unlike menstrual data, body weight is shared
-        bidirectionally by DEFAULT between bound partners (sleep-style visibility, no
-        per-user opt-in). Returns one entry per day (newest first, kilograms) plus
-        latest/average/min/max, the OLS weekly rate (kg/week), and — when `goal_kg` is
-        given — the distance to goal (latest - goal; negative = already below goal,
-        good for weight loss). The goal lives only on the owner's phone, so omit
-        `goal_kg` unless the user told you theirs. Only locally-decrypted data is
-        returned; ciphertext and keys never leave the device.
+        Returns one entry per day (newest first, kilograms) plus latest/average/min/max,
+        the OLS weekly rate (kg/week), and — when `goal_kg` is given — the distance to goal.
+        Use `owner` prefix to filter by person (e.g. "dce9" or "f835").
+        Each record carries `owner_user_id` to identify whose data it is.
         """
 
-        return await service.weight_trend_summary(limit=limit, goal_kg=goal_kg, fresh=fresh)
+        return await service.weight_trend_summary(limit=limit, goal_kg=goal_kg, owner=owner, fresh=fresh)
 
     @mcp.tool()
     async def get_symptoms(limit: int = 120, fresh: bool = False) -> dict[str, Any]:
@@ -193,16 +197,109 @@ def run_mcp_server(
         return await service.notes_summary(limit=limit, target_kind=target_kind, fresh=fresh)
 
     @mcp.tool()
-    async def get_partner_menstrual_cycle(limit: int = 60, fresh: bool = False) -> dict[str, Any]:
-        """Decrypt the partner's recent menstrual cycle locally and predict the next period.
+    async def get_menstrual_cycle(
+        limit: int = 60, owner: str | None = None, fresh: bool = False
+    ) -> dict[str, Any]:
+        """Decrypt recent menstrual cycle data locally and predict the next period.
 
-        SENSITIVE: menstrual data only reaches this server if the partner explicitly opted
+        SENSITIVE: menstrual data only reaches this server if the user explicitly opted
         in on iOS; it stays on-device and is never re-exported. Returns recent samples plus
-        a next-period prediction (last cycle start + average cycle length). When history is
-        insufficient the prediction is reported as unavailable rather than guessed.
+        a next-period prediction. Use `owner` prefix to filter by person.
         """
 
-        return await service.menstrual_cycle_summary(limit=limit, fresh=fresh)
+        return await service.menstrual_cycle_summary(limit=limit, owner=owner, fresh=fresh)
+
+    @mcp.tool()
+    def tether_start_binding(server_name: str = "Local AI Server") -> dict[str, Any]:
+        """Initialize a binding session: generates a keypair (if needed) and returns a
+        QR payload that the user scans in the Tether iOS app to authorize this AI server.
+
+        Returns `qr_payload_json` — a JSON string the AI should render as a QR code
+        for the user to scan, plus `poll_id` to pass to `tether_poll_binding`.
+        After the user scans, call `tether_poll_binding` to complete authorization.
+        """
+
+        session = service.start_binding(server_name=server_name)
+        return {
+            "poll_id": session.poll_id,
+            "qr_payload": session.qr_payload,
+            "qr_payload_json": session.qr_payload_json,
+        }
+
+    @mcp.tool()
+    async def tether_poll_binding() -> dict[str, Any]:
+        """Check whether the user has scanned the QR code and authorized this server.
+
+        Call this after `tether_start_binding`. Returns `status`: "pending" (user hasn't
+        scanned yet — wait and retry) or "bound" (success — server is now authorized
+        and can decrypt health data). Polls once; call repeatedly with short delays
+        until status is "bound" or you decide to time out.
+        """
+
+        result = await service.poll_once()
+        return {
+            "status": result.status,
+            "server_id": result.server_id,
+            "owner_user_id": result.owner_user_id,
+        }
+
+    @mcp.tool()
+    async def get_sleep_detail(
+        limit: int = 5, owner: str | None = None, fresh: bool = False
+    ) -> dict[str, Any]:
+        """Per-night timeline: each HR/RR sample tagged with the concurrent sleep stage.
+
+        Returns chronological `timeline` array (hr, rr, stage, time), `stage_intervals`
+        (contiguous stage bands with start/end), `stage_minutes`, and `stage_vitals`
+        (per-stage HR/RR min/mean/max). Use `owner` prefix to filter by person
+        (e.g. "dce9" for linyou, "f835" for partner). This is the primary tool for
+        detailed sleep analysis — richer than tether_sync_sleep.
+        """
+
+        return await service.sleep_detail_records(limit=limit, owner=owner, fresh=fresh)
+
+    @mcp.tool()
+    async def get_activity(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+        """Decrypt recent daily activity rings (steps, active energy kcal, exercise minutes,
+        stand hours, distance km). One entry per day, newest first.
+        Use `owner` prefix to filter by person. Each record carries `owner_user_id`."""
+
+        return await service.activity_summary(limit=limit, owner=owner, fresh=fresh)
+
+    @mcp.tool()
+    async def get_resting_hr(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+        """Decrypt recent resting heart rate samples (bpm). Returns per-day records
+        plus average over the window. Use `owner` prefix to filter by person."""
+
+        return await service.resting_hr_records(limit=limit, owner=owner, fresh=fresh)
+
+    @mcp.tool()
+    async def get_workouts(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+        """Decrypt recent workout sessions (type, duration, calories, distance).
+        Use `owner` prefix to filter by person."""
+
+        return await service.workout_records(limit=limit, owner=owner, fresh=fresh)
+
+    @mcp.tool()
+    async def get_hrv(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+        """Decrypt recent HRV (SDNN in ms) samples. Returns per-day records
+        plus average over the window. Use `owner` prefix to filter by person."""
+
+        return await service.hrv_records(limit=limit, owner=owner, fresh=fresh)
+
+    @mcp.tool()
+    async def get_wrist_temp(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+        """Decrypt recent sleeping wrist temperature samples (°C baseline deviation).
+        Returns per-day records plus average over the window. Use `owner` prefix to filter."""
+
+        return await service.wrist_temp_records(limit=limit, owner=owner, fresh=fresh)
+
+    @mcp.tool()
+    async def get_mindfulness(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+        """Decrypt recent daily mindfulness summaries (session count, total minutes).
+        Use `owner` prefix to filter by person."""
+
+        return await service.mindfulness_summary(limit=limit, owner=owner, fresh=fresh)
 
     if selected_transport == "stdio":
         mcp.run(transport="stdio")

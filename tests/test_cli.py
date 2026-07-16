@@ -168,7 +168,7 @@ def test_water_subcommand_prints_summary(
     monkeypatch: Any, tmp_path: Path, capsys: Any
 ) -> None:
     async def fake_summary(
-        self: TetherLocalService, *, limit: int | None = None, fresh: bool = False
+        self: TetherLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
     ) -> dict[str, Any]:
         return {"day_count": 1, "average_daily_intake_liters": 3.0, "errors": []}
 
@@ -185,7 +185,7 @@ def test_menstrual_subcommand_prints_sensitivity_note_and_summary(
     monkeypatch: Any, tmp_path: Path, capsys: Any
 ) -> None:
     async def fake_summary(
-        self: TetherLocalService, *, limit: int | None = None, fresh: bool = False
+        self: TetherLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
     ) -> dict[str, Any]:
         return {"day_count": 0, "predicted_next_period_start_date": None, "errors": []}
 
@@ -205,7 +205,7 @@ def test_water_subcommand_returns_3_on_decode_errors(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     async def fake_summary(
-        self: TetherLocalService, *, limit: int | None = None, fresh: bool = False
+        self: TetherLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
     ) -> dict[str, Any]:
         return {"day_count": 0, "errors": ["env-1: TetherCryptoError"]}
 

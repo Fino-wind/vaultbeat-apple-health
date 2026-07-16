@@ -213,5 +213,5 @@ def test_run_mcp_server_registers_water_and_menstrual_tools(
     run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
 
     assert "tether_sync_sleep" in registered
-    assert "get_partner_water_intake" in registered
-    assert "get_partner_menstrual_cycle" in registered
+    assert "get_water_intake" in registered
+    assert "get_menstrual_cycle" in registered

@@ -68,19 +68,30 @@ Debugging: `npx @modelcontextprotocol/inspector uvx --from 'git+https://github.c
 
 Then just ask your agent: *“How did we sleep last night?”*
 
-## MCP tools
+## MCP tools (16)
 
 | Tool | Returns |
 |---|---|
 | `tether_status` | Local binding state (never exposes keys or tokens) |
+| `tether_start_binding` | A fresh QR binding payload for the iOS app to scan |
+| `tether_poll_binding` | One poll for the iOS authorization to complete binding |
 | `tether_sync_sleep` | Recent sleep sessions incl. heart-rate samples, per-day primary-session selection matching the iOS app |
-| `get_partner_water_intake` | Daily water intake + computed daily average |
-| `get_partner_weight_trend` | Daily weights + latest/avg/min/max + weekly trend rate |
-| `get_partner_menstrual_cycle` | Cycle samples + next-period prediction *(sensitive — explicit iOS opt-in required)* |
+| `get_sleep_detail` | Per-night heart-rate + respiratory-rate + sleep-stage timeline |
+| `get_water_intake` | Daily water intake + computed daily average |
+| `get_weight_trend` | Daily weights + latest/avg/min/max + weekly trend rate |
+| `get_menstrual_cycle` | Cycle samples + next-period prediction *(sensitive — explicit iOS opt-in required)* |
 | `get_symptoms` | HealthKit symptom days grouped by data owner *(sensitive)* |
 | `get_notes` | Free-text day annotations with their writer *(sensitive)* |
+| `get_activity` | Daily activity rings: steps / energy / exercise minutes / stand hours / distance |
+| `get_resting_hr` | Resting heart-rate records + window mean |
+| `get_workouts` | Workout records: type / duration / calories / distance |
+| `get_mindfulness` | Mindful sessions and minutes per day |
+| `get_hrv` | Heart-rate variability (SDNN) records + window mean |
+| `get_wrist_temp` | Sleeping wrist-temperature baseline deviation |
 
-Reads are cache-first: decrypted records are cached locally (owner-only files, 600 s TTL, `TETHER_MCP_CACHE_TTL` to override) so repeat queries answer in ~0.2 s with zero network; pass `fresh=true` to force a cloud round trip. The same service layer backs a full CLI (`tether-mcp sync / water / menstrual / …`) if you prefer scripts over MCP.
+Every data tool accepts `owner` (a user-ID prefix) to filter to one person — the server may hold both your and your partner's shared records, and omitting `owner` mixes them into one pool, so per-person questions should always pass it. (Earlier releases named some tools `get_partner_*`; they were renamed in the 16-tool release since they return whichever owners' records this server holds, not specifically the partner's.)
+
+Reads are cache-first: decrypted records are cached locally (owner-only files, 600 s TTL, `TETHER_MCP_CACHE_TTL` to override) so repeat queries answer in ~0.2 s with zero network; pass `fresh=true` to force a cloud round trip. The same service layer backs a full CLI (`tether-mcp sleep / water / weight / …` — every data subcommand takes `--owner` too) if you prefer scripts over MCP.
 
 ## Privacy & security model
 

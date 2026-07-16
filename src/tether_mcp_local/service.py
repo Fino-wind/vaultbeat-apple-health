@@ -145,6 +145,7 @@ class WaterDay:
     day_start_date: str
     container_volume_liters: float
     refill_count: int
+    owner_user_id: str | None = None
 
     @property
     def intake_liters(self) -> float:
@@ -159,6 +160,7 @@ class WaterDay:
             "container_volume_liters": self.container_volume_liters,
             "refill_count": self.refill_count,
             "intake_liters": self.intake_liters,
+            "owner_user_id": self.owner_user_id,
         }
 
 
@@ -177,6 +179,7 @@ class BodyDay:
     weight_kg: float
     body_fat_percent: float | None
     bmi: float | None
+    owner_user_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -185,6 +188,7 @@ class BodyDay:
             "weight_kg": self.weight_kg,
             "body_fat_percent": self.body_fat_percent,
             "bmi": self.bmi,
+            "owner_user_id": self.owner_user_id,
         }
 
 
@@ -209,12 +213,14 @@ class MenstrualDay:
     day_id: str
     day_start_date: str
     samples: list[MenstrualSample]
+    owner_user_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "day_id": self.day_id,
             "day_start_date": self.day_start_date,
             "samples": [sample.to_dict() for sample in self.samples],
+            "owner_user_id": self.owner_user_id,
         }
 
 
@@ -229,6 +235,7 @@ class ActivityDay:
     exercise_minutes: int
     stand_minutes: int
     distance_meters: float | None
+    owner_user_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -239,6 +246,7 @@ class ActivityDay:
             "exercise_minutes": self.exercise_minutes,
             "stand_minutes": self.stand_minutes,
             "distance_meters": self.distance_meters,
+            "owner_user_id": self.owner_user_id,
         }
 
 
@@ -249,9 +257,10 @@ class RestingHrRecord:
     record_id: str
     date: str
     bpm: float
+    owner_user_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"record_id": self.record_id, "date": self.date, "bpm": self.bpm}
+        return {"record_id": self.record_id, "date": self.date, "bpm": self.bpm, "owner_user_id": self.owner_user_id}
 
 
 @dataclass(frozen=True)
@@ -265,6 +274,7 @@ class WorkoutRecord:
     duration_seconds: float
     active_kcal: float | None
     distance_meters: float | None
+    owner_user_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -275,6 +285,7 @@ class WorkoutRecord:
             "duration_seconds": self.duration_seconds,
             "active_kcal": self.active_kcal,
             "distance_meters": self.distance_meters,
+            "owner_user_id": self.owner_user_id,
         }
 
 
@@ -286,6 +297,7 @@ class MindfulnessDay:
     day_start_date: str
     session_count: int
     total_minutes: float
+    owner_user_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -293,6 +305,7 @@ class MindfulnessDay:
             "day_start_date": self.day_start_date,
             "session_count": self.session_count,
             "total_minutes": self.total_minutes,
+            "owner_user_id": self.owner_user_id,
         }
 
 
@@ -303,9 +316,10 @@ class HRVRecord:
     record_id: str
     date: str
     sdnn_ms: float
+    owner_user_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"record_id": self.record_id, "date": self.date, "sdnn_ms": self.sdnn_ms}
+        return {"record_id": self.record_id, "date": self.date, "sdnn_ms": self.sdnn_ms, "owner_user_id": self.owner_user_id}
 
 
 @dataclass(frozen=True)
@@ -315,12 +329,14 @@ class WristTempRecord:
     record_id: str
     date: str
     temperature_delta_celsius: float
+    owner_user_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "record_id": self.record_id,
             "date": self.date,
             "temperature_delta_celsius": self.temperature_delta_celsius,
+            "owner_user_id": self.owner_user_id,
         }
 
 
@@ -402,7 +418,7 @@ def _require_mapping(payload: Any, metric: str) -> dict[str, Any]:
     return payload
 
 
-def parse_water_day(payload: Any) -> WaterDay:
+def parse_water_day(payload: Any, *, owner_user_id: str | None = None) -> WaterDay:
     """Decode a decrypted water blob into a typed WaterDay (no aggregation)."""
 
     data = _require_mapping(payload, METRIC_WATER)
@@ -417,6 +433,7 @@ def parse_water_day(payload: Any) -> WaterDay:
         day_start_date=str(data["dayStartDate"]),
         container_volume_liters=float(container_volume),
         refill_count=len(refill_events),
+        owner_user_id=owner_user_id,
     )
 
 
@@ -431,7 +448,7 @@ def _optional_number(data: dict[str, Any], key: str, metric: str) -> float | Non
     return float(value)
 
 
-def parse_body_day(payload: Any) -> BodyDay:
+def parse_body_day(payload: Any, *, owner_user_id: str | None = None) -> BodyDay:
     """Decode a decrypted body blob into a typed BodyDay (no aggregation).
 
     Wire contract mirrors iOS TetherBodySharedCloudPayload:
@@ -449,10 +466,11 @@ def parse_body_day(payload: Any) -> BodyDay:
         weight_kg=float(weight),
         body_fat_percent=_optional_number(data, "bodyFatPercent", METRIC_BODY),
         bmi=_optional_number(data, "bmi", METRIC_BODY),
+        owner_user_id=owner_user_id,
     )
 
 
-def parse_activity_day(payload: Any) -> ActivityDay:
+def parse_activity_day(payload: Any, *, owner_user_id: str | None = None) -> ActivityDay:
     """Decode a decrypted activity blob into a typed ActivityDay.
 
     Wire contract mirrors iOS TetherActivitySharedCloudPayload:
@@ -476,10 +494,11 @@ def parse_activity_day(payload: Any) -> ActivityDay:
         exercise_minutes=int(exercise_minutes),
         stand_minutes=int(stand_minutes),
         distance_meters=_optional_number(data, "distanceMeters", METRIC_ACTIVITY),
+        owner_user_id=owner_user_id,
     )
 
 
-def parse_resting_hr_record(payload: Any) -> RestingHrRecord:
+def parse_resting_hr_record(payload: Any, *, owner_user_id: str | None = None) -> RestingHrRecord:
     """Decode a decrypted resting_hr blob into a typed RestingHrRecord.
 
     Wire contract mirrors iOS TetherRestingHeartRateSharedCloudPayload:
@@ -494,10 +513,11 @@ def parse_resting_hr_record(payload: Any) -> RestingHrRecord:
         record_id=str(data["dayID"]),
         date=str(data["dayStartDate"]),
         bpm=float(bpm),
+        owner_user_id=owner_user_id,
     )
 
 
-def parse_workout_record(payload: Any) -> WorkoutRecord:
+def parse_workout_record(payload: Any, *, owner_user_id: str | None = None) -> WorkoutRecord:
     """Decode a decrypted workout blob into a typed WorkoutRecord.
 
     Wire contract mirrors iOS TetherWorkoutSharedCloudPayload:
@@ -516,10 +536,11 @@ def parse_workout_record(payload: Any) -> WorkoutRecord:
         duration_seconds=float(duration),
         active_kcal=_optional_number(data, "activeKcal", METRIC_WORKOUT),
         distance_meters=_optional_number(data, "distanceMeters", METRIC_WORKOUT),
+        owner_user_id=owner_user_id,
     )
 
 
-def parse_mindfulness_day(payload: Any) -> MindfulnessDay:
+def parse_mindfulness_day(payload: Any, *, owner_user_id: str | None = None) -> MindfulnessDay:
     """Decode a decrypted mindfulness blob into a typed MindfulnessDay.
 
     Wire contract mirrors iOS TetherMindfulnessSharedCloudPayload:
@@ -536,10 +557,11 @@ def parse_mindfulness_day(payload: Any) -> MindfulnessDay:
         day_start_date=str(data["dayStartDate"]),
         session_count=int(session_count),
         total_minutes=float(total_minutes),
+        owner_user_id=owner_user_id,
     )
 
 
-def parse_hrv_record(payload: Any) -> HRVRecord:
+def parse_hrv_record(payload: Any, *, owner_user_id: str | None = None) -> HRVRecord:
     """Decode a decrypted hrv blob into a typed HRVRecord.
 
     Wire contract mirrors iOS TetherHRVSharedCloudPayload:
@@ -554,10 +576,11 @@ def parse_hrv_record(payload: Any) -> HRVRecord:
         record_id=str(data["dayID"]),
         date=str(data["dayStartDate"]),
         sdnn_ms=float(sdnn),
+        owner_user_id=owner_user_id,
     )
 
 
-def parse_wrist_temp_record(payload: Any) -> WristTempRecord:
+def parse_wrist_temp_record(payload: Any, *, owner_user_id: str | None = None) -> WristTempRecord:
     """Decode a decrypted wrist_temp blob into a typed WristTempRecord.
 
     Wire contract mirrors iOS TetherWristTemperatureSharedCloudPayload:
@@ -572,10 +595,11 @@ def parse_wrist_temp_record(payload: Any) -> WristTempRecord:
         record_id=str(data["dayID"]),
         date=str(data["dayStartDate"]),
         temperature_delta_celsius=float(delta),
+        owner_user_id=owner_user_id,
     )
 
 
-def parse_menstrual_day(payload: Any) -> MenstrualDay:
+def parse_menstrual_day(payload: Any, *, owner_user_id: str | None = None) -> MenstrualDay:
     """Decode a decrypted menstrual blob into a typed MenstrualDay (no prediction)."""
 
     data = _require_mapping(payload, METRIC_MENSTRUAL)
@@ -600,6 +624,7 @@ def parse_menstrual_day(payload: Any) -> MenstrualDay:
         day_id=str(data["dayID"]),
         day_start_date=str(data["dayStartDate"]),
         samples=samples,
+        owner_user_id=owner_user_id,
     )
 
 
@@ -1576,14 +1601,18 @@ class TetherLocalService:
             "errors": errors,
         }
 
-    async def water_intake_summary(self, *, limit: int | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def water_intake_summary(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent daily water intake plus the computed average over the window."""
 
-        records, errors = await self._records_for_metric(METRIC_WATER, limit=limit, fresh=fresh)
+        records, errors = await self._records_for_metric(METRIC_WATER, limit=None, fresh=fresh)
+        if owner:
+            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+        if limit is not None:
+            records = records[:limit]
         days: list[WaterDay] = []
         for record in records:
             try:
-                days.append(parse_water_day(record.payload))
+                days.append(parse_water_day(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         summary = summarize_water_intake(days)
@@ -1591,7 +1620,7 @@ class TetherLocalService:
         return summary
 
     async def weight_trend_summary(
-        self, *, limit: int | None = None, goal_kg: float | None = None, fresh: bool = False
+        self, *, limit: int | None = None, goal_kg: float | None = None, owner: str | None = None, fresh: bool = False
     ) -> dict[str, Any]:
         """Return recent body-weight days plus the computed trend over the window.
 
@@ -1601,18 +1630,22 @@ class TetherLocalService:
         so without it the goal-distance is reported as None rather than assumed.
         """
 
-        records, errors = await self._records_for_metric(METRIC_BODY, limit=limit, fresh=fresh)
+        records, errors = await self._records_for_metric(METRIC_BODY, limit=None, fresh=fresh)
+        if owner:
+            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+        if limit is not None:
+            records = records[:limit]
         days: list[BodyDay] = []
         for record in records:
             try:
-                days.append(parse_body_day(record.payload))
+                days.append(parse_body_day(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         summary = summarize_weight_trend(days, goal_kg=goal_kg)
         summary["errors"] = errors
         return summary
 
-    async def menstrual_cycle_summary(self, *, limit: int | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def menstrual_cycle_summary(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent menstrual cycle samples plus a simple next-period prediction.
 
         Menstrual blobs only arrive here when the user explicitly opted in on iOS; this
@@ -1620,7 +1653,11 @@ class TetherLocalService:
         up. The data is sensitive — it stays on-device and is never re-exported.
         """
 
-        records, errors = await self._records_for_metric(METRIC_MENSTRUAL, limit=limit, fresh=fresh)
+        records, errors = await self._records_for_metric(METRIC_MENSTRUAL, limit=None, fresh=fresh)
+        if owner:
+            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+        if limit is not None:
+            records = records[:limit]
         if not records:
             _LOG.info("no menstrual envelopes present (likely not opted in on iOS)")
         else:
@@ -1629,7 +1666,7 @@ class TetherLocalService:
         menstrual_owners: set[str] = set()
         for record in records:
             try:
-                days.append(parse_menstrual_day(record.payload))
+                days.append(parse_menstrual_day(record.payload, owner_user_id=record.owner_user_id))
                 if record.owner_user_id:
                     menstrual_owners.add(record.owner_user_id)
             except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
@@ -1662,32 +1699,40 @@ class TetherLocalService:
             if record.owner_user_id != cycle_owner:
                 continue
             try:
-                parsed = parse_wrist_temp_record(record.payload)
+                parsed = parse_wrist_temp_record(record.payload, owner_user_id=record.owner_user_id)
                 readings.append((_parse_iso8601(parsed.date), parsed.temperature_delta_celsius))
             except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         return readings or None
 
-    async def activity_summary(self, *, limit: int | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def activity_summary(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent daily activity ring data (steps, energy, exercise, stand, distance)."""
 
-        records, errors = await self._records_for_metric(METRIC_ACTIVITY, limit=limit, fresh=fresh)
+        records, errors = await self._records_for_metric(METRIC_ACTIVITY, limit=None, fresh=fresh)
+        if owner:
+            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+        if limit is not None:
+            records = records[:limit]
         days: list[ActivityDay] = []
         for record in records:
             try:
-                days.append(parse_activity_day(record.payload))
+                days.append(parse_activity_day(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         return {"days": [d.to_dict() for d in days], "count": len(days), "errors": errors}
 
-    async def resting_hr_records(self, *, limit: int | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def resting_hr_records(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent resting heart rate samples."""
 
-        records, errors = await self._records_for_metric(METRIC_RESTING_HR, limit=limit, fresh=fresh)
+        records, errors = await self._records_for_metric(METRIC_RESTING_HR, limit=None, fresh=fresh)
+        if owner:
+            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+        if limit is not None:
+            records = records[:limit]
         hr_records: list[RestingHrRecord] = []
         for record in records:
             try:
-                hr_records.append(parse_resting_hr_record(record.payload))
+                hr_records.append(parse_resting_hr_record(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         bpms = [r.bpm for r in hr_records]
@@ -1699,14 +1744,18 @@ class TetherLocalService:
             "errors": errors,
         }
 
-    async def workout_records(self, *, limit: int | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def workout_records(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent workout sessions."""
 
-        records, errors = await self._records_for_metric(METRIC_WORKOUT, limit=limit, fresh=fresh)
+        records, errors = await self._records_for_metric(METRIC_WORKOUT, limit=None, fresh=fresh)
+        if owner:
+            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+        if limit is not None:
+            records = records[:limit]
         workouts: list[WorkoutRecord] = []
         for record in records:
             try:
-                workouts.append(parse_workout_record(record.payload))
+                workouts.append(parse_workout_record(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         total_duration = sum(w.duration_seconds for w in workouts)
@@ -1717,14 +1766,18 @@ class TetherLocalService:
             "errors": errors,
         }
 
-    async def mindfulness_summary(self, *, limit: int | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def mindfulness_summary(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent daily mindfulness data (session count and total minutes)."""
 
-        records, errors = await self._records_for_metric(METRIC_MINDFULNESS, limit=limit, fresh=fresh)
+        records, errors = await self._records_for_metric(METRIC_MINDFULNESS, limit=None, fresh=fresh)
+        if owner:
+            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+        if limit is not None:
+            records = records[:limit]
         days: list[MindfulnessDay] = []
         for record in records:
             try:
-                days.append(parse_mindfulness_day(record.payload))
+                days.append(parse_mindfulness_day(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         total_minutes = sum(d.total_minutes for d in days)
@@ -1735,14 +1788,18 @@ class TetherLocalService:
             "errors": errors,
         }
 
-    async def hrv_records(self, *, limit: int | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def hrv_records(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent HRV (SDNN) samples."""
 
-        records, errors = await self._records_for_metric(METRIC_HRV, limit=limit, fresh=fresh)
+        records, errors = await self._records_for_metric(METRIC_HRV, limit=None, fresh=fresh)
+        if owner:
+            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+        if limit is not None:
+            records = records[:limit]
         hrv_list: list[HRVRecord] = []
         for record in records:
             try:
-                hrv_list.append(parse_hrv_record(record.payload))
+                hrv_list.append(parse_hrv_record(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         sdnns = [r.sdnn_ms for r in hrv_list]
@@ -1754,14 +1811,18 @@ class TetherLocalService:
             "errors": errors,
         }
 
-    async def wrist_temp_records(self, *, limit: int | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def wrist_temp_records(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent sleeping wrist temperature samples."""
 
-        records, errors = await self._records_for_metric(METRIC_WRIST_TEMP, limit=limit, fresh=fresh)
+        records, errors = await self._records_for_metric(METRIC_WRIST_TEMP, limit=None, fresh=fresh)
+        if owner:
+            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+        if limit is not None:
+            records = records[:limit]
         temp_list: list[WristTempRecord] = []
         for record in records:
             try:
-                temp_list.append(parse_wrist_temp_record(record.payload))
+                temp_list.append(parse_wrist_temp_record(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         deltas = [r.temperature_delta_celsius for r in temp_list]
