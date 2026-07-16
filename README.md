@@ -22,13 +22,13 @@ iPhone (Apple Health) ──E2EE──▶ cloud (ciphertext only) ──E2EE─�
 With [uv](https://docs.astral.sh/uv/) (recommended — no clone needed):
 
 ```bash
-uvx --from 'git+https://github.com/Fino-wind/tether-mcp' tether-mcp status
+uvx tether-mcp status
 ```
 
 Or with pip:
 
 ```bash
-pip install 'tether-mcp[qr] @ git+https://github.com/Fino-wind/tether-mcp'
+pip install 'tether-mcp[qr]'
 ```
 
 ### 2. Bind your phone
@@ -44,7 +44,7 @@ This generates a keypair on your machine and prints a QR code. In the Tether iOS
 **Claude Code** (one line):
 
 ```bash
-claude mcp add tether-health -- uvx --from 'git+https://github.com/Fino-wind/tether-mcp' tether-mcp serve --transport stdio
+claude mcp add tether-health -- uvx tether-mcp serve --transport stdio
 ```
 
 **Claude Desktop** (`claude_desktop_config.json`):
@@ -54,7 +54,7 @@ claude mcp add tether-health -- uvx --from 'git+https://github.com/Fino-wind/tet
   "mcpServers": {
     "tether-health": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/Fino-wind/tether-mcp", "tether-mcp", "serve", "--transport", "stdio"]
+      "args": ["tether-mcp", "serve", "--transport", "stdio"]
     }
   }
 }
@@ -64,7 +64,7 @@ Any other MCP client: run `tether-mcp serve --transport stdio`, or `serve --tran
 
 > **Claude Desktop note**: it does not inherit your shell `PATH`. If `uvx` isn't found, use the absolute path (`which uvx`) as `command`.
 
-Debugging: `npx @modelcontextprotocol/inspector uvx --from 'git+https://github.com/Fino-wind/tether-mcp' tether-mcp serve --transport stdio`
+Debugging: `npx @modelcontextprotocol/inspector uvx tether-mcp serve --transport stdio`
 
 Then just ask your agent: *“How did we sleep last night?”*
 
@@ -117,3 +117,5 @@ pytest
 ---
 
 *Website: [tetherme.app](https://tetherme.app) · App Store: [Tether — AI Health Sync](https://apps.apple.com/us/app/tether-ai-health-sync/id6759241985) · Bugs & feedback: [tether-community](https://github.com/Fino-wind/tether-community/issues)*
+
+<!-- mcp-name: io.github.fino-wind/tether -->
