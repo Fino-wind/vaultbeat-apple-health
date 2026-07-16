@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tether-mcp-local"
+version = "0.1.0"
+description = "Local MCP server for Tether — AI Health Sync: your AI agent reads your end-to-end-encrypted Apple Health data (sleep, cycle, weight, water), decrypted only on your machine"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Fino-wind" }]
+keywords = ["mcp", "model-context-protocol", "apple-health", "healthkit", "e2ee", "claude", "ai-agent", "sleep", "health"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Security :: Cryptography",
+]
+requires-python = ">=3.11"
+dependencies = [
+  "cryptography>=42.0.0,<47.0.0",
+  "httpx>=0.28.0,<1.0.0",
+  "keyring>=24",
+  "mcp>=1.13.0,<2.0.0",
+]
+
+[project.urls]
+Homepage = "https://tetherme.app"
+Documentation = "https://tetherme.app/mcp"
+Repository = "https://github.com/Fino-wind/tether-mcp"
+Issues = "https://github.com/Fino-wind/tether-community/issues"
+"App Store" = "https://apps.apple.com/us/app/tether-ai-health-sync/id6759241985"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0,<9.0.0",
+  "ruff>=0.11.0,<1.0.0",
+  "mypy>=1.13.0,<2.0.0",
+]
+qr = [
+  "qrcode>=8.0.0,<9.0.0",
+]
+
+[project.scripts]
+tether-mcp-local = "tether_mcp_local.cli:main"
+
+[tool.pytest.ini_options]
+# src-layout: make tether_mcp_local importable for the test run without depending
+# on an editable install being present. The editable .pth can silently drop out
+# when the venv is rebuilt (e.g. via `uv sync`), which otherwise breaks collection.
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_return_any = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
