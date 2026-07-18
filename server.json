@@ -1,0 +1,20 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Fino-wind/vaultbeat",
+  "description": "Your AI agent reads your E2EE Apple Health data (sleep, HRV, cycle) \u2014 decrypted only locally",
+  "repository": {
+    "url": "https://github.com/Fino-wind/vaultbeat-mcp",
+    "source": "github"
+  },
+  "version": "0.1.2",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "vaultbeat-mcp",
+      "version": "0.1.2",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

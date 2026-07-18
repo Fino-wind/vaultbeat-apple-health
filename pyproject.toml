@@ -4,8 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vaultbeat-mcp"
-version = "0.1.0"
+version = "0.1.2"
 description = "Local MCP server for Vaultbeat — AI Health Sync: your AI agent reads your end-to-end-encrypted Apple Health data (sleep, cycle, weight, water), decrypted only on your machine"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "cryptography>=42.0.0,<47.0.0",

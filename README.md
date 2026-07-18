@@ -120,4 +120,4 @@ pytest
 
 *Website: [tetherme.app](https://tetherme.app) · App Store: [Vaultbeat — AI Health Sync](https://apps.apple.com/us/app/tether-ai-health-sync/id6759241985) · Bugs & feedback: [vaultbeat-community](https://github.com/Fino-wind/vaultbeat-community/issues)*
 
-<!-- mcp-name: io.github.fino-wind/vaultbeat -->
+<!-- mcp-name: io.github.Fino-wind/vaultbeat -->
