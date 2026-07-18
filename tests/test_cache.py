@@ -13,18 +13,18 @@ import json
 import stat
 from pathlib import Path
 
-from tether_mcp_local.cache import LocalRecordCache
-from tether_mcp_local.service import TetherLocalService
-from tether_mcp_local.store import ConfigStore
+from vaultbeat_mcp_local.cache import LocalRecordCache
+from vaultbeat_mcp_local.service import VaultbeatLocalService
+from vaultbeat_mcp_local.store import ConfigStore
 
 from test_service import FakeCloudClient, _make_envelope, _water_payload
 
 
-def _bound(tmp_path: Path, **cache_kwargs) -> tuple[TetherLocalService, FakeCloudClient, str]:
+def _bound(tmp_path: Path, **cache_kwargs) -> tuple[VaultbeatLocalService, FakeCloudClient, str]:
     config_path = tmp_path / "config.json"
     cloud = FakeCloudClient()
     cache = LocalRecordCache(tmp_path / "cache", **cache_kwargs)
-    service = TetherLocalService(ConfigStore(config_path), cloud, cache=cache)
+    service = VaultbeatLocalService(ConfigStore(config_path), cloud, cache=cache)
     service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
     asyncio.run(service.poll_once())
     public_key = ConfigStore(config_path).require_bound().public_key_base64

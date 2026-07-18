@@ -7,17 +7,17 @@ import os
 from pathlib import Path
 from typing import Any
 
-from tether_mcp_local import __version__
-from tether_mcp_local.service import KNOWN_METRIC_TYPES, TetherLocalService
-from tether_mcp_local.store import DEFAULT_API_BASE_URL, ConfigStore, write_secret_file
+from vaultbeat_mcp_local import __version__
+from vaultbeat_mcp_local.service import KNOWN_METRIC_TYPES, VaultbeatLocalService
+from vaultbeat_mcp_local.store import DEFAULT_API_BASE_URL, ConfigStore, write_secret_file
 
 
 def _store(args: argparse.Namespace) -> ConfigStore:
     return ConfigStore(Path(args.config).expanduser() if args.config else None)
 
 
-def _service(args: argparse.Namespace) -> TetherLocalService:
-    return TetherLocalService(_store(args))
+def _service(args: argparse.Namespace) -> VaultbeatLocalService:
+    return VaultbeatLocalService(_store(args))
 
 
 def _print_json(payload: Any) -> None:
@@ -28,7 +28,7 @@ def _print_qr(payload: str) -> None:
     try:
         import qrcode  # type: ignore[import-untyped]
     except ModuleNotFoundError:
-        print("Install with `pip install 'tether-mcp-local[qr]'` to render an ASCII QR code.")
+        print("Install with `pip install 'vaultbeat-mcp-local[qr]'` to render an ASCII QR code.")
         return
 
     qr = qrcode.QRCode(border=2)
@@ -57,7 +57,7 @@ def handle_bind(args: argparse.Namespace) -> int:
         server_name=args.server_name,
         api_base_url=args.api_base_url,
     )
-    print("Scan this payload with Tether on iOS:")
+    print("Scan this payload with Vaultbeat on iOS:")
     print(session.qr_payload_json)
     if not args.no_qr:
         _print_qr(session.qr_payload_json)
@@ -69,7 +69,7 @@ def handle_bind(args: argparse.Namespace) -> int:
         )
     )
     if result.status != "bound":
-        print("Binding is still pending. Re-run `tether-mcp-local poll` to continue.")
+        print("Binding is still pending. Re-run `vaultbeat-mcp-local poll` to continue.")
         return 2
 
     print(f"Bound local MCP server: {result.server_id}")
@@ -225,7 +225,8 @@ def handle_symptoms(args: argparse.Namespace) -> int:
 
 
 def _resolve_http_token(store: ConfigStore) -> str | None:
-    env_token = os.getenv("TETHER_MCP_HTTP_TOKEN", "").strip()
+    # Pre-rename TETHER_ env var honored as a fallback for existing setups.
+    env_token = os.getenv("VAULTBEAT_MCP_HTTP_TOKEN", "").strip() or os.getenv("TETHER_MCP_HTTP_TOKEN", "").strip()
     if env_token:
         return env_token
     config = store.load()
@@ -236,7 +237,7 @@ def _print_http_token(token: str, args: argparse.Namespace) -> None:
     url = f"http://{args.host}:{args.port}{args.path}"
     snippet = {
         "servers": {
-            "tether-local": {
+            "vaultbeat-local": {
                 "type": "http",
                 "url": url,
                 "headers": {"Authorization": f"Bearer {token}"},
@@ -256,7 +257,7 @@ def _print_http_token(token: str, args: argparse.Namespace) -> None:
 def handle_serve(args: argparse.Namespace) -> int:
     # Imported lazily: the MCP SDK import chain is ~1.4s, which every OTHER
     # subcommand (the CLI data path) must not pay.
-    from tether_mcp_local.mcp_server import run_mcp_server
+    from vaultbeat_mcp_local.mcp_server import run_mcp_server
 
     store = _store(args)
     is_http = args.transport in ("http", "streamable-http")
@@ -269,7 +270,7 @@ def handle_serve(args: argparse.Namespace) -> int:
         config = store.load()
         stored = config.http_token if config else None
         if not stored:
-            print("No HTTP token set. Run `tether-mcp-local serve --generate-token` first.")
+            print("No HTTP token set. Run `vaultbeat-mcp-local serve --generate-token` first.")
             return 1
         print(stored)
         return 0
@@ -298,9 +299,9 @@ def handle_serve(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="tether-mcp-local")
+    parser = argparse.ArgumentParser(prog="vaultbeat-mcp-local")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    parser.add_argument("--config", help="Path to config JSON. Defaults to ~/.tether/mcp-local/config.json.")
+    parser.add_argument("--config", help="Path to config JSON. Defaults to ~/.vaultbeat/mcp-local/config.json.")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 

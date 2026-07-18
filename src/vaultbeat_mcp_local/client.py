@@ -7,7 +7,7 @@ if TYPE_CHECKING:
     import httpx
 
 
-class TetherCloudError(RuntimeError):
+class VaultbeatCloudError(RuntimeError):
     pass
 
 
@@ -24,7 +24,7 @@ class PollBindingResult:
     request_id: str | None = None
 
 
-class TetherCloudClient:
+class VaultbeatCloudClient:
     def __init__(self, api_base_url: str, *, timeout: float = 20.0):
         self.api_base_url = api_base_url.rstrip("/")
         self.timeout = timeout
@@ -75,7 +75,7 @@ class TetherCloudClient:
         payload = self._decode_response(response)
         envelopes = payload.get("envelopes", [])
         if not isinstance(envelopes, list):
-            raise TetherCloudError("Cloud response has invalid envelopes shape")
+            raise VaultbeatCloudError("Cloud response has invalid envelopes shape")
         return [row for row in envelopes if isinstance(row, dict)]
 
     @staticmethod
@@ -83,7 +83,7 @@ class TetherCloudClient:
         try:
             payload = response.json()
         except ValueError as error:
-            raise TetherCloudError(f"Cloud returned non-JSON response: HTTP {response.status_code}") from error
+            raise VaultbeatCloudError(f"Cloud returned non-JSON response: HTTP {response.status_code}") from error
 
         if response.status_code >= 400:
             error_code = payload.get("error") if isinstance(payload, dict) else None
@@ -93,8 +93,8 @@ class TetherCloudClient:
                 detail += f" error={error_code}"
             if request_id:
                 detail += f" request_id={request_id}"
-            raise TetherCloudError(detail)
+            raise VaultbeatCloudError(detail)
 
         if not isinstance(payload, dict):
-            raise TetherCloudError("Cloud returned invalid JSON response")
+            raise VaultbeatCloudError("Cloud returned invalid JSON response")
         return payload

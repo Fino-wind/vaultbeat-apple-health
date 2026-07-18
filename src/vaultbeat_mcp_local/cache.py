@@ -7,20 +7,22 @@ import time
 from pathlib import Path
 from typing import Any
 
-from tether_mcp_local.store import write_secret_file
+from vaultbeat_mcp_local.store import write_secret_file
 
-_LOG = logging.getLogger("tether_mcp_local.cache")
+_LOG = logging.getLogger("vaultbeat_mcp_local.cache")
 
 # Cache freshness window. Health data lands in the cloud at the phone's
 # background-sync cadence (minutes-to-hours), so an agent asking twice within a
 # few minutes should not pay a second cloud round trip. Override with
-# TETHER_MCP_CACHE_TTL (seconds); 0 disables the cache entirely.
+# VAULTBEAT_MCP_CACHE_TTL (seconds); 0 disables the cache entirely.
 DEFAULT_TTL_SECONDS = 600.0
-TTL_ENV = "TETHER_MCP_CACHE_TTL"
+TTL_ENV = "VAULTBEAT_MCP_CACHE_TTL"
+# Pre-rename env var, honored as a fallback so existing setups keep working.
+_LEGACY_TTL_ENV = "TETHER_MCP_CACHE_TTL"
 
 
 def _ttl_from_env(default: float) -> float:
-    raw = os.getenv(TTL_ENV, "").strip()
+    raw = os.getenv(TTL_ENV, "").strip() or os.getenv(_LEGACY_TTL_ENV, "").strip()
     if not raw:
         return default
     try:

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from tether_mcp_local.store import (
+from vaultbeat_mcp_local.store import (
     ConfigError,
     ConfigStore,
     LocalServerConfig,

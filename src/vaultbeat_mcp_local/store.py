@@ -11,11 +11,13 @@ from typing import Any
 
 import keyring
 
-from tether_mcp_local.crypto import generate_x25519_keypair, public_key_from_private
+from vaultbeat_mcp_local.crypto import generate_x25519_keypair, public_key_from_private
 
 
 DEFAULT_API_BASE_URL = "https://wjpnyxglgtmtgjuuhwru.supabase.co/functions/v1"
-CONFIG_ENV = "TETHER_MCP_CONFIG"
+CONFIG_ENV = "VAULTBEAT_MCP_CONFIG"
+# Pre-rename env var, honored as a fallback so existing setups keep working.
+_LEGACY_CONFIG_ENV = "TETHER_MCP_CONFIG"
 
 # Keychain service name — stable namespace that matches the macOS bundle-ID convention.
 # Changing this string would orphan existing Keychain entries, so treat it as frozen.
@@ -155,9 +157,13 @@ def _keychain_load(config_path: Path) -> str | None:
 
 
 def default_config_path() -> Path:
-    override = os.getenv(CONFIG_ENV, "").strip()
+    override = os.getenv(CONFIG_ENV, "").strip() or os.getenv(_LEGACY_CONFIG_ENV, "").strip()
     if override:
         return Path(override).expanduser()
+    # Frozen at the pre-rename path: the Keychain username embeds the resolved
+    # config path (see _keychain_username), so moving this directory orphans
+    # both the bound config AND its private-key Keychain entry for every
+    # existing installation. Treat like _KEYCHAIN_SERVICE — never rename.
     return Path.home() / ".tether" / "mcp-local" / "config.json"
 
 
@@ -283,5 +289,5 @@ class ConfigStore:
         if not current:
             raise ConfigError("Local MCP server is not initialized")
         if not current.is_bound:
-            raise ConfigError("Local MCP server is not bound; run `tether-mcp-local bind` first")
+            raise ConfigError("Local MCP server is not bound; run `vaultbeat-mcp-local bind` first")
         return current

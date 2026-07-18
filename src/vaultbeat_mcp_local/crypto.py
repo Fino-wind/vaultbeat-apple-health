@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 ENVELOPE_INFO = b"tether-e2ee-envelope"
 
 
-class TetherCryptoError(ValueError):
+class VaultbeatCryptoError(ValueError):
     pass
 
 
@@ -42,12 +42,12 @@ def _b64decode(value: str, label: str) -> bytes:
     try:
         return base64.b64decode(value, validate=True)
     except Exception as error:
-        raise TetherCryptoError(f"invalid base64 field: {label}") from error
+        raise VaultbeatCryptoError(f"invalid base64 field: {label}") from error
 
 
 def _split_apple_aes_gcm_combined(combined: bytes) -> tuple[bytes, bytes]:
     if len(combined) < 12 + 16:
-        raise TetherCryptoError("invalid AES-GCM combined payload")
+        raise VaultbeatCryptoError("invalid AES-GCM combined payload")
     nonce = combined[:12]
     ciphertext_and_tag = combined[12:]
     return nonce, ciphertext_and_tag
@@ -82,7 +82,7 @@ def generate_x25519_keypair() -> tuple[str, str]:
 def public_key_from_private(private_key_base64: str) -> str:
     private_raw = _b64decode(private_key_base64, "private_key_base64")
     if len(private_raw) != 32:
-        raise TetherCryptoError("X25519 private key must be 32 bytes")
+        raise VaultbeatCryptoError("X25519 private key must be 32 bytes")
     private_key = x25519.X25519PrivateKey.from_private_bytes(private_raw)
     public_raw = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
@@ -106,25 +106,25 @@ def decrypt_blob_payload(
 
     private_raw = _b64decode(private_key_base64, "private_key_base64")
     if len(private_raw) != 32:
-        raise TetherCryptoError("X25519 private key must be 32 bytes")
+        raise VaultbeatCryptoError("X25519 private key must be 32 bytes")
 
     envelope_data = _b64decode(encrypted_data_key_base64, "encrypted_data_key")
     try:
         envelope = json.loads(envelope_data)
     except json.JSONDecodeError as error:
-        raise TetherCryptoError("encrypted_data_key is not a JSON envelope") from error
+        raise VaultbeatCryptoError("encrypted_data_key is not a JSON envelope") from error
 
     if not isinstance(envelope, dict):
-        raise TetherCryptoError("encrypted_data_key envelope must be an object")
+        raise VaultbeatCryptoError("encrypted_data_key envelope must be an object")
 
     sender_public_key_base64 = envelope.get("senderPublicKeyBase64")
     wrapped_symmetric_key_base64 = envelope.get("wrappedSymmetricKeyBase64")
     if not isinstance(sender_public_key_base64, str) or not isinstance(wrapped_symmetric_key_base64, str):
-        raise TetherCryptoError("encrypted_data_key envelope is missing key material")
+        raise VaultbeatCryptoError("encrypted_data_key envelope is missing key material")
 
     sender_public_raw = _b64decode(sender_public_key_base64, "senderPublicKeyBase64")
     if len(sender_public_raw) != 32:
-        raise TetherCryptoError("sender public key must be 32 bytes")
+        raise VaultbeatCryptoError("sender public key must be 32 bytes")
 
     private_key = x25519.X25519PrivateKey.from_private_bytes(private_raw)
     sender_public_key = x25519.X25519PublicKey.from_public_bytes(sender_public_raw)
@@ -138,8 +138,8 @@ def decrypt_blob_payload(
 
     # AESGCM.decrypt raises cryptography.exceptions.InvalidTag on any auth
     # failure (tampered ciphertext, rotated key, envelope/recipient mismatch).
-    # InvalidTag subclasses neither ValueError nor TetherCryptoError, so if it
-    # escaped here it would skip every per-record `except (…, TetherCryptoError,
+    # InvalidTag subclasses neither ValueError nor VaultbeatCryptoError, so if it
+    # escaped here it would skip every per-record `except (…, VaultbeatCryptoError,
     # …)` in service.py and one bad envelope would abort the ENTIRE sync across
     # all metric types instead of landing in that record's errors[] entry.
     # Normalize it at this boundary like every other crypto-layer failure.
@@ -152,7 +152,7 @@ def decrypt_blob_payload(
         ciphertext_nonce, ciphertext = _split_apple_aes_gcm_combined(ciphertext_combined)
         return AESGCM(dek).decrypt(ciphertext_nonce, ciphertext, None)
     except InvalidTag as error:
-        raise TetherCryptoError("AES-GCM authentication failed (tampered or mis-keyed envelope)") from error
+        raise VaultbeatCryptoError("AES-GCM authentication failed (tampered or mis-keyed envelope)") from error
 
 
 def encrypt_blob_payload(
@@ -180,7 +180,7 @@ def encrypt_blob_payload(
     """
 
     if not recipients:
-        raise TetherCryptoError("encrypt_blob_payload requires at least one recipient")
+        raise VaultbeatCryptoError("encrypt_blob_payload requires at least one recipient")
 
     dek = os.urandom(32)
     ciphertext_base64 = base64.b64encode(_seal_apple_aes_gcm_combined(dek, plaintext)).decode()
@@ -189,7 +189,7 @@ def encrypt_blob_payload(
     for recipient in recipients:
         recipient_public_raw = _b64decode(recipient.public_key_base64, "recipient public_key")
         if len(recipient_public_raw) != 32:
-            raise TetherCryptoError("recipient public key must be 32 bytes")
+            raise VaultbeatCryptoError("recipient public key must be 32 bytes")
 
         ephemeral_private = x25519.X25519PrivateKey.generate()
         recipient_public = x25519.X25519PublicKey.from_public_bytes(recipient_public_raw)

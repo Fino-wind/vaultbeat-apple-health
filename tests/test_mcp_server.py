@@ -9,13 +9,13 @@ from typing import Any
 
 import pytest
 
-from tether_mcp_local.mcp_server import (
+from vaultbeat_mcp_local.mcp_server import (
     StaticBearerASGIMiddleware,
     _is_loopback,
     _serve_streamable_http,
     run_mcp_server,
 )
-from tether_mcp_local.store import ConfigStore
+from vaultbeat_mcp_local.store import ConfigStore
 
 
 def _drive_http(app: Any, scope: dict[str, Any]) -> list[dict[str, Any]]:
@@ -106,7 +106,7 @@ def test_is_loopback_true(host: str) -> None:
 
 @pytest.mark.parametrize(
     "host",
-    ["0.0.0.0", "::", "192.168.1.10", "10.0.0.1", "example.com", "tether.local"],
+    ["0.0.0.0", "::", "192.168.1.10", "10.0.0.1", "example.com", "vaultbeat.local"],
 )
 def test_is_loopback_false(host: str) -> None:
     assert _is_loopback(host) is False
@@ -212,6 +212,6 @@ def test_run_mcp_server_registers_water_and_menstrual_tools(
 
     run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
 
-    assert "tether_sync_sleep" in registered
+    assert "vaultbeat_sync_sleep" in registered
     assert "get_water_intake" in registered
     assert "get_menstrual_cycle" in registered

@@ -6,10 +6,10 @@ import types
 from pathlib import Path
 from typing import Any
 
-import tether_mcp_local.cli as cli
-from tether_mcp_local.mcp_server import _normalize_http_path, _normalize_transport, run_mcp_server
-from tether_mcp_local.service import TetherLocalService
-from tether_mcp_local.store import ConfigStore
+import vaultbeat_mcp_local.cli as cli
+from vaultbeat_mcp_local.mcp_server import _normalize_http_path, _normalize_transport, run_mcp_server
+from vaultbeat_mcp_local.service import VaultbeatLocalService
+from vaultbeat_mcp_local.store import ConfigStore
 
 
 def test_serve_defaults_to_stdio_transport(monkeypatch: Any, tmp_path: Path) -> None:
@@ -21,7 +21,7 @@ def test_serve_defaults_to_stdio_transport(monkeypatch: Any, tmp_path: Path) -> 
 
     # `serve` imports run_mcp_server lazily at call time, so the patch
     # must land on the defining module, not on cli.
-    import tether_mcp_local.mcp_server as mcp_server_module
+    import vaultbeat_mcp_local.mcp_server as mcp_server_module
 
     monkeypatch.setattr(mcp_server_module, "run_mcp_server", fake_run_mcp_server)
 
@@ -47,7 +47,7 @@ def test_serve_http_transport_options_are_forwarded(monkeypatch: Any, tmp_path: 
 
     # `serve` imports run_mcp_server lazily at call time, so the patch
     # must land on the defining module, not on cli.
-    import tether_mcp_local.mcp_server as mcp_server_module
+    import vaultbeat_mcp_local.mcp_server as mcp_server_module
 
     monkeypatch.setattr(mcp_server_module, "run_mcp_server", fake_run_mcp_server)
 
@@ -133,7 +133,7 @@ def test_run_mcp_server_configures_http_transport_on_fastmcp_init(
         stateless_http=False,
     )
 
-    assert captured["init_args"] == ("Tether Local Sleep",)
+    assert captured["init_args"] == ("Vaultbeat Local Sleep",)
     assert captured["init_kwargs"]["host"] == "127.0.0.1"
     assert captured["init_kwargs"]["port"] == 9000
     assert captured["init_kwargs"]["streamable_http_path"] == "/custom-mcp"
@@ -153,10 +153,10 @@ def test_resolve_http_token_prefers_env_over_config(monkeypatch: Any, tmp_path: 
     store.ensure_initialized()
     store.update(http_token="config-token")
 
-    monkeypatch.setenv("TETHER_MCP_HTTP_TOKEN", "env-token")
+    monkeypatch.setenv("VAULTBEAT_MCP_HTTP_TOKEN", "env-token")
     assert cli._resolve_http_token(store) == "env-token"  # env wins over stored config
 
-    monkeypatch.delenv("TETHER_MCP_HTTP_TOKEN", raising=False)
+    monkeypatch.delenv("VAULTBEAT_MCP_HTTP_TOKEN", raising=False)
     assert cli._resolve_http_token(store) == "config-token"  # falls back to config
 
     empty = ConfigStore(tmp_path / "empty.json")
@@ -168,11 +168,11 @@ def test_water_subcommand_prints_summary(
     monkeypatch: Any, tmp_path: Path, capsys: Any
 ) -> None:
     async def fake_summary(
-        self: TetherLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
+        self: VaultbeatLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
     ) -> dict[str, Any]:
         return {"day_count": 1, "average_daily_intake_liters": 3.0, "errors": []}
 
-    monkeypatch.setattr(TetherLocalService, "water_intake_summary", fake_summary)
+    monkeypatch.setattr(VaultbeatLocalService, "water_intake_summary", fake_summary)
 
     exit_code = cli.main(["--config", str(tmp_path / "config.json"), "water", "--limit", "5"])
 
@@ -185,11 +185,11 @@ def test_menstrual_subcommand_prints_sensitivity_note_and_summary(
     monkeypatch: Any, tmp_path: Path, capsys: Any
 ) -> None:
     async def fake_summary(
-        self: TetherLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
+        self: VaultbeatLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
     ) -> dict[str, Any]:
         return {"day_count": 0, "predicted_next_period_start_date": None, "errors": []}
 
-    monkeypatch.setattr(TetherLocalService, "menstrual_cycle_summary", fake_summary)
+    monkeypatch.setattr(VaultbeatLocalService, "menstrual_cycle_summary", fake_summary)
 
     exit_code = cli.main(["--config", str(tmp_path / "config.json"), "menstrual"])
 
@@ -205,11 +205,11 @@ def test_water_subcommand_returns_3_on_decode_errors(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     async def fake_summary(
-        self: TetherLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
+        self: VaultbeatLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
     ) -> dict[str, Any]:
-        return {"day_count": 0, "errors": ["env-1: TetherCryptoError"]}
+        return {"day_count": 0, "errors": ["env-1: VaultbeatCryptoError"]}
 
-    monkeypatch.setattr(TetherLocalService, "water_intake_summary", fake_summary)
+    monkeypatch.setattr(VaultbeatLocalService, "water_intake_summary", fake_summary)
 
     exit_code = cli.main(["--config", str(tmp_path / "config.json"), "water"])
 

@@ -8,17 +8,17 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Protocol
 
-from tether_mcp_local.cache import LocalRecordCache
-from tether_mcp_local.client import PollBindingResult, TetherCloudClient
-from tether_mcp_local.crypto import (
-    TetherCryptoError,
+from vaultbeat_mcp_local.cache import LocalRecordCache
+from vaultbeat_mcp_local.client import PollBindingResult, VaultbeatCloudClient
+from vaultbeat_mcp_local.crypto import (
+    VaultbeatCryptoError,
     decode_json_payload,
     decrypt_blob_payload,
 )
-from tether_mcp_local.store import ConfigStore, LocalServerConfig, now_iso
+from vaultbeat_mcp_local.store import ConfigStore, LocalServerConfig, now_iso
 
 
-_LOG = logging.getLogger("tether_mcp_local.service")
+_LOG = logging.getLogger("vaultbeat_mcp_local.service")
 
 # Health kinds carried in encrypted_sleep_blobs.metric_type. Decryption is identical
 # for every kind (Curve25519 ECDH + HKDF-SHA256 + AES-GCM); only the post-decrypt JSON
@@ -58,13 +58,13 @@ KNOWN_METRIC_TYPES = frozenset(
     }
 )
 
-# Note target kinds (mirrors iOS TetherNoteTargetKind). Unknown kinds are
+# Note target kinds (mirrors iOS VaultbeatNoteTargetKind). Unknown kinds are
 # accepted as-is so a newer app adding a kind doesn't brick older decoders.
 NOTE_TARGET_KINDS = frozenset({"sleep", "menstrual"})
 
 # String forms of the three HK category-value enums the iOS reader maps
 # (HKCategoryValueSeverity / HKCategoryValuePresence / HKCategoryValueAppetiteChanges).
-# Keep in sync with TetherSymptomHealthKitReader.mapValue.
+# Keep in sync with VaultbeatSymptomHealthKitReader.mapValue.
 SYMPTOM_SEVERITY_VALUES = frozenset(
     {
         "unspecified",
@@ -171,7 +171,7 @@ class BodyDay:
     Body weight is shared bidirectionally by default (like sleep, unlike menstrual's
     explicit opt-in). Storage is always kilograms; unit conversion (jin/lb) happens
     only in presentation layers. bodyFatPercent and bmi are reserved fields the iOS
-    payload (TetherBodySharedCloudPayload) currently always sends as null.
+    payload (VaultbeatBodySharedCloudPayload) currently always sends as null.
     """
 
     day_id: str
@@ -414,7 +414,7 @@ class SymptomDay:
 
 def _require_mapping(payload: Any, metric: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
-        raise TetherCryptoError(f"{metric} payload must be a JSON object")
+        raise VaultbeatCryptoError(f"{metric} payload must be a JSON object")
     return payload
 
 
@@ -424,10 +424,10 @@ def parse_water_day(payload: Any, *, owner_user_id: str | None = None) -> WaterD
     data = _require_mapping(payload, METRIC_WATER)
     refill_events = data.get("refillEvents")
     if not isinstance(refill_events, list):
-        raise TetherCryptoError("water payload is missing refillEvents list")
+        raise VaultbeatCryptoError("water payload is missing refillEvents list")
     container_volume = data.get("containerVolumeLiters")
     if not isinstance(container_volume, (int, float)) or isinstance(container_volume, bool):
-        raise TetherCryptoError("water payload is missing containerVolumeLiters")
+        raise VaultbeatCryptoError("water payload is missing containerVolumeLiters")
     return WaterDay(
         day_id=str(data["dayID"]),
         day_start_date=str(data["dayStartDate"]),
@@ -444,14 +444,14 @@ def _optional_number(data: dict[str, Any], key: str, metric: str) -> float | Non
     if value is None:
         return None
     if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise TetherCryptoError(f"{metric} payload has non-numeric {key}")
+        raise VaultbeatCryptoError(f"{metric} payload has non-numeric {key}")
     return float(value)
 
 
 def parse_body_day(payload: Any, *, owner_user_id: str | None = None) -> BodyDay:
     """Decode a decrypted body blob into a typed BodyDay (no aggregation).
 
-    Wire contract mirrors iOS TetherBodySharedCloudPayload:
+    Wire contract mirrors iOS VaultbeatBodySharedCloudPayload:
     {dayID, dayStartDate, weightKg, bodyFatPercent, bmi} — weightKg required (kg),
     bodyFatPercent/bmi nullable reserved fields (currently always null from iOS).
     """
@@ -459,7 +459,7 @@ def parse_body_day(payload: Any, *, owner_user_id: str | None = None) -> BodyDay
     data = _require_mapping(payload, METRIC_BODY)
     weight = data.get("weightKg")
     if not isinstance(weight, (int, float)) or isinstance(weight, bool):
-        raise TetherCryptoError("body payload is missing weightKg")
+        raise VaultbeatCryptoError("body payload is missing weightKg")
     return BodyDay(
         day_id=str(data["dayID"]),
         day_start_date=str(data["dayStartDate"]),
@@ -473,17 +473,17 @@ def parse_body_day(payload: Any, *, owner_user_id: str | None = None) -> BodyDay
 def parse_activity_day(payload: Any, *, owner_user_id: str | None = None) -> ActivityDay:
     """Decode a decrypted activity blob into a typed ActivityDay.
 
-    Wire contract mirrors iOS TetherActivitySharedCloudPayload:
+    Wire contract mirrors iOS VaultbeatActivitySharedCloudPayload:
     {dayID, dayStartDate, stepCount, activeEnergyKcal, exerciseMinutes, standMinutes, distanceMeters}.
     """
 
     data = _require_mapping(payload, METRIC_ACTIVITY)
     step_count = data.get("stepCount", 0)
     if not isinstance(step_count, (int, float)) or isinstance(step_count, bool):
-        raise TetherCryptoError("activity payload has non-numeric stepCount")
+        raise VaultbeatCryptoError("activity payload has non-numeric stepCount")
     active_energy = data.get("activeEnergyKcal", 0)
     if not isinstance(active_energy, (int, float)) or isinstance(active_energy, bool):
-        raise TetherCryptoError("activity payload has non-numeric activeEnergyKcal")
+        raise VaultbeatCryptoError("activity payload has non-numeric activeEnergyKcal")
     exercise_minutes = data.get("exerciseMinutes", 0)
     stand_minutes = data.get("standMinutes", 0)
     return ActivityDay(
@@ -501,14 +501,14 @@ def parse_activity_day(payload: Any, *, owner_user_id: str | None = None) -> Act
 def parse_resting_hr_record(payload: Any, *, owner_user_id: str | None = None) -> RestingHrRecord:
     """Decode a decrypted resting_hr blob into a typed RestingHrRecord.
 
-    Wire contract mirrors iOS TetherRestingHeartRateSharedCloudPayload:
+    Wire contract mirrors iOS VaultbeatRestingHeartRateSharedCloudPayload:
     {dayID, dayStartDate, restingHeartRateBPM}.
     """
 
     data = _require_mapping(payload, METRIC_RESTING_HR)
     bpm = data.get("restingHeartRateBPM")
     if not isinstance(bpm, (int, float)) or isinstance(bpm, bool):
-        raise TetherCryptoError("resting_hr payload is missing restingHeartRateBPM")
+        raise VaultbeatCryptoError("resting_hr payload is missing restingHeartRateBPM")
     return RestingHrRecord(
         record_id=str(data["dayID"]),
         date=str(data["dayStartDate"]),
@@ -520,14 +520,14 @@ def parse_resting_hr_record(payload: Any, *, owner_user_id: str | None = None) -
 def parse_workout_record(payload: Any, *, owner_user_id: str | None = None) -> WorkoutRecord:
     """Decode a decrypted workout blob into a typed WorkoutRecord.
 
-    Wire contract mirrors iOS TetherWorkoutSharedCloudPayload:
+    Wire contract mirrors iOS VaultbeatWorkoutSharedCloudPayload:
     {workoutID, activityType, startDate, endDate, durationSeconds, activeKcal, distanceMeters}.
     """
 
     data = _require_mapping(payload, METRIC_WORKOUT)
     duration = data.get("durationSeconds")
     if not isinstance(duration, (int, float)) or isinstance(duration, bool):
-        raise TetherCryptoError("workout payload is missing durationSeconds")
+        raise VaultbeatCryptoError("workout payload is missing durationSeconds")
     return WorkoutRecord(
         workout_id=str(data["workoutID"]),
         activity_type=str(data.get("activityType", "Other")),
@@ -543,7 +543,7 @@ def parse_workout_record(payload: Any, *, owner_user_id: str | None = None) -> W
 def parse_mindfulness_day(payload: Any, *, owner_user_id: str | None = None) -> MindfulnessDay:
     """Decode a decrypted mindfulness blob into a typed MindfulnessDay.
 
-    Wire contract mirrors iOS TetherMindfulnessSharedCloudPayload:
+    Wire contract mirrors iOS VaultbeatMindfulnessSharedCloudPayload:
     {dayID, dayStartDate, sessionCount, totalMinutes}.
     """
 
@@ -551,7 +551,7 @@ def parse_mindfulness_day(payload: Any, *, owner_user_id: str | None = None) -> 
     session_count = data.get("sessionCount", 0)
     total_minutes = data.get("totalMinutes", 0.0)
     if not isinstance(total_minutes, (int, float)) or isinstance(total_minutes, bool):
-        raise TetherCryptoError("mindfulness payload has non-numeric totalMinutes")
+        raise VaultbeatCryptoError("mindfulness payload has non-numeric totalMinutes")
     return MindfulnessDay(
         day_id=str(data["dayID"]),
         day_start_date=str(data["dayStartDate"]),
@@ -564,14 +564,14 @@ def parse_mindfulness_day(payload: Any, *, owner_user_id: str | None = None) -> 
 def parse_hrv_record(payload: Any, *, owner_user_id: str | None = None) -> HRVRecord:
     """Decode a decrypted hrv blob into a typed HRVRecord.
 
-    Wire contract mirrors iOS TetherHRVSharedCloudPayload:
+    Wire contract mirrors iOS VaultbeatHRVSharedCloudPayload:
     {dayID, dayStartDate, sdnnMilliseconds}.
     """
 
     data = _require_mapping(payload, METRIC_HRV)
     sdnn = data.get("sdnnMilliseconds")
     if not isinstance(sdnn, (int, float)) or isinstance(sdnn, bool):
-        raise TetherCryptoError("hrv payload is missing sdnnMilliseconds")
+        raise VaultbeatCryptoError("hrv payload is missing sdnnMilliseconds")
     return HRVRecord(
         record_id=str(data["dayID"]),
         date=str(data["dayStartDate"]),
@@ -583,14 +583,14 @@ def parse_hrv_record(payload: Any, *, owner_user_id: str | None = None) -> HRVRe
 def parse_wrist_temp_record(payload: Any, *, owner_user_id: str | None = None) -> WristTempRecord:
     """Decode a decrypted wrist_temp blob into a typed WristTempRecord.
 
-    Wire contract mirrors iOS TetherWristTemperatureSharedCloudPayload:
+    Wire contract mirrors iOS VaultbeatWristTemperatureSharedCloudPayload:
     {dayID, dayStartDate, temperatureDeltaCelsius}.
     """
 
     data = _require_mapping(payload, METRIC_WRIST_TEMP)
     delta = data.get("temperatureDeltaCelsius")
     if not isinstance(delta, (int, float)) or isinstance(delta, bool):
-        raise TetherCryptoError("wrist_temp payload is missing temperatureDeltaCelsius")
+        raise VaultbeatCryptoError("wrist_temp payload is missing temperatureDeltaCelsius")
     return WristTempRecord(
         record_id=str(data["dayID"]),
         date=str(data["dayStartDate"]),
@@ -605,14 +605,14 @@ def parse_menstrual_day(payload: Any, *, owner_user_id: str | None = None) -> Me
     data = _require_mapping(payload, METRIC_MENSTRUAL)
     raw_samples = data.get("samples")
     if not isinstance(raw_samples, list):
-        raise TetherCryptoError("menstrual payload is missing samples list")
+        raise VaultbeatCryptoError("menstrual payload is missing samples list")
     samples: list[MenstrualSample] = []
     for raw in raw_samples:
         if not isinstance(raw, dict):
-            raise TetherCryptoError("menstrual sample must be a JSON object")
+            raise VaultbeatCryptoError("menstrual sample must be a JSON object")
         flow = str(raw.get("flow", "unspecified"))
         if flow not in MENSTRUAL_FLOW_VALUES:
-            raise TetherCryptoError(f"menstrual sample has unknown flow value: {flow}")
+            raise VaultbeatCryptoError(f"menstrual sample has unknown flow value: {flow}")
         samples.append(
             MenstrualSample(
                 start_date=str(raw["startDate"]),
@@ -631,7 +631,7 @@ def parse_menstrual_day(payload: Any, *, owner_user_id: str | None = None) -> Me
 def parse_symptom_day(payload: Any, *, owner_user_id: str | None = None) -> SymptomDay:
     """Decode a decrypted symptom blob into a typed SymptomDay.
 
-    Wire contract mirrors iOS TetherSymptomSharedCloudPayload:
+    Wire contract mirrors iOS VaultbeatSymptomSharedCloudPayload:
     {dayID, dayStartDate, samples: [{symptomType, severity, startDate, endDate}]}.
     An unknown severity string is a contract violation (the iOS mapper only emits
     SYMPTOM_SEVERITY_VALUES); unknown symptomType strings are accepted as-is so a
@@ -641,17 +641,17 @@ def parse_symptom_day(payload: Any, *, owner_user_id: str | None = None) -> Symp
     data = _require_mapping(payload, METRIC_SYMPTOM)
     raw_samples = data.get("samples")
     if not isinstance(raw_samples, list):
-        raise TetherCryptoError("symptom payload is missing samples list")
+        raise VaultbeatCryptoError("symptom payload is missing samples list")
     samples: list[SymptomSample] = []
     for raw in raw_samples:
         if not isinstance(raw, dict):
-            raise TetherCryptoError("symptom sample must be a JSON object")
+            raise VaultbeatCryptoError("symptom sample must be a JSON object")
         severity = str(raw.get("severity", "unspecified"))
         if severity not in SYMPTOM_SEVERITY_VALUES:
-            raise TetherCryptoError(f"symptom sample has unknown severity value: {severity}")
+            raise VaultbeatCryptoError(f"symptom sample has unknown severity value: {severity}")
         symptom_type = raw.get("symptomType")
         if not isinstance(symptom_type, str) or not symptom_type:
-            raise TetherCryptoError("symptom sample is missing symptomType")
+            raise VaultbeatCryptoError("symptom sample is missing symptomType")
         samples.append(
             SymptomSample(
                 symptom_type=symptom_type,
@@ -671,7 +671,7 @@ def parse_symptom_day(payload: Any, *, owner_user_id: str | None = None) -> Symp
 def parse_note(payload: Any, *, owner_user_id: str | None = None) -> NoteRecord:
     """Decode a decrypted note blob into a typed NoteRecord.
 
-    Wire contract mirrors iOS TetherNoteCloudPayload:
+    Wire contract mirrors iOS VaultbeatNoteCloudPayload:
     {noteID, targetKind, targetDate, text, createdAt, updatedAt}. text and a
     non-empty targetKind are required; timestamps are tolerated missing so a
     payload written by a newer/older writer still decodes.
@@ -680,10 +680,10 @@ def parse_note(payload: Any, *, owner_user_id: str | None = None) -> NoteRecord:
     data = _require_mapping(payload, METRIC_NOTE)
     text = data.get("text")
     if not isinstance(text, str) or not text.strip():
-        raise TetherCryptoError("note payload is missing text")
+        raise VaultbeatCryptoError("note payload is missing text")
     target_kind = data.get("targetKind")
     if not isinstance(target_kind, str) or not target_kind:
-        raise TetherCryptoError("note payload is missing targetKind")
+        raise VaultbeatCryptoError("note payload is missing targetKind")
     return NoteRecord(
         note_id=str(data["noteID"]),
         target_kind=target_kind,
@@ -757,7 +757,7 @@ def summarize_water_intake(days: list[WaterDay]) -> dict[str, Any]:
         return {"days": [], "average_daily_intake_liters": None, "day_count": 0}
 
     # Dedup by dayID: newest dayStartDate wins, last-iterated wins on an exact tie
-    # — matches the iOS aggregator (TetherWaterIntakeAggregator) so the AI and the
+    # — matches the iOS aggregator (VaultbeatWaterIntakeAggregator) so the AI and the
     # app agree. (In practice the upsert keeps one blob per dayID.)
     by_id: dict[str, WaterDay] = {}
     for day in days:
@@ -857,7 +857,7 @@ def _cycle_starts(days: list[MenstrualDay]) -> list[datetime]:
     A day counts as bleeding if it carries at least one sample with flow other than
     "none". HealthKit's "unspecified" means "flow occurred, amount not specified"
     (Apple Health's quick period log writes exactly this), so it counts as bleeding —
-    mirrors the Swift `TetherMenstrualFlowLevel.isBleeding`. Consecutive bleeding days
+    mirrors the Swift `VaultbeatMenstrualFlowLevel.isBleeding`. Consecutive bleeding days
     within _CYCLE_GAP_THRESHOLD_DAYS of each other belong to the same cycle; a larger
     gap opens a new cycle. Returns starts oldest-first.
     """
@@ -882,12 +882,12 @@ def _cycle_starts(days: list[MenstrualDay]) -> list[datetime]:
 
 
 # Cycle statistics — MUST stay logic-identical to Swift's
-# TetherMenstrualCycleAggregator (any change lands in both in the same commit).
+# VaultbeatMenstrualCycleAggregator (any change lands in both in the same commit).
 _CYCLE_STATISTICS_WINDOW = 12  # most-recent gaps considered (~1 year of rhythm)
 _MIN_GAPS_FOR_VARIABILITY = 3  # below this a spread estimate is noise
 
 # Biphasic-shift ovulation detection — MUST stay logic-identical to Swift's
-# TetherWristTemperatureOvulationDetector. Wrist temp is `.ownDevicesOnly`, so
+# VaultbeatWristTemperatureOvulationDetector. Wrist temp is `.ownDevicesOnly`, so
 # this server only ever holds the OWNER's deltas — the function fires when the
 # same person tracks both cycle and wrist temperature here (gender-neutral:
 # whoever tracks, benefits). Threshold awaits real-cycle calibration.
@@ -923,7 +923,7 @@ def detect_ovulation_from_wrist_temp(
     threshold, spanning < 4 calendar days; ovulation ~= the day before the
     first elevated reading. Retrospective by nature — it confirms, it does not
     forecast; the caller fuses it as `ovulation + luteal 14` (mirrors Swift's
-    TetherCyclePredictionCalculator / TetherMenstrualCycleSummary.calibrated).
+    VaultbeatCyclePredictionCalculator / VaultbeatMenstrualCycleSummary.calibrated).
     """
 
     cycle_start_day = _local_calendar_day(cycle_start)
@@ -959,7 +959,7 @@ def _median(values: list[float]) -> float | None:
     return ordered[middle]
 
 
-# Mirrors Swift's TetherCyclePredictionCalculator.lutealPhaseDays.
+# Mirrors Swift's VaultbeatCyclePredictionCalculator.lutealPhaseDays.
 _LUTEAL_PHASE_DAYS = 14
 
 
@@ -1124,7 +1124,7 @@ def _select_primary_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, A
     return daily
 
 
-class TetherLocalService:
+class VaultbeatLocalService:
     def __init__(
         self,
         store: ConfigStore,
@@ -1176,7 +1176,7 @@ class TetherLocalService:
     async def poll_once(self) -> PollBindingResult:
         config = self.store.load()
         if not config or not config.poll_id:
-            raise RuntimeError("No active binding session; run `tether-mcp-local bind` first")
+            raise RuntimeError("No active binding session; run `vaultbeat-mcp-local bind` first")
 
         result = await self._client(config).poll_binding(config.poll_id)
         if result.status == "bound":
@@ -1234,7 +1234,7 @@ class TetherLocalService:
         server_token = config.server_token
         server_id = config.server_id or ""
         if not server_token:
-            raise RuntimeError("Local MCP server is not bound; run `tether-mcp-local bind` first")
+            raise RuntimeError("Local MCP server is not bound; run `vaultbeat-mcp-local bind` first")
 
         if not fresh:
             cached = self.cache.load(server_id=server_id, metric_type=metric_type)
@@ -1252,7 +1252,7 @@ class TetherLocalService:
         for row in envelope_rows:
             try:
                 records.append(self._decrypt_row(row, config))
-            except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 envelope_id = str(row.get("id", "<unknown>"))
                 errors.append(f"{envelope_id}: {type(error).__name__}")
 
@@ -1391,7 +1391,7 @@ class TetherLocalService:
                     "heart_rate_samples": len(payload.get("heartRateSamples", [])),
                     "respiratory_rate_samples": len(payload.get("respiratoryRateSamples", [])),
                 })
-            except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
 
         daily_summary = _select_primary_sessions(sessions)
@@ -1573,7 +1573,7 @@ class TetherLocalService:
                     "stage_samples": len(samples),
                     "timeline": timeline,
                 })
-            except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
 
         by_date: dict[str, list[dict[str, Any]]] = {}
@@ -1613,7 +1613,7 @@ class TetherLocalService:
         for record in records:
             try:
                 days.append(parse_water_day(record.payload, owner_user_id=record.owner_user_id))
-            except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         summary = summarize_water_intake(days)
         summary["errors"] = errors
@@ -1626,7 +1626,7 @@ class TetherLocalService:
 
         Body weight is shared bidirectionally by default (sleep-style visibility, not
         menstrual-style opt-in). goal_kg is supplied by the caller — the goal lives in
-        the owner's iOS UserDefaults (TetherBodyGoalSettingsStore) and never syncs here,
+        the owner's iOS UserDefaults (VaultbeatBodyGoalSettingsStore) and never syncs here,
         so without it the goal-distance is reported as None rather than assumed.
         """
 
@@ -1639,7 +1639,7 @@ class TetherLocalService:
         for record in records:
             try:
                 days.append(parse_body_day(record.payload, owner_user_id=record.owner_user_id))
-            except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         summary = summarize_weight_trend(days, goal_kg=goal_kg)
         summary["errors"] = errors
@@ -1669,7 +1669,7 @@ class TetherLocalService:
                 days.append(parse_menstrual_day(record.payload, owner_user_id=record.owner_user_id))
                 if record.owner_user_id:
                     menstrual_owners.add(record.owner_user_id)
-            except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         wrist_readings = await self._wrist_readings_for_owner(menstrual_owners, errors, fresh=fresh)
         summary = summarize_menstrual_cycle(days, wrist_readings=wrist_readings)
@@ -1701,7 +1701,7 @@ class TetherLocalService:
             try:
                 parsed = parse_wrist_temp_record(record.payload, owner_user_id=record.owner_user_id)
                 readings.append((_parse_iso8601(parsed.date), parsed.temperature_delta_celsius))
-            except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         return readings or None
 
@@ -1717,7 +1717,7 @@ class TetherLocalService:
         for record in records:
             try:
                 days.append(parse_activity_day(record.payload, owner_user_id=record.owner_user_id))
-            except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         return {"days": [d.to_dict() for d in days], "count": len(days), "errors": errors}
 
@@ -1733,7 +1733,7 @@ class TetherLocalService:
         for record in records:
             try:
                 hr_records.append(parse_resting_hr_record(record.payload, owner_user_id=record.owner_user_id))
-            except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         bpms = [r.bpm for r in hr_records]
         average_bpm = sum(bpms) / len(bpms) if bpms else None
@@ -1756,7 +1756,7 @@ class TetherLocalService:
         for record in records:
             try:
                 workouts.append(parse_workout_record(record.payload, owner_user_id=record.owner_user_id))
-            except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         total_duration = sum(w.duration_seconds for w in workouts)
         return {
@@ -1778,7 +1778,7 @@ class TetherLocalService:
         for record in records:
             try:
                 days.append(parse_mindfulness_day(record.payload, owner_user_id=record.owner_user_id))
-            except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         total_minutes = sum(d.total_minutes for d in days)
         return {
@@ -1800,7 +1800,7 @@ class TetherLocalService:
         for record in records:
             try:
                 hrv_list.append(parse_hrv_record(record.payload, owner_user_id=record.owner_user_id))
-            except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         sdnns = [r.sdnn_ms for r in hrv_list]
         average_sdnn = sum(sdnns) / len(sdnns) if sdnns else None
@@ -1823,7 +1823,7 @@ class TetherLocalService:
         for record in records:
             try:
                 temp_list.append(parse_wrist_temp_record(record.payload, owner_user_id=record.owner_user_id))
-            except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         deltas = [r.temperature_delta_celsius for r in temp_list]
         average_delta = sum(deltas) / len(deltas) if deltas else None
@@ -1850,7 +1850,7 @@ class TetherLocalService:
         for record in records:
             try:
                 days.append(parse_symptom_day(record.payload, owner_user_id=record.owner_user_id))
-            except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         summary = summarize_symptoms(days)
         summary["errors"] = errors
@@ -1861,7 +1861,7 @@ class TetherLocalService:
     ) -> dict[str, Any]:
         """Return recent free-text notes grouped by target kind (sleep/menstrual).
 
-        Notes are written manually in Tether by either partner; each carries its
+        Notes are written manually in Vaultbeat by either partner; each carries its
         writer (owner_user_id). Sensitive free text — decoded locally, never
         re-exported.
         """
@@ -1875,7 +1875,7 @@ class TetherLocalService:
         for record in records:
             try:
                 notes.append(parse_note(record.payload, owner_user_id=record.owner_user_id))
-            except (KeyError, TypeError, TetherCryptoError, ValueError) as error:
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: {type(error).__name__}")
         summary = summarize_notes(notes, target_kind=target_kind)
         summary["errors"] = errors
@@ -1902,7 +1902,7 @@ class TetherLocalService:
         }
 
     def _client(self, config: LocalServerConfig) -> CloudClientProtocol:
-        return self._cloud_client or TetherCloudClient(config.api_base_url)
+        return self._cloud_client or VaultbeatCloudClient(config.api_base_url)
 
     @staticmethod
     def _decrypt_row(row: dict[str, Any], config: LocalServerConfig) -> DecryptedRecord:

@@ -5,8 +5,8 @@ import ipaddress
 import json
 from typing import Any
 
-from tether_mcp_local.service import TetherLocalService
-from tether_mcp_local.store import ConfigStore
+from vaultbeat_mcp_local.service import VaultbeatLocalService
+from vaultbeat_mcp_local.store import ConfigStore
 
 
 _LOOPBACK_HOSTNAMES = {"localhost"}
@@ -75,7 +75,7 @@ class StaticBearerASGIMiddleware:
                     "headers": [
                         (b"content-type", b"application/json"),
                         (b"content-length", str(len(body)).encode("latin-1")),
-                        (b"www-authenticate", b'Bearer realm="tether-mcp-local"'),
+                        (b"www-authenticate", b'Bearer realm="vaultbeat-mcp-local"'),
                     ],
                 }
             )
@@ -104,10 +104,10 @@ def run_mcp_server(
             "The MCP SDK is not installed. Install with `pip install -e ./mcp-local-server`."
         ) from error
 
-    service = TetherLocalService(store or ConfigStore())
+    service = VaultbeatLocalService(store or ConfigStore())
     selected_transport = _normalize_transport(transport)
     mcp = FastMCP(
-        "Tether Local Sleep",
+        "Vaultbeat Local Sleep",
         host=host,
         port=port,
         streamable_http_path=_normalize_http_path(path),
@@ -116,16 +116,16 @@ def run_mcp_server(
     )
 
     @mcp.tool()
-    def tether_status() -> dict[str, Any]:
-        """Return local Tether binding state without exposing private keys or server tokens."""
+    def vaultbeat_status() -> dict[str, Any]:
+        """Return local Vaultbeat binding state without exposing private keys or server tokens."""
 
         return service.status()
 
     @mcp.tool()
-    async def tether_sync_sleep(
+    async def vaultbeat_sync_sleep(
         limit: int = 50, owner: str | None = None, fresh: bool = False
     ) -> dict[str, Any]:
-        """Fetch encrypted Tether sleep records, decrypt them locally, and return
+        """Fetch encrypted Vaultbeat sleep records, decrypt them locally, and return
         per-day primary session summaries matching the iOS app's display.
 
         Returns `daily_summary` (one primary session per local date, selected by
@@ -186,7 +186,7 @@ def run_mcp_server(
     async def get_notes(limit: int = 120, target_kind: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent free-text notes (sleep/menstrual day annotations) locally.
 
-        SENSITIVE free text written manually in Tether by either partner — e.g.
+        SENSITIVE free text written manually in Vaultbeat by either partner — e.g.
         "昨晚舍友很吵" on a sleep day, or a period-day remark. Each note carries
         `owner_user_id` (who wrote it), `target_kind` ("sleep" | "menstrual"),
         and `target_date` (the local day it annotates) — join against the
@@ -210,13 +210,13 @@ def run_mcp_server(
         return await service.menstrual_cycle_summary(limit=limit, owner=owner, fresh=fresh)
 
     @mcp.tool()
-    def tether_start_binding(server_name: str = "Local AI Server") -> dict[str, Any]:
+    def vaultbeat_start_binding(server_name: str = "Local AI Server") -> dict[str, Any]:
         """Initialize a binding session: generates a keypair (if needed) and returns a
-        QR payload that the user scans in the Tether iOS app to authorize this AI server.
+        QR payload that the user scans in the Vaultbeat iOS app to authorize this AI server.
 
         Returns `qr_payload_json` — a JSON string the AI should render as a QR code
-        for the user to scan, plus `poll_id` to pass to `tether_poll_binding`.
-        After the user scans, call `tether_poll_binding` to complete authorization.
+        for the user to scan, plus `poll_id` to pass to `vaultbeat_poll_binding`.
+        After the user scans, call `vaultbeat_poll_binding` to complete authorization.
         """
 
         session = service.start_binding(server_name=server_name)
@@ -227,10 +227,10 @@ def run_mcp_server(
         }
 
     @mcp.tool()
-    async def tether_poll_binding() -> dict[str, Any]:
+    async def vaultbeat_poll_binding() -> dict[str, Any]:
         """Check whether the user has scanned the QR code and authorized this server.
 
-        Call this after `tether_start_binding`. Returns `status`: "pending" (user hasn't
+        Call this after `vaultbeat_start_binding`. Returns `status`: "pending" (user hasn't
         scanned yet — wait and retry) or "bound" (success — server is now authorized
         and can decrypt health data). Polls once; call repeatedly with short delays
         until status is "bound" or you decide to time out.
@@ -253,7 +253,7 @@ def run_mcp_server(
         (contiguous stage bands with start/end), `stage_minutes`, and `stage_vitals`
         (per-stage HR/RR min/mean/max). Use `owner` prefix to filter by person
         (e.g. "dce9" for linyou, "f835" for partner). This is the primary tool for
-        detailed sleep analysis — richer than tether_sync_sleep.
+        detailed sleep analysis — richer than vaultbeat_sync_sleep.
         """
 
         return await service.sleep_detail_records(limit=limit, owner=owner, fresh=fresh)
@@ -322,7 +322,7 @@ def _serve_streamable_http(
         if not token:
             raise RuntimeError(
                 f"Refusing to bind {host}: HTTP transport on a non-loopback address exposes "
-                "decrypted sleep data. Run `serve --generate-token` (or set TETHER_MCP_HTTP_TOKEN), "
+                "decrypted sleep data. Run `serve --generate-token` (or set VAULTBEAT_MCP_HTTP_TOKEN), "
                 "or bind 127.0.0.1."
             )
         if not allow_remote:

@@ -1,10 +1,10 @@
-"""Shared pytest fixtures for the tether-mcp-local test suite."""
+"""Shared pytest fixtures for the vaultbeat-mcp-local test suite."""
 
 from __future__ import annotations
 
 import pytest
 
-import tether_mcp_local.store as store_module
+import vaultbeat_mcp_local.store as store_module
 
 
 @pytest.fixture(autouse=True)
@@ -12,7 +12,7 @@ def fake_keychain(monkeypatch: pytest.MonkeyPatch) -> dict[tuple[str, str], str]
     """Replace the real macOS Keychain with an in-memory dict.
 
     Monkeypatches ``keyring.set_password``, ``keyring.get_password``, and
-    ``keyring.delete_password`` (imported into ``tether_mcp_local.store``) so
+    ``keyring.delete_password`` (imported into ``vaultbeat_mcp_local.store``) so
     tests never pop a Keychain authorisation dialog and can run headless in CI.
 
     Returns the backing dict so tests can inspect what was stored.

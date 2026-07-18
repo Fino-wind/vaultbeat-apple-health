@@ -9,10 +9,10 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from tether_mcp_local.crypto import (
+from vaultbeat_mcp_local.crypto import (
     ENVELOPE_INFO,
     RecipientKey,
-    TetherCryptoError,
+    VaultbeatCryptoError,
     decrypt_blob_payload,
     decrypt_sleep_payload,
     encrypt_blob_payload,
@@ -121,18 +121,18 @@ def test_encrypt_blob_payload_multi_recipient_shares_one_dek_with_distinct_ephem
 def test_encrypt_blob_payload_rejects_no_recipients_and_bad_pubkey() -> None:
     try:
         encrypt_blob_payload(plaintext=b"x", recipients=[])
-    except TetherCryptoError:
+    except VaultbeatCryptoError:
         pass
     else:
-        raise AssertionError("expected TetherCryptoError for empty recipients")
+        raise AssertionError("expected VaultbeatCryptoError for empty recipients")
 
     bad = RecipientKey("mcp_server", "s", base64.b64encode(b"too-short").decode())
     try:
         encrypt_blob_payload(plaintext=b"x", recipients=[bad])
-    except TetherCryptoError:
+    except VaultbeatCryptoError:
         pass
     else:
-        raise AssertionError("expected TetherCryptoError for bad recipient public key")
+        raise AssertionError("expected VaultbeatCryptoError for bad recipient public key")
 
 
 # ---------------------------------------------------------------------------
@@ -150,14 +150,14 @@ def test_encrypt_blob_payload_rejects_no_recipients_and_bad_pubkey() -> None:
     ids=["empty", "5-bytes", "27-bytes"],
 )
 def test_decrypt_blob_payload_rejects_truncated_ciphertext(short_payload: bytes) -> None:
-    """_split_apple_aes_gcm_combined raises TetherCryptoError when len < 28."""
+    """_split_apple_aes_gcm_combined raises VaultbeatCryptoError when len < 28."""
     priv, pub = generate_x25519_keypair()
     _, envelopes = encrypt_blob_payload(
         plaintext=b"legit payload",
         recipients=[RecipientKey("owner_user", "u-1", pub)],
     )
     truncated_b64 = base64.b64encode(short_payload).decode()
-    with pytest.raises(TetherCryptoError, match="invalid AES-GCM combined payload"):
+    with pytest.raises(VaultbeatCryptoError, match="invalid AES-GCM combined payload"):
         decrypt_blob_payload(
             ciphertext_base64=truncated_b64,
             encrypted_data_key_base64=envelopes[0].encrypted_data_key_base64,
@@ -166,7 +166,7 @@ def test_decrypt_blob_payload_rejects_truncated_ciphertext(short_payload: bytes)
 
 
 def test_decrypt_blob_payload_rejects_truncated_wrapped_dek() -> None:
-    """_split_apple_aes_gcm_combined raises TetherCryptoError on short wrappedSymmetricKey."""
+    """_split_apple_aes_gcm_combined raises VaultbeatCryptoError on short wrappedSymmetricKey."""
     priv, pub = generate_x25519_keypair()
     ct_b64, envelopes = encrypt_blob_payload(
         plaintext=b"legit payload",
@@ -176,7 +176,7 @@ def test_decrypt_blob_payload_rejects_truncated_wrapped_dek() -> None:
     env_json["wrappedSymmetricKeyBase64"] = base64.b64encode(b"tooshort").decode()
     tampered_env_b64 = base64.b64encode(json.dumps(env_json).encode()).decode()
 
-    with pytest.raises(TetherCryptoError, match="invalid AES-GCM combined payload"):
+    with pytest.raises(VaultbeatCryptoError, match="invalid AES-GCM combined payload"):
         decrypt_blob_payload(
             ciphertext_base64=ct_b64,
             encrypted_data_key_base64=tampered_env_b64,
@@ -200,13 +200,13 @@ def test_decrypt_blob_payload_rejects_truncated_wrapped_dek() -> None:
     ids=["0-bytes", "5-bytes", "16-bytes", "33-bytes"],
 )
 def test_decrypt_blob_payload_rejects_wrong_length_private_key(bad_private_b64: str) -> None:
-    """crypto.py line 108: raises TetherCryptoError when private key != 32 bytes."""
+    """crypto.py line 108: raises VaultbeatCryptoError when private key != 32 bytes."""
     priv, pub = generate_x25519_keypair()
     ct_b64, envelopes = encrypt_blob_payload(
         plaintext=b"x",
         recipients=[RecipientKey("owner_user", "u-1", pub)],
     )
-    with pytest.raises(TetherCryptoError, match="X25519 private key must be 32 bytes"):
+    with pytest.raises(VaultbeatCryptoError, match="X25519 private key must be 32 bytes"):
         decrypt_blob_payload(
             ciphertext_base64=ct_b64,
             encrypted_data_key_base64=envelopes[0].encrypted_data_key_base64,
@@ -224,8 +224,8 @@ def test_decrypt_blob_payload_rejects_wrong_length_private_key(bad_private_b64: 
     ids=["0-bytes", "16-bytes", "31-bytes"],
 )
 def test_public_key_from_private_rejects_wrong_length(bad_private_b64: str) -> None:
-    """public_key_from_private line 84: raises TetherCryptoError when private key != 32 bytes."""
-    with pytest.raises(TetherCryptoError, match="X25519 private key must be 32 bytes"):
+    """public_key_from_private line 84: raises VaultbeatCryptoError when private key != 32 bytes."""
+    with pytest.raises(VaultbeatCryptoError, match="X25519 private key must be 32 bytes"):
         public_key_from_private(bad_private_b64)
 
 
@@ -239,8 +239,8 @@ def test_public_key_from_private_rejects_wrong_length(bad_private_b64: str) -> N
     ids=["0-bytes", "10-bytes", "31-bytes"],
 )
 def test_encrypt_blob_payload_rejects_wrong_length_recipient_pubkey(bad_recipient_pub_b64: str) -> None:
-    """encrypt_blob_payload line 181: raises TetherCryptoError when recipient public key != 32 bytes."""
-    with pytest.raises(TetherCryptoError, match="recipient public key must be 32 bytes"):
+    """encrypt_blob_payload line 181: raises VaultbeatCryptoError when recipient public key != 32 bytes."""
+    with pytest.raises(VaultbeatCryptoError, match="recipient public key must be 32 bytes"):
         encrypt_blob_payload(
             plaintext=b"x",
             recipients=[RecipientKey("owner_user", "u-1", bad_recipient_pub_b64)],
@@ -248,7 +248,7 @@ def test_encrypt_blob_payload_rejects_wrong_length_recipient_pubkey(bad_recipien
 
 
 def test_decrypt_blob_payload_rejects_wrong_length_sender_pubkey_in_envelope() -> None:
-    """crypto.py line 126: raises TetherCryptoError when senderPublicKeyBase64 != 32 bytes."""
+    """crypto.py line 126: raises VaultbeatCryptoError when senderPublicKeyBase64 != 32 bytes."""
     priv, pub = generate_x25519_keypair()
     ct_b64, envelopes = encrypt_blob_payload(
         plaintext=b"x",
@@ -258,7 +258,7 @@ def test_decrypt_blob_payload_rejects_wrong_length_sender_pubkey_in_envelope() -
     env_json["senderPublicKeyBase64"] = base64.b64encode(b"not32bytes").decode()
     tampered_env_b64 = base64.b64encode(json.dumps(env_json).encode()).decode()
 
-    with pytest.raises(TetherCryptoError, match="sender public key must be 32 bytes"):
+    with pytest.raises(VaultbeatCryptoError, match="sender public key must be 32 bytes"):
         decrypt_blob_payload(
             ciphertext_base64=ct_b64,
             encrypted_data_key_base64=tampered_env_b64,
@@ -272,7 +272,7 @@ def test_decrypt_blob_payload_rejects_wrong_length_sender_pubkey_in_envelope() -
 
 
 def test_decrypt_blob_payload_raises_on_tampered_ciphertext_tag() -> None:
-    """A flipped ciphertext tag surfaces as TetherCryptoError (InvalidTag is normalized at the crypto boundary so one bad envelope cannot abort a whole sync)."""
+    """A flipped ciphertext tag surfaces as VaultbeatCryptoError (InvalidTag is normalized at the crypto boundary so one bad envelope cannot abort a whole sync)."""
     priv, pub = generate_x25519_keypair()
     ct_b64, envelopes = encrypt_blob_payload(
         plaintext=b"secret data",
@@ -282,7 +282,7 @@ def test_decrypt_blob_payload_raises_on_tampered_ciphertext_tag() -> None:
     tampered_ct = ct[:-1] + bytes([ct[-1] ^ 0xFF])
     tampered_ct_b64 = base64.b64encode(tampered_ct).decode()
 
-    with pytest.raises(TetherCryptoError):
+    with pytest.raises(VaultbeatCryptoError):
         decrypt_blob_payload(
             ciphertext_base64=tampered_ct_b64,
             encrypted_data_key_base64=envelopes[0].encrypted_data_key_base64,
@@ -291,7 +291,7 @@ def test_decrypt_blob_payload_raises_on_tampered_ciphertext_tag() -> None:
 
 
 def test_decrypt_blob_payload_raises_on_tampered_wrapped_dek_tag() -> None:
-    """A flipped wrapped-DEK tag surfaces as TetherCryptoError (same boundary normalization)."""
+    """A flipped wrapped-DEK tag surfaces as VaultbeatCryptoError (same boundary normalization)."""
     priv, pub = generate_x25519_keypair()
     ct_b64, envelopes = encrypt_blob_payload(
         plaintext=b"secret data",
@@ -303,7 +303,7 @@ def test_decrypt_blob_payload_raises_on_tampered_wrapped_dek_tag() -> None:
     env_json["wrappedSymmetricKeyBase64"] = base64.b64encode(tampered_wsk).decode()
     tampered_env_b64 = base64.b64encode(json.dumps(env_json).encode()).decode()
 
-    with pytest.raises(TetherCryptoError):
+    with pytest.raises(VaultbeatCryptoError):
         decrypt_blob_payload(
             ciphertext_base64=ct_b64,
             encrypted_data_key_base64=tampered_env_b64,
@@ -317,7 +317,7 @@ def test_decrypt_blob_payload_raises_on_tampered_wrapped_dek_tag() -> None:
 
 
 def test_decrypt_blob_payload_rejects_non_json_envelope() -> None:
-    """crypto.py line 114: raises TetherCryptoError when envelope bytes are not valid JSON."""
+    """crypto.py line 114: raises VaultbeatCryptoError when envelope bytes are not valid JSON."""
     priv, pub = generate_x25519_keypair()
     ct_b64, _ = encrypt_blob_payload(
         plaintext=b"x",
@@ -325,7 +325,7 @@ def test_decrypt_blob_payload_rejects_non_json_envelope() -> None:
     )
     not_json_env_b64 = base64.b64encode(b"this is not json at all").decode()
 
-    with pytest.raises(TetherCryptoError, match="encrypted_data_key is not a JSON envelope"):
+    with pytest.raises(VaultbeatCryptoError, match="encrypted_data_key is not a JSON envelope"):
         decrypt_blob_payload(
             ciphertext_base64=ct_b64,
             encrypted_data_key_base64=not_json_env_b64,
@@ -334,7 +334,7 @@ def test_decrypt_blob_payload_rejects_non_json_envelope() -> None:
 
 
 def test_decrypt_blob_payload_rejects_json_array_envelope() -> None:
-    """crypto.py line 117: raises TetherCryptoError when envelope is a JSON array, not object."""
+    """crypto.py line 117: raises VaultbeatCryptoError when envelope is a JSON array, not object."""
     priv, pub = generate_x25519_keypair()
     ct_b64, _ = encrypt_blob_payload(
         plaintext=b"x",
@@ -342,7 +342,7 @@ def test_decrypt_blob_payload_rejects_json_array_envelope() -> None:
     )
     array_env_b64 = base64.b64encode(json.dumps([1, 2, 3]).encode()).decode()
 
-    with pytest.raises(TetherCryptoError, match="encrypted_data_key envelope must be an object"):
+    with pytest.raises(VaultbeatCryptoError, match="encrypted_data_key envelope must be an object"):
         decrypt_blob_payload(
             ciphertext_base64=ct_b64,
             encrypted_data_key_base64=array_env_b64,
@@ -356,7 +356,7 @@ def test_decrypt_blob_payload_rejects_json_array_envelope() -> None:
     ids=["missing-senderPubKey", "missing-wrappedSymKey"],
 )
 def test_decrypt_blob_payload_rejects_envelope_missing_required_field(missing_field: str) -> None:
-    """crypto.py line 121-122: raises TetherCryptoError when a required envelope field is absent."""
+    """crypto.py line 121-122: raises VaultbeatCryptoError when a required envelope field is absent."""
     priv, pub = generate_x25519_keypair()
     ct_b64, envelopes = encrypt_blob_payload(
         plaintext=b"x",
@@ -366,7 +366,7 @@ def test_decrypt_blob_payload_rejects_envelope_missing_required_field(missing_fi
     del env_json[missing_field]
     tampered_env_b64 = base64.b64encode(json.dumps(env_json).encode()).decode()
 
-    with pytest.raises(TetherCryptoError, match="encrypted_data_key envelope is missing key material"):
+    with pytest.raises(VaultbeatCryptoError, match="encrypted_data_key envelope is missing key material"):
         decrypt_blob_payload(
             ciphertext_base64=ct_b64,
             encrypted_data_key_base64=tampered_env_b64,
@@ -383,7 +383,7 @@ def test_decrypt_blob_payload_rejects_envelope_missing_required_field(missing_fi
     ids=["bad-senderPubKey-base64", "bad-wrappedSymKey-base64"],
 )
 def test_decrypt_blob_payload_rejects_non_base64_envelope_fields(field: str, bad_value: str) -> None:
-    """_b64decode raises TetherCryptoError when an envelope field is not valid base64."""
+    """_b64decode raises VaultbeatCryptoError when an envelope field is not valid base64."""
     priv, pub = generate_x25519_keypair()
     ct_b64, envelopes = encrypt_blob_payload(
         plaintext=b"x",
@@ -393,7 +393,7 @@ def test_decrypt_blob_payload_rejects_non_base64_envelope_fields(field: str, bad
     env_json[field] = bad_value
     tampered_env_b64 = base64.b64encode(json.dumps(env_json).encode()).decode()
 
-    with pytest.raises(TetherCryptoError, match="invalid base64 field"):
+    with pytest.raises(VaultbeatCryptoError, match="invalid base64 field"):
         decrypt_blob_payload(
             ciphertext_base64=ct_b64,
             encrypted_data_key_base64=tampered_env_b64,
@@ -402,13 +402,13 @@ def test_decrypt_blob_payload_rejects_non_base64_envelope_fields(field: str, bad
 
 
 def test_decrypt_blob_payload_rejects_non_base64_ciphertext() -> None:
-    """_b64decode raises TetherCryptoError when ciphertext_base64 is not valid base64."""
+    """_b64decode raises VaultbeatCryptoError when ciphertext_base64 is not valid base64."""
     priv, pub = generate_x25519_keypair()
     _, envelopes = encrypt_blob_payload(
         plaintext=b"x",
         recipients=[RecipientKey("owner_user", "u-1", pub)],
     )
-    with pytest.raises(TetherCryptoError, match="invalid base64 field: ciphertext"):
+    with pytest.raises(VaultbeatCryptoError, match="invalid base64 field: ciphertext"):
         decrypt_blob_payload(
             ciphertext_base64="not!!valid!!base64",
             encrypted_data_key_base64=envelopes[0].encrypted_data_key_base64,
@@ -417,13 +417,13 @@ def test_decrypt_blob_payload_rejects_non_base64_ciphertext() -> None:
 
 
 def test_decrypt_blob_payload_rejects_non_base64_private_key() -> None:
-    """_b64decode raises TetherCryptoError when private_key_base64 is not valid base64."""
+    """_b64decode raises VaultbeatCryptoError when private_key_base64 is not valid base64."""
     priv, pub = generate_x25519_keypair()
     ct_b64, envelopes = encrypt_blob_payload(
         plaintext=b"x",
         recipients=[RecipientKey("owner_user", "u-1", pub)],
     )
-    with pytest.raises(TetherCryptoError, match="invalid base64 field: private_key_base64"):
+    with pytest.raises(VaultbeatCryptoError, match="invalid base64 field: private_key_base64"):
         decrypt_blob_payload(
             ciphertext_base64=ct_b64,
             encrypted_data_key_base64=envelopes[0].encrypted_data_key_base64,
@@ -432,13 +432,13 @@ def test_decrypt_blob_payload_rejects_non_base64_private_key() -> None:
 
 
 def test_decrypt_blob_payload_rejects_non_base64_encrypted_data_key() -> None:
-    """_b64decode raises TetherCryptoError when encrypted_data_key_base64 is not valid base64."""
+    """_b64decode raises VaultbeatCryptoError when encrypted_data_key_base64 is not valid base64."""
     priv, pub = generate_x25519_keypair()
     ct_b64, _ = encrypt_blob_payload(
         plaintext=b"x",
         recipients=[RecipientKey("owner_user", "u-1", pub)],
     )
-    with pytest.raises(TetherCryptoError, match="invalid base64 field: encrypted_data_key"):
+    with pytest.raises(VaultbeatCryptoError, match="invalid base64 field: encrypted_data_key"):
         decrypt_blob_payload(
             ciphertext_base64=ct_b64,
             encrypted_data_key_base64="not!!valid!!base64",

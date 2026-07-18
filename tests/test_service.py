@@ -13,15 +13,15 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from tether_mcp_local.client import PollBindingResult
-from tether_mcp_local.crypto import ENVELOPE_INFO
-from tether_mcp_local.crypto import TetherCryptoError
-from tether_mcp_local.service import (
+from vaultbeat_mcp_local.client import PollBindingResult
+from vaultbeat_mcp_local.crypto import ENVELOPE_INFO
+from vaultbeat_mcp_local.crypto import VaultbeatCryptoError
+from vaultbeat_mcp_local.service import (
     BodyDay,
     detect_ovulation_from_wrist_temp,
     MenstrualDay,
     MenstrualSample,
-    TetherLocalService,
+    VaultbeatLocalService,
     WaterDay,
     parse_body_day,
     parse_menstrual_day,
@@ -30,7 +30,7 @@ from tether_mcp_local.service import (
     summarize_water_intake,
     summarize_weight_trend,
 )
-from tether_mcp_local.store import ConfigStore
+from vaultbeat_mcp_local.store import ConfigStore
 
 
 class FakeCloudClient:
@@ -131,7 +131,7 @@ def _make_envelope(
 def test_binding_session_persists_credentials_and_secure_file(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     cloud = FakeCloudClient()
-    service = TetherLocalService(ConfigStore(config_path), cloud)
+    service = VaultbeatLocalService(ConfigStore(config_path), cloud)
 
     session = service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
     result = asyncio.run(service.poll_once())
@@ -149,7 +149,7 @@ def test_binding_session_persists_credentials_and_secure_file(tmp_path: Path) ->
 def test_sync_decrypts_cloud_envelopes(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     cloud = FakeCloudClient()
-    service = TetherLocalService(ConfigStore(config_path), cloud)
+    service = VaultbeatLocalService(ConfigStore(config_path), cloud)
 
     service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
     asyncio.run(service.poll_once())
@@ -264,10 +264,10 @@ def test_parse_body_day_decodes_weight_and_reserved_nulls() -> None:
 def test_parse_body_day_requires_numeric_weight() -> None:
     try:
         parse_body_day({"dayID": "body-1", "dayStartDate": "2026-06-05T00:00:00Z", "weightKg": "82"})
-    except TetherCryptoError:
+    except VaultbeatCryptoError:
         pass
     else:
-        raise AssertionError("expected TetherCryptoError for non-numeric weightKg")
+        raise AssertionError("expected VaultbeatCryptoError for non-numeric weightKg")
 
 
 def test_summarize_weight_trend_empty_reports_none() -> None:
@@ -426,7 +426,7 @@ def test_detect_ovulation_missing_night_tolerance_is_bounded() -> None:
 
 def test_summarize_menstrual_cycle_fuses_detected_ovulation() -> None:
     # A detected biphasic shift re-anchors the prediction to ovulation + 14 —
-    # mirrors Swift's TetherMenstrualCycleSummary.calibrated so the app and
+    # mirrors Swift's VaultbeatMenstrualCycleSummary.calibrated so the app and
     # the AI keep agreeing on the date.
     days = _menstrual_days_from_gaps("2026-04-01", [28, 28])  # last start 2026-05-27
     readings = _wrist_readings(
@@ -503,10 +503,10 @@ def test_summarize_menstrual_cycle_counts_unspecified_as_bleeding() -> None:
 # --- end-to-end through the service (decrypt -> route by metric_type -> aggregate) -------
 
 
-def _bound_service(tmp_path: Path) -> tuple[TetherLocalService, FakeCloudClient, str]:
+def _bound_service(tmp_path: Path) -> tuple[VaultbeatLocalService, FakeCloudClient, str]:
     config_path = tmp_path / "config.json"
     cloud = FakeCloudClient()
-    service = TetherLocalService(ConfigStore(config_path), cloud)
+    service = VaultbeatLocalService(ConfigStore(config_path), cloud)
     service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
     asyncio.run(service.poll_once())
     public_key = ConfigStore(config_path).require_bound().public_key_base64
