@@ -11,6 +11,32 @@ class VaultbeatCloudError(RuntimeError):
     pass
 
 
+class VaultbeatUnsupportedMetricError(VaultbeatCloudError):
+    """The server does not recognise a metric type this client knows about.
+
+    Happens when the MCP server is newer than the deployed `mcp-sync` edge
+    function — the client asks for a kind the server's allowlist predates. It is
+    a version-skew condition, not a failure: every OTHER kind still works, so
+    callers should degrade to "this one kind is unavailable" instead of failing
+    the whole read. Kept a subclass of VaultbeatCloudError so existing
+    `except VaultbeatCloudError` handlers keep working unchanged.
+
+    Real incident this models: 2026-07-22 shipped `hrv_hourly` without adding it
+    to the edge allowlist, and because it was also `get_hrv`'s new DEFAULT
+    granularity, every default HRV read 400'd for two days rather than
+    returning "hourly unavailable, here's raw".
+    """
+
+    def __init__(self, metric_type: str, allowed: list[str] | None = None) -> None:
+        self.metric_type = metric_type
+        self.allowed = allowed or []
+        super().__init__(
+            f"Server does not support metric_type={metric_type!r}. "
+            "The Vaultbeat cloud function is older than this MCP server — "
+            "other data types are unaffected."
+        )
+
+
 @dataclass(frozen=True)
 class PollBindingResult:
     status: str
@@ -78,6 +104,94 @@ class VaultbeatCloudClient:
             raise VaultbeatCloudError("Cloud response has invalid envelopes shape")
         return [row for row in envelopes if isinstance(row, dict)]
 
+    async def write_strength_blob(
+        self,
+        server_token: str,
+        *,
+        blob: dict[str, Any],
+        envelopes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Upsert one already-encrypted strength blob + its envelopes.
+
+        The server never sees plaintext — `blob`/`envelopes` are pre-sealed by
+        the caller (``encrypt_blob_payload``). Mirrors ``mcp-sync``'s bearer-token
+        auth; the edge function does its own strength-only + ownership validation
+        server-side, this client is a thin transport.
+        """
+
+        import httpx
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.api_base_url}/mcp-write-strength",
+                headers={"Authorization": f"Bearer {server_token}"},
+                json={"blob": blob, "envelopes": envelopes},
+            )
+        return self._decode_response(response)
+
+    async def write_food_blob(
+        self,
+        server_token: str,
+        *,
+        blob: dict[str, Any],
+        envelopes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Same shape as `write_strength_blob`, different endpoint. The metric-
+        specific split (one edge function per writable kind) keeps each function's
+        allow-listed metric_type + recipient scope tight — a food write can never
+        widen its blast radius into strength/sleep/etc.
+        """
+
+        import httpx
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.api_base_url}/mcp-write-food",
+                headers={"Authorization": f"Bearer {server_token}"},
+                json={"blob": blob, "envelopes": envelopes},
+            )
+        return self._decode_response(response)
+
+    async def write_body_blob(
+        self,
+        server_token: str,
+        *,
+        blob: dict[str, Any],
+        envelopes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Agent-write path for metric_type="body" (weight). Same shape as
+        strength/food; edge fn narrows to body-only allow-list."""
+
+        import httpx
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.api_base_url}/mcp-write-body",
+                headers={"Authorization": f"Bearer {server_token}"},
+                json={"blob": blob, "envelopes": envelopes},
+            )
+        return self._decode_response(response)
+
+    async def write_note_blob(
+        self,
+        server_token: str,
+        *,
+        blob: dict[str, Any],
+        envelopes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Agent-write path for metric_type="note" (mood/general annotations).
+        Same shape as strength/food/body; edge fn narrows to note-only."""
+
+        import httpx
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.api_base_url}/mcp-write-note",
+                headers={"Authorization": f"Bearer {server_token}"},
+                json={"blob": blob, "envelopes": envelopes},
+            )
+        return self._decode_response(response)
+
     @staticmethod
     def _decode_response(response: "httpx.Response") -> dict[str, Any]:
         try:
@@ -88,6 +202,18 @@ class VaultbeatCloudClient:
         if response.status_code >= 400:
             error_code = payload.get("error") if isinstance(payload, dict) else None
             request_id = payload.get("request_id") if isinstance(payload, dict) else None
+
+            # Version skew gets its own type so callers can degrade one kind
+            # instead of failing the whole read. The edge echoes back both the
+            # rejected value and its allowlist, so carry them for a precise
+            # message.
+            if error_code == "invalid_metric_type" and isinstance(payload, dict):
+                allowed = payload.get("allowed")
+                raise VaultbeatUnsupportedMetricError(
+                    str(payload.get("metric_type", "<unknown>")),
+                    [str(x) for x in allowed] if isinstance(allowed, list) else None,
+                )
+
             detail = f"Cloud request failed: HTTP {response.status_code}"
             if error_code:
                 detail += f" error={error_code}"

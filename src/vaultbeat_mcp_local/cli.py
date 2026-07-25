@@ -51,6 +51,20 @@ def handle_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_doctor(args: argparse.Namespace) -> int:
+    report = asyncio.run(_service(args).doctor())
+    if getattr(args, "json", False):
+        _print_json(report)
+    else:
+        for check in report["checks"]:
+            marker = "[OK]  " if check["ok"] else "[FAIL]"
+            print(f"{marker} {check['name']}: {check['detail']}")
+            if not check["ok"] and check.get("hint"):
+                print(f"       → {check['hint']}")
+        print("All checks passed." if report["ok"] else "Some checks failed — follow the hints above.")
+    return 0 if report["ok"] else 1
+
+
 def handle_bind(args: argparse.Namespace) -> int:
     service = _service(args)
     session = service.start_binding(
@@ -192,8 +206,23 @@ def handle_mindfulness(args: argparse.Namespace) -> int:
 
 
 def handle_hrv(args: argparse.Namespace) -> int:
-    result = asyncio.run(_service(args).hrv_records(limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)))
-    _emit_decrypted(result, args, label="HRV (SDNN)")
+    granularity = getattr(args, "granularity", "hourly")
+    service_obj = _service(args)
+    if granularity == "raw":
+        result = asyncio.run(
+            service_obj.hrv_records(
+                limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)
+            )
+        )
+        label = "HRV (SDNN raw samples)"
+    else:
+        result = asyncio.run(
+            service_obj.hrv_hourly_records(
+                limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)
+            )
+        )
+        label = "HRV (SDNN hourly averages)"
+    _emit_decrypted(result, args, label=label)
     return 0 if not result.get("errors") else 3
 
 
@@ -211,6 +240,14 @@ def handle_notes(args: argparse.Namespace) -> int:
         _service(args).notes_summary(limit=args.limit, target_kind=args.kind, fresh=args.fresh)
     )
     _emit_decrypted(summary, args, label="notes")
+    return 0 if not summary.get("errors") else 3
+
+
+def handle_strength(args: argparse.Namespace) -> int:
+    summary = asyncio.run(
+        _service(args).strength_summary(limit=args.limit, limit_days=args.days, fresh=args.fresh)
+    )
+    _emit_decrypted(summary, args, label="strength sessions")
     return 0 if not summary.get("errors") else 3
 
 
@@ -493,7 +530,7 @@ def build_parser() -> argparse.ArgumentParser:
     mindfulness_parser.set_defaults(func=handle_mindfulness)
 
     hrv_parser = subparsers.add_parser(
-        "hrv", help="Decrypt recent HRV (SDNN) samples."
+        "hrv", help="Decrypt recent HRV (SDNN) — hourly aggregated by default, raw with --granularity raw."
     )
     hrv_parser.add_argument("--limit", type=int)
     hrv_parser.add_argument(
@@ -504,6 +541,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--fresh",
         action="store_true",
         help="Bypass the local record cache and force a cloud fetch.",
+    )
+    hrv_parser.add_argument(
+        "--granularity",
+        choices=("hourly", "raw"),
+        default="hourly",
+        help="hourly = one bucket per UTC hour (30d window, ≤720 records, saves context). "
+             "raw = one record per SDNN sample (3d window, spike-precision).",
     )
     hrv_parser.add_argument("--output")
     hrv_parser.set_defaults(func=handle_hrv)
@@ -553,8 +597,31 @@ def build_parser() -> argparse.ArgumentParser:
     notes_parser.add_argument("--output")
     notes_parser.set_defaults(func=handle_notes)
 
+    strength_parser = subparsers.add_parser(
+        "strength",
+        help="Decrypt recent strength-training sessions (exercise-level sets × reps).",
+    )
+    strength_parser.add_argument("--limit", type=int)
+    strength_parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Bypass the local record cache and force a cloud fetch.",
+    )
+    strength_parser.add_argument(
+        "--days", type=int, help="Keep only the most recent N sessions."
+    )
+    strength_parser.add_argument("--output")
+    strength_parser.set_defaults(func=handle_strength)
+
     status_parser = subparsers.add_parser("status", help="Show local binding state.")
     status_parser.set_defaults(func=handle_status)
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Self-diagnose the install and binding (config, key, cloud reachability, data round-trip).",
+    )
+    doctor_parser.add_argument("--json", action="store_true", help="Machine-readable output.")
+    doctor_parser.set_defaults(func=handle_doctor)
 
     serve_parser = subparsers.add_parser("serve", help="Run the MCP server over stdio or streamable HTTP.")
     serve_parser.add_argument(

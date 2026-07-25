@@ -184,17 +184,136 @@ def run_mcp_server(
 
     @mcp.tool()
     async def get_notes(limit: int = 120, target_kind: str | None = None, fresh: bool = False) -> dict[str, Any]:
-        """Decrypt recent free-text notes (sleep/menstrual day annotations) locally.
+        """Decrypt recent free-text notes (day annotations) locally.
 
-        SENSITIVE free text written manually in Vaultbeat by either partner — e.g.
-        "昨晚舍友很吵" on a sleep day, or a period-day remark. Each note carries
-        `owner_user_id` (who wrote it), `target_kind` ("sleep" | "menstrual"),
-        and `target_date` (the local day it annotates) — join against the
-        same-day metric data for pattern analysis. Pass target_kind to filter.
+        SENSITIVE free text. Each note carries `owner_user_id` (who wrote it),
+        `target_kind`, and `target_date` (the local day it annotates) — join
+        against the same-day metric data for pattern analysis. Kinds:
+        "sleep" | "menstrual" are written manually in the iOS app by either
+        partner (e.g. "昨晚舍友很吵" on a sleep day); "mood" | "general" are
+        agent-authored via `log_note`. Pass target_kind to filter.
         Stays on-device, never re-exported.
         """
 
         return await service.notes_summary(limit=limit, target_kind=target_kind, fresh=fresh)
+
+    @mcp.tool()
+    async def get_strength_log(
+        limit: int = 120, limit_days: int | None = None, fresh: bool = False
+    ) -> dict[str, Any]:
+        """Decrypt recent strength-training sessions locally (newest first).
+
+        Exercise-level detail HealthKit's workout type cannot carry: each
+        session lists exercises with their sets (weightKg × reps), an optional
+        session note, and `total_volume_kg` (Σ weight × reps). Logged manually
+        in Vaultbeat; owner's own sessions only — strength has no partner
+        fan-out. Join `date` against sleep/HRV/weight for training-load
+        analysis. Pass limit_days to cap how many sessions return.
+        """
+
+        return await service.strength_summary(limit=limit, limit_days=limit_days, fresh=fresh)
+
+    @mcp.tool()
+    async def log_strength_entry(
+        date: str, exercises: list[dict[str, Any]], note: str | None = None
+    ) -> dict[str, Any]:
+        """Log one strength-training session on the owner's behalf (agent write).
+
+        `date` is the LOCAL calendar day the session happened, "YYYY-MM-DD".
+        `exercises` is `[{"name": "卧推", "sets": [{"weightKg": 30, "reps": 8}, ...]}, ...]`.
+        Logging a day that already has a session (app- or agent-authored)
+        overwrites it in place rather than creating a duplicate. Encrypted
+        end-to-end before it ever leaves this machine — this server never
+        sends plaintext. Requires a bind made after this feature shipped
+        (carries owner_user_id/owner_public_key_base64/owner_device_id from
+        the pairing handshake); an older bind must re-pair via `bind`.
+        """
+
+        return await service.log_strength_entry(date=date, exercises=exercises, note=note)
+
+    @mcp.tool()
+    async def get_food_log(
+        limit: int = 90, limit_days: int | None = None, fresh: bool = False
+    ) -> dict[str, Any]:
+        """Decrypt recent daily food-intake logs locally (newest first).
+
+        Each day carries `meals`, each meal a list of `items` with `food` (name),
+        optional free-text `portion` ("1 根" / "300g" / "小份"), optional
+        per-item/per-meal `note`, and — when the logging agent estimated them —
+        optional structured nutrition numbers (`kcal`, `proteinGrams`,
+        `fatGrams`, `carbGrams`). Items without those fields need analysis-time
+        estimation from name + portion; items with them can be summed directly.
+        Owner's own days only. Pass limit_days to cap how many days return.
+        """
+
+        return await service.food_summary(limit=limit, limit_days=limit_days, fresh=fresh)
+
+    @mcp.tool()
+    async def log_food_entry(
+        date: str, meals: list[dict[str, Any]], note: str | None = None, merge: bool = False
+    ) -> dict[str, Any]:
+        """Log one day's food intake on the owner's behalf (agent write).
+
+        ⚠️ DEFAULT IS REPLACE-THE-WHOLE-DAY: with `merge=False`, the supplied
+        `meals` become the day's ENTIRE log — any meal you don't re-send is
+        silently deleted. To ADD a meal/snack to a day that already has
+        entries, pass `merge=True`: your meals are appended to the existing
+        day (a meal whose `name` matches an existing meal gets its items
+        appended to that meal), nothing already logged can be lost, and
+        `note=None` keeps the existing day note.
+
+        `date` is the LOCAL calendar day, "YYYY-MM-DD".
+        `meals` is a list of `{name?, timeOfDay?, items: [...], note?}` where each
+        item is `{food, portion?, note?, kcal?, proteinGrams?, fatGrams?, carbGrams?}`,
+        e.g. `[{"name": "lunch", "items": [{"food": "香蕉", "portion": "1 根", "kcal": 105}]}]`.
+        Everything but `food` is optional so a rushed "just log 香蕉" still works;
+        when you DO estimate nutrition at logging time, put the numbers in the
+        structured fields (snake_case aliases like `protein_g` are accepted) —
+        they persist for later sessions instead of being re-guessed each read.
+        Encrypted end-to-end before it ever leaves this machine.
+        """
+
+        return await service.log_food_entry(date=date, meals=meals, note=note, merge=merge)
+
+    @mcp.tool()
+    async def log_note(
+        text: str, kind: str = "general", date: str | None = None
+    ) -> dict[str, Any]:
+        """Log a free-text note on the owner's behalf (agent write).
+
+        For narratives that belong next to the metric data instead of in chat
+        history: `kind="mood"` for emotional state ("为什么今天情绪低落"),
+        `kind="general"` for day events worth joining against sleep/HRV later.
+        (sleep/menstrual notes stay iOS-authored — this tool refuses them.)
+
+        `date` = LOCAL calendar day "YYYY-MM-DD" (default today). One
+        agent-authored note per (kind, day): re-logging the same kind+day
+        OVERWRITES it — to add to an existing note, `get_notes` first and
+        resend the combined text. Read back via `get_notes` (optionally
+        `target_kind="mood"`/`"general"`). Encrypted end-to-end before it
+        ever leaves this machine.
+        """
+
+        return await service.log_note(text=text, kind=kind, date=date)
+
+    @mcp.tool()
+    async def log_weight_entry(weight_kg: float, date: str | None = None) -> dict[str, Any]:
+        """Log the owner's weight (kg) on their behalf (agent write, 2026-07-21).
+
+        `weight_kg`: kilograms (positive, ≤500). `date`: LOCAL calendar day
+        "YYYY-MM-DD" (default = today). Same-day upsert-in-place semantics
+        (dayID = "body-{dayStart.epoch}") — re-logging the same day overwrites.
+        Encrypted end-to-end before it ever leaves this machine.
+
+        ⚠️ Written data lands in Vaultbeat cloud + MCP (visible to
+        `get_weight_trend`). It does NOT propagate to Apple Health (HealthKit
+        is iOS-only; server-triggered HealthKit write would require iOS to
+        listen for a push, out of v1 scope). If the owner wants the number in
+        Apple Health app too, they need to also record it in the Vaultbeat
+        weight card on iOS.
+        """
+
+        return await service.log_weight_entry(weight_kg=weight_kg, date=date)
 
     @mcp.tool()
     async def get_menstrual_cycle(
@@ -281,18 +400,95 @@ def run_mcp_server(
         return await service.workout_records(limit=limit, owner=owner, fresh=fresh)
 
     @mcp.tool()
-    async def get_hrv(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
-        """Decrypt recent HRV (SDNN in ms) samples. Returns per-day records
-        plus average over the window. Use `owner` prefix to filter by person."""
+    async def get_hrv(
+        limit: int = 30,
+        owner: str | None = None,
+        fresh: bool = False,
+        granularity: str = "hourly",
+    ) -> dict[str, Any]:
+        """Decrypt recent HRV (SDNN in ms) — returns records plus average over the window.
 
-        return await service.hrv_records(limit=limit, owner=owner, fresh=fresh)
+        `granularity` selects between two backing kinds:
+        - `"hourly"` (default) — routes to `hrv_hourly` kind: one bucket per
+          UTC hour (arithmetic mean of every raw SDNN sample in the hour).
+          **30-day rolling window**, ≤720 records, includes `sample_count`
+          per bucket. Records also carry a `sdnn_ms` alias equal to the
+          hourly mean, so callers migrating from the pre-build-77 raw
+          default keep working without a field rename. Right for trend /
+          aggregate queries — SAVES CONTEXT vs raw.
+        - `"raw"` — routes to `hrv` kind: one record per SDNN sample (Apple
+          Watch emits every 5-15min). **3-day rolling window**; older raw
+          history lives in prior-recipient envelopes plus the
+          `VaultbeatHistoryBackfillCoordinator`-driven historical push
+          (advances 30d/24h on device wake-ups, up to 5 years). Use for
+          spike-precision questions (e.g. "HRV during the 3 minutes I
+          opened a stressful message"). Note: single-day count is often
+          30-100+ records.
+
+        ⚠️ `average_sdnn_ms` from the two granularities is **NOT directly
+        comparable** — they observe different windows (3d vs 30d) and, on
+        the raw side, also include legacy per-sample blobs from before
+        build 77. Use hourly for "what has my HRV been lately?" trend
+        answers; use raw only when you need per-sample precision inside
+        the last ~3 days. The equivalence claim in previous doc versions
+        was retracted 2026-07-22 after an adversarial review pointed out
+        the window mismatch.
+
+        Use `owner` prefix to filter by person (e.g. `"dce9"` / `"f835"`).
+        """
+
+        if granularity == "raw":
+            return await service.hrv_records(limit=limit, owner=owner, fresh=fresh)
+        # Default + explicit "hourly" → aggregate kind.
+        return await service.hrv_hourly_records(limit=limit, owner=owner, fresh=fresh)
 
     @mcp.tool()
     async def get_wrist_temp(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
-        """Decrypt recent sleeping wrist temperature samples (°C baseline deviation).
-        Returns per-day records plus average over the window. Use `owner` prefix to filter."""
+        """Decrypt recent sleeping wrist temperature samples — ABSOLUTE °C.
+
+        ⚠️ These are absolute skin temperatures (~35.5-36.5 °C), NOT baseline
+        deltas — the legacy `temperature_delta_celsius` field name is a wire-
+        contract misnomer (kept for compatibility; prefer the honest twin
+        `wrist_temperature_celsius`). For cycle analysis, derive the deviation
+        yourself: reading minus that person's rolling baseline. One sample per
+        night. Use `owner` prefix to filter."""
 
         return await service.wrist_temp_records(limit=limit, owner=owner, fresh=fresh)
+
+    @mcp.tool()
+    async def get_basal_energy(limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+        """Decrypt recent basal-energy-burned samples (Apple Watch BMR estimate, kcal).
+        Watch typically emits hourly samples; unlimited limit + daily aggregation
+        returns per-day BMR (~1500-2000 kcal for active young adults) + average.
+        Use `owner` prefix to filter by person."""
+
+        return await service.basal_energy_records(limit=limit, owner=owner, fresh=fresh)
+
+    @mcp.tool()
+    async def get_total_energy_burned(days: int = 7, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+        """TDEE (total daily energy expenditure) = basal + active per day, last N days.
+
+        The truthful daily calorie burn from Watch's actual measurements — not
+        a formula. Diet targets need to aim BELOW this to lose weight (e.g.
+        eating avg_tdee - 500 = ~0.5 kg/week loss). Returns per-day breakdown
+        {day, basal_kcal, active_kcal, total_kcal, basal_missing, partial} +
+        average TDEE. Today's row is flagged `partial` (still accumulating)
+        and excluded from the average — quote complete days for targets.
+        Use `owner` prefix to filter by person."""
+
+        return await service.total_energy_burned(days=days, owner=owner, fresh=fresh)
+
+    @mcp.tool()
+    async def get_vo2max(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+        """Decrypt recent VO2Max samples (Apple Watch cardiorespiratory fitness).
+        Unit: mL/(kg·min); higher = better. Male 20-29 reference: <35 poor,
+        35-42 fair, 42-46 good, 46-50 excellent, 50+ superior. Returns
+        newest-first records plus latest / peak / trough / average over the
+        window. Use `owner` prefix to filter by person. VO2Max is sparse (Watch
+        computes it during outdoor brisk walk/run bouts, days apart), so a
+        limit of 30 usually covers many months."""
+
+        return await service.vo2max_records(limit=limit, owner=owner, fresh=fresh)
 
     @mcp.tool()
     async def get_mindfulness(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
