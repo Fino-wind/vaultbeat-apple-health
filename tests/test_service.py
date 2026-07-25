@@ -2016,3 +2016,56 @@ def test_unsupported_metric_degrades_instead_of_raising(tmp_path: Path) -> None:
     )
     assert errors == []
     assert records[0].payload == {"stage": "asleep"}
+
+
+def test_doctor_reports_capability_gap_for_an_older_app(tmp_path: Path) -> None:
+    """An account whose app predates a feature must be told, not left guessing.
+
+    The first paying customer (2026-07-25) runs App Store 1.2.0, which has no
+    executor for strength / food / vo2max / basal_energy / hrv_hourly. Those
+    tools return empty with no error — identical, from the outside, to a broken
+    install. doctor names them and the iOS date each requires.
+    """
+    config_path = tmp_path / "config.json"
+    cloud = FakeCloudClient()
+    service = VaultbeatLocalService(ConfigStore(config_path), cloud)
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+    config = ConfigStore(config_path).require_bound()
+
+    # An old app writes sleep and activity, and nothing added after 2026-07-19.
+    cloud.envelopes = [
+        _make_envelope(config.public_key_base64, b'{"stage":"asleep"}'),
+    ]
+
+    report = asyncio.run(service.doctor())
+    caps = report["capabilities"]
+
+    assert caps["available"] is True
+    gated = caps["possibly_needs_newer_app"]
+    assert set(gated) == {"strength", "food", "vo2max", "basal_energy", "hrv_hourly"}
+    assert gated["basal_energy"] == "2026-07-21"
+    # It must not claim to know the app version — only that a newer one is needed.
+    assert "possibly" in "possibly_needs_newer_app"
+    assert "unrecorded" in caps["note"]
+
+
+def test_doctor_capability_report_is_quiet_when_everything_has_data(tmp_path: Path) -> None:
+    """No false alarm for an up-to-date account (the owner's own case)."""
+    config_path = tmp_path / "config.json"
+    cloud = FakeCloudClient()
+    service = VaultbeatLocalService(ConfigStore(config_path), cloud)
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+    config = ConfigStore(config_path).require_bound()
+
+    from vaultbeat_mcp_local.service import KNOWN_METRIC_TYPES
+
+    cloud.envelopes = [
+        _make_envelope(config.public_key_base64, b'{"v":1}', metric_type=kind, blob_id=f"blob-{kind}", envelope_id=f"env-{kind}")
+        for kind in sorted(KNOWN_METRIC_TYPES)
+    ]
+
+    caps = asyncio.run(service.doctor())["capabilities"]
+    assert caps["possibly_needs_newer_app"] == {}
+    assert caps["kinds_without_data"] == []

@@ -327,3 +327,97 @@ def test_get_hrv_prefers_hourly_when_available(monkeypatch: Any, tmp_path: Path)
 
     assert result["count"] == 1
     assert "granularity_note" not in result
+
+
+def _capture_tools(monkeypatch: Any) -> dict[str, Any]:
+    """Register the MCP surface against a fake FastMCP and return the tools."""
+    tools: dict[str, Any] = {}
+
+    class FakeFastMCP:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def tool(self) -> Any:
+            def decorator(function: Any) -> Any:
+                tools[function.__name__] = function
+                return function
+
+            return decorator
+
+        def run(self, **kwargs: Any) -> None:
+            pass
+
+    fake_module = types.ModuleType("mcp.server.fastmcp")
+    fake_module.FastMCP = FakeFastMCP
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_module)
+    return tools
+
+
+def test_empty_newer_kind_explains_itself(monkeypatch: Any, tmp_path: Path) -> None:
+    """An empty result for a post-1.2.0 kind must carry its own reason.
+
+    Otherwise `{"sessions": []}` is indistinguishable from "never trained" and
+    from "install is broken", and the agent has no way to tell the user which.
+    """
+    tools = _capture_tools(monkeypatch)
+
+    async def empty_strength(**_: Any) -> dict[str, Any]:
+        return {"sessions": [], "errors": []}
+
+    monkeypatch.setattr(
+        "vaultbeat_mcp_local.service.VaultbeatLocalService.strength_summary",
+        lambda self, **kw: empty_strength(**kw),
+    )
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    result = asyncio.run(tools["get_strength_log"]())
+    assert result["sessions"] == []
+    assert "2026-07-19" in result["hint"]
+    assert "vaultbeat_doctor" in result["hint"]
+    # Add-only: the original keys survive untouched.
+    assert result["errors"] == []
+
+
+def test_populated_result_is_left_completely_alone(monkeypatch: Any, tmp_path: Path) -> None:
+    """With data present, the response must be byte-identical to the service's.
+
+    Payload shape is the contract layer no server can validate, so the
+    annotation helper must be provably inert on the happy path.
+    """
+    tools = _capture_tools(monkeypatch)
+    payload = {"sessions": [{"exercises": [], "total_volume_kg": 100}], "errors": []}
+
+    async def full_strength(**_: Any) -> dict[str, Any]:
+        return dict(payload)
+
+    monkeypatch.setattr(
+        "vaultbeat_mcp_local.service.VaultbeatLocalService.strength_summary",
+        lambda self, **kw: full_strength(**kw),
+    )
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    result = asyncio.run(tools["get_strength_log"]())
+    assert result == payload
+    assert "hint" not in result
+
+
+def test_vaultbeat_doctor_is_exposed_as_a_tool(monkeypatch: Any, tmp_path: Path) -> None:
+    """The diagnostic must be reachable by the agent, not just from a terminal.
+
+    It lived only in the CLI until 2026-07-25, so an agent facing an empty
+    result had no way to find out why — the answer existed in a room it could
+    not enter.
+    """
+    tools = _capture_tools(monkeypatch)
+
+    async def fake_doctor(self: Any) -> dict[str, Any]:
+        return {"ok": True, "checks": [], "capabilities": {"available": True}}
+
+    monkeypatch.setattr(
+        "vaultbeat_mcp_local.service.VaultbeatLocalService.doctor", fake_doctor
+    )
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    assert "vaultbeat_doctor" in tools
+    result = asyncio.run(tools["vaultbeat_doctor"]())
+    assert result["capabilities"]["available"] is True
