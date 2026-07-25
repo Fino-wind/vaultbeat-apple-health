@@ -439,8 +439,34 @@ def run_mcp_server(
 
         if granularity == "raw":
             return await service.hrv_records(limit=limit, owner=owner, fresh=fresh)
-        # Default + explicit "hourly" → aggregate kind.
-        return await service.hrv_hourly_records(limit=limit, owner=owner, fresh=fresh)
+
+        # Default + explicit "hourly" → aggregate kind, but fall back to raw
+        # when it yields nothing.
+        #
+        # `hrv_hourly` only started being written by iOS build 77 (2026-07-22).
+        # An App Store user on 1.2.0 has plenty of raw HRV and zero hourly
+        # buckets, so serving the empty hourly result would report "no HRV
+        # data" to someone whose HRV data is sitting right there — a straight
+        # regression against 0.1.2, where get_hrv read raw unconditionally.
+        # Version skew between app and MCP is normal and permanent (users
+        # update the two independently), so the aggregate kind degrades to the
+        # kind it aggregates instead of pretending the data is absent.
+        hourly = await service.hrv_hourly_records(limit=limit, owner=owner, fresh=fresh)
+        if hourly.get("records"):
+            return hourly
+
+        raw = await service.hrv_records(limit=limit, owner=owner, fresh=fresh)
+        if not raw.get("records"):
+            return hourly  # genuinely no HRV at all — keep the hourly shape
+
+        raw["granularity"] = "raw"
+        raw["granularity_note"] = (
+            "Requested hourly averages, but this account has none — hourly HRV "
+            "requires the iOS app from 2026-07-22 or later. Returned raw "
+            "per-sample HRV instead; the numbers are the same measurements, "
+            "just not hour-averaged."
+        )
+        return raw
 
     @mcp.tool()
     async def get_wrist_temp(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
