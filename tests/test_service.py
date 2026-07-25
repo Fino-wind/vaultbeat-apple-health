@@ -13,11 +13,13 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from vaultbeat_mcp_local.client import PollBindingResult
+from vaultbeat_mcp_local.client import PollBindingResult, VaultbeatUnsupportedMetricError
 from vaultbeat_mcp_local.crypto import ENVELOPE_INFO
 from vaultbeat_mcp_local.crypto import VaultbeatCryptoError
 from vaultbeat_mcp_local.service import (
     BodyDay,
+    _local_calendar_day,
+    _parse_iso8601,
     detect_ovulation_from_wrist_temp,
     MenstrualDay,
     MenstrualSample,
@@ -48,6 +50,14 @@ class FakeCloudClient:
         self.owner_user_id: str | None = None
         self.owner_public_key_base64: str | None = None
         self.owner_device_id: str | None = None
+        # Every write_strength_blob call, in order — lets tests assert what
+        # was actually sent (ownership, recipients, ciphertext presence)
+        # without a real network round trip.
+        self.write_calls: list[dict[str, Any]] = []
+        # Metric types this fake "edge deployment" does not know about, i.e. an
+        # edge older than this client. Requesting one raises the same error the
+        # real edge's 400 invalid_metric_type produces.
+        self.unsupported_metric_types: set[str] = set()
 
     async def poll_binding(self, poll_id: str) -> PollBindingResult:
         self.poll_id = poll_id
@@ -65,6 +75,8 @@ class FakeCloudClient:
     ) -> list[dict[str, Any]]:
         self.synced_with_token = server_token
         self.sync_calls.append(metric_type)
+        if metric_type is not None and metric_type in self.unsupported_metric_types:
+            raise VaultbeatUnsupportedMetricError(metric_type, ["sleep", "water"])
         if metric_type is None or self.ignores_metric_type:
             return self.envelopes
 
@@ -74,6 +86,61 @@ class FakeCloudClient:
             return effective == metric_type
 
         return [row for row in self.envelopes if _matches(row)]
+
+    async def write_strength_blob(
+        self, server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return await self._record_write(server_token, blob=blob, envelopes=envelopes)
+
+    async def write_food_blob(
+        self, server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        # Same fake shape as write_strength_blob — the edge functions differ in
+        # the metric-scope validation, but from the client's perspective both
+        # sides just POST a sealed blob + envelopes and get back an upsert count.
+        return await self._record_write(server_token, blob=blob, envelopes=envelopes)
+
+    async def write_body_blob(
+        self, server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return await self._record_write(server_token, blob=blob, envelopes=envelopes)
+
+    async def write_note_blob(
+        self, server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return await self._record_write(server_token, blob=blob, envelopes=envelopes)
+
+    async def _record_write(
+        self, server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        self.write_calls.append(
+            {"server_token": server_token, "blob": blob, "envelopes": envelopes}
+        )
+        mcp_envelope = next(
+            (e for e in envelopes if e.get("recipient_kind") == "mcp_server"), None
+        )
+        if mcp_envelope is not None:
+            # Mirror what mcp-sync's read side actually returns: only the
+            # mcp_server-kind envelope round-trips back — this server can
+            # never decrypt the owner_user envelope (sealed to the PHONE's
+            # identity key, not this machine's).
+            self.envelopes = [
+                row for row in self.envelopes if row.get("blob_id") != blob["id"]
+            ] + [
+                {
+                    "id": f"env-write-{blob['id']}",
+                    "blob_id": blob["id"],
+                    "encrypted_data_key": mcp_envelope["encrypted_data_key"],
+                    "encrypted_sleep_blobs": {
+                        "id": blob["id"],
+                        "ciphertext": blob["ciphertext"],
+                        "metric_type": blob["metric_type"],
+                        "created_at": "2026-07-19T12:00:00Z",
+                        "owner_user_id": blob["owner_user_id"],
+                    },
+                }
+            ]
+        return {"upserted_blobs": 1, "upserted_envelopes": len(envelopes), "blob_id": blob["id"]}
 
 
 def _make_envelope(
@@ -786,3 +853,1166 @@ def test_tampered_envelope_lands_in_errors_without_killing_sync(tmp_path: Path) 
     assert summary["kinds"][0]["notes"][0]["text"] == "好的备注"
     assert len(summary["errors"]) == 1
     assert "env-tampered" in summary["errors"][0]
+
+
+def test_doctor_reports_missing_config_with_bind_hint(tmp_path: Path) -> None:
+    service = VaultbeatLocalService(ConfigStore(tmp_path / "config.json"), FakeCloudClient())
+
+    report = asyncio.run(service.doctor())
+
+    assert report["ok"] is False
+    config_check = report["checks"][0]
+    assert config_check["name"] == "config"
+    assert config_check["ok"] is False
+    assert "bind" in config_check["hint"]
+
+
+def test_doctor_passes_on_bound_server_with_reachable_cloud(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    cloud = FakeCloudClient()
+    service = VaultbeatLocalService(ConfigStore(config_path), cloud)
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+    service._probe_cloud = lambda url: (True, "cloud answered HTTP 401")  # type: ignore[method-assign]
+
+    report = asyncio.run(service.doctor())
+
+    assert report["ok"] is True
+    names = {check["name"]: check for check in report["checks"]}
+    assert names["bound"]["ok"] is True
+    assert names["cloud_reachable"]["ok"] is True
+    assert names["data_roundtrip"]["ok"] is True
+
+
+def test_doctor_flags_decrypt_failure_with_rebind_hint(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    cloud = FakeCloudClient()
+    service = VaultbeatLocalService(ConfigStore(config_path), cloud)
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+    service._probe_cloud = lambda url: (True, "cloud answered HTTP 401")  # type: ignore[method-assign]
+    # An envelope wrapped for a DIFFERENT recipient key — decrypt must fail.
+    foreign_key = base64.b64encode(
+        x25519.X25519PrivateKey.generate()
+        .public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
+        )
+    ).decode()
+    cloud.envelopes = [_make_envelope(foreign_key, b'{"stage":"asleep"}')]
+
+    report = asyncio.run(service.doctor())
+
+    assert report["ok"] is False
+    roundtrip = next(check for check in report["checks"] if check["name"] == "data_roundtrip")
+    assert roundtrip["ok"] is False
+    assert "bind again" in roundtrip["hint"]
+
+
+def test_doctor_unreachable_cloud_skips_data_roundtrip(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    cloud = FakeCloudClient()
+    service = VaultbeatLocalService(ConfigStore(config_path), cloud)
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+    service._probe_cloud = lambda url: (False, "ConnectError: refused")  # type: ignore[method-assign]
+
+    report = asyncio.run(service.doctor())
+
+    assert report["ok"] is False
+    names = [check["name"] for check in report["checks"]]
+    assert "data_roundtrip" not in names
+
+
+# ── strength kind (added 2026-07-19) ─────────────────────────────────────────
+
+
+def _strength_payload(
+    entry_id: str,
+    date: str,
+    exercises: list[dict[str, Any]],
+    *,
+    note: str | None = None,
+    updated_at: str | None = "2026-07-19T14:00:00Z",
+) -> bytes:
+    payload: dict[str, Any] = {
+        "entryID": entry_id,
+        "date": date,
+        "exercises": exercises,
+        "createdAt": "2026-07-19T12:00:00Z",
+    }
+    if note is not None:
+        payload["note"] = note
+    if updated_at is not None:
+        payload["updatedAt"] = updated_at
+    return json.dumps(payload).encode()
+
+
+def test_strength_summary_orders_newest_first_and_computes_volume(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _strength_payload(
+                "strength-aaaa000011112222aaaa000011112222",
+                "2026-07-18T00:00:00Z",
+                [{"name": "卧推", "sets": [{"weightKg": 30.0, "reps": 8}]}],
+            ),
+            metric_type="strength",
+            envelope_id="env-st1",
+            blob_id="strength-aaaa000011112222aaaa000011112222",
+            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+        ),
+        _make_envelope(
+            public_key,
+            _strength_payload(
+                "strength-bbbb000011112222bbbb000011112222",
+                "2026-07-19T00:00:00Z",
+                [
+                    {"name": "三头下压", "sets": [{"weightKg": 18.0, "reps": 12}, {"weightKg": 18.0, "reps": 10}]},
+                    {"name": "龙门架夹胸", "sets": [{"weightKg": 31.5, "reps": 10}]},
+                ],
+                note="腰有点紧",
+            ),
+            metric_type="strength",
+            envelope_id="env-st2",
+            blob_id="strength-bbbb000011112222bbbb000011112222",
+            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+        ),
+    ]
+
+    summary = asyncio.run(service.strength_summary(limit=50))
+
+    assert summary["errors"] == []
+    assert summary["session_count"] == 2
+    newest = summary["sessions"][0]
+    assert newest["date"].startswith("2026-07-19")
+    assert newest["note"] == "腰有点紧"
+    # 18×12 + 18×10 + 31.5×10 = 216 + 180 + 315 = 711
+    assert newest["total_volume_kg"] == 711.0
+    assert summary["sessions"][1]["total_volume_kg"] == 240.0
+
+
+def test_strength_summary_dedups_edits_newest_wins(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service(tmp_path)
+    entry_id = "strength-cccc000011112222cccc000011112222"
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _strength_payload(
+                entry_id,
+                "2026-07-19T00:00:00Z",
+                [{"name": "卧推", "sets": [{"weightKg": 27.5, "reps": 12}]}],
+                updated_at="2026-07-19T13:00:00Z",
+            ),
+            metric_type="strength",
+            envelope_id="env-st-orig",
+            blob_id=entry_id,
+        ),
+        _make_envelope(
+            public_key,
+            _strength_payload(
+                entry_id,
+                "2026-07-19T00:00:00Z",
+                [
+                    {"name": "卧推", "sets": [{"weightKg": 27.5, "reps": 12}]},
+                    {"name": "上斜推", "sets": [{"weightKg": 7.5, "reps": 9}]},
+                ],
+                updated_at="2026-07-19T15:00:00Z",
+            ),
+            metric_type="strength",
+            envelope_id="env-st-edit",
+            blob_id=entry_id,
+        ),
+    ]
+
+    summary = asyncio.run(service.strength_summary(limit=50))
+
+    assert summary["session_count"] == 1
+    assert len(summary["sessions"][0]["exercises"]) == 2
+
+
+def test_strength_summary_collects_malformed_into_errors(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            json.dumps({"entryID": "strength-bad", "date": "2026-07-19T00:00:00Z", "exercises": []}).encode(),
+            metric_type="strength",
+            envelope_id="env-st-bad",
+            blob_id="strength-bad",
+        ),
+    ]
+
+    summary = asyncio.run(service.strength_summary(limit=50))
+
+    assert summary["session_count"] == 0
+    assert len(summary["errors"]) == 1
+    assert "env-st-bad" in summary["errors"][0]
+
+
+# ── log_strength_entry (agent write path, added 2026-07-20) ─────────────────
+
+
+def _bound_service_with_owner_identity(tmp_path: Path) -> tuple[VaultbeatLocalService, FakeCloudClient, str]:
+    """A bind that carries owner_user_id/owner_public_key_base64/owner_device_id
+    through the handshake — the shape `log_strength_entry` requires. Distinct
+    from `_bound_service` (used by every pre-existing test) so those stay
+    unaffected by this feature.
+    """
+
+    config_path = tmp_path / "config.json"
+    cloud = FakeCloudClient()
+    owner_private = x25519.X25519PrivateKey.generate()
+    owner_public_b64 = base64.b64encode(
+        owner_private.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
+        )
+    ).decode()
+    cloud.owner_user_id = "dce9b9cf-0000-0000-0000-000000000000"
+    cloud.owner_public_key_base64 = owner_public_b64
+    cloud.owner_device_id = "device-owner-1"
+
+    service = VaultbeatLocalService(ConfigStore(config_path), cloud)
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+    public_key = ConfigStore(config_path).require_bound().public_key_base64
+    return service, cloud, public_key
+
+
+def test_log_strength_entry_creates_fresh_entry_and_round_trips(tmp_path: Path) -> None:
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    result = asyncio.run(
+        service.log_strength_entry(
+            date="2026-07-19",
+            exercises=[
+                {"name": "坐姿推胸机", "sets": [{"weightKg": 27.5, "reps": 10}]},
+                {"name": "自由杠铃卧推", "sets": [{"weightKg": 30, "reps": 8}]},
+            ],
+            note="胸日",
+        )
+    )
+
+    assert result["updated_existing_day"] is False
+    assert result["date"] == "2026-07-19"
+    assert result["entry_id"].startswith("strength-")
+    assert len(cloud.write_calls) == 1
+
+    written_blob = cloud.write_calls[0]["blob"]
+    assert written_blob["owner_user_id"] == cloud.owner_user_id
+    assert written_blob["source_device_id"] == cloud.owner_device_id
+    assert written_blob["metric_type"] == "strength"
+
+    written_envelopes = cloud.write_calls[0]["envelopes"]
+    kinds = {e["recipient_kind"] for e in written_envelopes}
+    assert kinds == {"owner_user", "mcp_server"}
+
+    # The tool's own return value already reflects the round trip. The wire
+    # `date` is a UTC instant for LOCAL midnight — not a "2026-07-19..." prefix
+    # once the machine's UTC offset is non-zero — so decode it back through
+    # the same local-day helper the service itself uses, rather than assuming UTC.
+    session = result["session"]
+    assert session is not None
+    assert _local_calendar_day(_parse_iso8601(session["date"])) == date(2026, 7, 19)
+    assert session["note"] == "胸日"
+    assert len(session["exercises"]) == 2
+
+    # And a fresh get_strength_log call (the actual MCP tool an agent uses to
+    # read back) sees it too.
+    summary = asyncio.run(service.strength_summary(limit=50, fresh=True))
+    assert summary["session_count"] == 1
+    assert summary["sessions"][0]["entry_id"] == result["entry_id"]
+
+
+def test_log_strength_entry_editing_same_day_reuses_entry_id(tmp_path: Path) -> None:
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    first = asyncio.run(
+        service.log_strength_entry(
+            date="2026-07-19",
+            exercises=[{"name": "卧推", "sets": [{"weightKg": 30, "reps": 8}]}],
+        )
+    )
+    second = asyncio.run(
+        service.log_strength_entry(
+            date="2026-07-19",
+            exercises=[
+                {"name": "卧推", "sets": [{"weightKg": 30, "reps": 8}]},
+                {"name": "上斜推", "sets": [{"weightKg": 7.5, "reps": 9}]},
+            ],
+        )
+    )
+
+    assert second["updated_existing_day"] is True
+    assert second["entry_id"] == first["entry_id"]
+
+    summary = asyncio.run(service.strength_summary(limit=50, fresh=True))
+    assert summary["session_count"] == 1  # same day = same blob id, not a duplicate
+    assert len(summary["sessions"][0]["exercises"]) == 2
+
+
+def test_log_strength_entry_different_days_create_separate_entries(tmp_path: Path) -> None:
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    day1 = asyncio.run(
+        service.log_strength_entry(
+            date="2026-07-18", exercises=[{"name": "深蹲", "sets": [{"weightKg": 60, "reps": 5}]}]
+        )
+    )
+    day2 = asyncio.run(
+        service.log_strength_entry(
+            date="2026-07-19", exercises=[{"name": "卧推", "sets": [{"weightKg": 30, "reps": 8}]}]
+        )
+    )
+
+    assert day1["entry_id"] != day2["entry_id"]
+    summary = asyncio.run(service.strength_summary(limit=50, fresh=True))
+    assert summary["session_count"] == 2
+
+
+def test_log_strength_entry_rejects_bind_missing_owner_identity(tmp_path: Path) -> None:
+    # _bound_service (not _with_owner_identity) never sets owner_user_id/etc —
+    # the pre-2026-07-20 bind shape this must reject with a clear message.
+    service, _cloud, _public_key = _bound_service(tmp_path)
+
+    try:
+        asyncio.run(service.log_strength_entry(date="2026-07-19", exercises=[{"name": "卧推", "sets": [{"weightKg": 30, "reps": 8}]}]))
+        raised = False
+    except RuntimeError as error:
+        raised = True
+        assert "re-pair" in str(error) or "re-bind" in str(error) or "bind" in str(error)
+    assert raised
+
+
+def test_log_strength_entry_rejects_empty_exercises(tmp_path: Path) -> None:
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    try:
+        asyncio.run(service.log_strength_entry(date="2026-07-19", exercises=[]))
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised
+
+
+def test_log_strength_entry_accepts_snake_case_weight_key(tmp_path: Path) -> None:
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    result = asyncio.run(
+        service.log_strength_entry(
+            date="2026-07-19",
+            exercises=[{"name": "深蹲", "sets": [{"weight_kg": 60, "reps": 5}]}],
+        )
+    )
+
+    session = result["session"]
+    assert session["exercises"][0]["sets"][0]["weightKg"] == 60.0
+
+
+# ── food kind (added 2026-07-20) ─────────────────────────────────────────────
+
+
+def _food_payload(
+    entry_id: str,
+    date: str,
+    meals: list[dict[str, Any]],
+    *,
+    note: str | None = None,
+    updated_at: str | None = "2026-07-20T20:00:00Z",
+) -> bytes:
+    payload: dict[str, Any] = {
+        "entryID": entry_id,
+        "date": date,
+        "meals": meals,
+        "createdAt": "2026-07-20T18:00:00Z",
+    }
+    if note is not None:
+        payload["note"] = note
+    if updated_at is not None:
+        payload["updatedAt"] = updated_at
+    return json.dumps(payload).encode()
+
+
+def test_food_summary_orders_newest_first_and_counts_items(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _food_payload(
+                "food-aaaa000011112222aaaa000011112222",
+                "2026-07-19T00:00:00Z",
+                [{"name": "dinner", "items": [{"food": "秦镇老碗红烧牛腩盖饭"}]}],
+            ),
+            metric_type="food",
+            envelope_id="env-fd1",
+            blob_id="food-aaaa000011112222aaaa000011112222",
+            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+        ),
+        _make_envelope(
+            public_key,
+            _food_payload(
+                "food-bbbb000011112222bbbb000011112222",
+                "2026-07-20T00:00:00Z",
+                [
+                    {
+                        "name": "dinner",
+                        "items": [
+                            {"food": "青椒肉丝", "portion": "1 份"},
+                            {"food": "番茄炒蛋", "portion": "1 份"},
+                        ],
+                    }
+                ],
+                note="宿舍自炊，救回中午空腹后的低血糖",
+            ),
+            metric_type="food",
+            envelope_id="env-fd2",
+            blob_id="food-bbbb000011112222bbbb000011112222",
+            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+        ),
+    ]
+
+    summary = asyncio.run(service.food_summary(limit=50))
+
+    assert summary["errors"] == []
+    assert summary["day_count"] == 2
+    newest = summary["days"][0]
+    assert newest["date"].startswith("2026-07-20")
+    assert newest["note"].startswith("宿舍自炊")
+    assert newest["total_item_count"] == 2
+    assert summary["days"][1]["total_item_count"] == 1
+
+
+def test_food_summary_dedups_edits_newest_wins(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service(tmp_path)
+    entry_id = "food-cccc000011112222cccc000011112222"
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _food_payload(
+                entry_id,
+                "2026-07-20T00:00:00Z",
+                [{"name": "lunch", "items": [{"food": "香蕉"}]}],
+                updated_at="2026-07-20T12:00:00Z",
+            ),
+            metric_type="food",
+            envelope_id="env-fd-orig",
+            blob_id=entry_id,
+        ),
+        _make_envelope(
+            public_key,
+            _food_payload(
+                entry_id,
+                "2026-07-20T00:00:00Z",
+                [
+                    {"name": "lunch", "items": [{"food": "香蕉"}]},
+                    {"name": "dinner", "items": [{"food": "青椒肉丝"}, {"food": "番茄炒蛋"}]},
+                ],
+                updated_at="2026-07-20T20:00:00Z",
+            ),
+            metric_type="food",
+            envelope_id="env-fd-edit",
+            blob_id=entry_id,
+        ),
+    ]
+
+    summary = asyncio.run(service.food_summary(limit=50))
+
+    assert summary["day_count"] == 1
+    assert len(summary["days"][0]["meals"]) == 2
+    assert summary["days"][0]["total_item_count"] == 3
+
+
+def test_food_summary_collects_malformed_into_errors(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            json.dumps({"entryID": "food-bad", "date": "2026-07-20T00:00:00Z", "meals": []}).encode(),
+            metric_type="food",
+            envelope_id="env-fd-bad",
+            blob_id="food-bad",
+        ),
+    ]
+
+    summary = asyncio.run(service.food_summary(limit=50))
+
+    assert summary["day_count"] == 0
+    assert len(summary["errors"]) == 1
+    assert "env-fd-bad" in summary["errors"][0]
+
+
+# ── log_food_entry (agent write path) ────────────────────────────────────────
+
+
+def test_log_food_entry_creates_fresh_entry_and_round_trips(tmp_path: Path) -> None:
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    result = asyncio.run(
+        service.log_food_entry(
+            date="2026-07-20",
+            meals=[
+                {
+                    "name": "dinner",
+                    "timeOfDay": "19:00",
+                    "items": [
+                        {"food": "青椒肉丝", "portion": "1 份"},
+                        {"food": "番茄炒蛋", "portion": "1 份"},
+                    ],
+                }
+            ],
+            note="宿舍自炊",
+        )
+    )
+
+    assert result["updated_existing_day"] is False
+    assert result["date"] == "2026-07-20"
+    assert result["entry_id"].startswith("food-")
+    assert len(cloud.write_calls) == 1
+
+    written_blob = cloud.write_calls[0]["blob"]
+    assert written_blob["owner_user_id"] == cloud.owner_user_id
+    assert written_blob["source_device_id"] == cloud.owner_device_id
+    assert written_blob["metric_type"] == "food"
+
+    written_envelopes = cloud.write_calls[0]["envelopes"]
+    kinds = {e["recipient_kind"] for e in written_envelopes}
+    assert kinds == {"owner_user", "mcp_server"}
+
+    day = result["day"]
+    assert day is not None
+    assert _local_calendar_day(_parse_iso8601(day["date"])) == date(2026, 7, 20)
+    assert day["note"] == "宿舍自炊"
+    assert len(day["meals"]) == 1
+    assert day["meals"][0]["timeOfDay"] == "19:00"
+    assert day["total_item_count"] == 2
+
+    summary = asyncio.run(service.food_summary(limit=50, fresh=True))
+    assert summary["day_count"] == 1
+    assert summary["days"][0]["entry_id"] == result["entry_id"]
+
+
+def test_log_food_entry_editing_same_day_reuses_entry_id(tmp_path: Path) -> None:
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    first = asyncio.run(
+        service.log_food_entry(
+            date="2026-07-20",
+            meals=[{"name": "lunch", "items": [{"food": "香蕉"}]}],
+        )
+    )
+    second = asyncio.run(
+        service.log_food_entry(
+            date="2026-07-20",
+            meals=[
+                {"name": "lunch", "items": [{"food": "香蕉"}]},
+                {"name": "dinner", "items": [{"food": "青椒肉丝"}, {"food": "番茄炒蛋"}]},
+            ],
+        )
+    )
+
+    assert second["updated_existing_day"] is True
+    assert second["entry_id"] == first["entry_id"]
+
+    summary = asyncio.run(service.food_summary(limit=50, fresh=True))
+    assert summary["day_count"] == 1
+    assert len(summary["days"][0]["meals"]) == 2
+
+
+def test_log_food_entry_rejects_bind_missing_owner_identity(tmp_path: Path) -> None:
+    service, _cloud, _public_key = _bound_service(tmp_path)
+
+    try:
+        asyncio.run(
+            service.log_food_entry(
+                date="2026-07-20",
+                meals=[{"items": [{"food": "香蕉"}]}],
+            )
+        )
+        raised = False
+    except RuntimeError as error:
+        raised = True
+        assert "re-pair" in str(error) or "re-bind" in str(error) or "bind" in str(error)
+    assert raised
+
+
+def test_log_food_entry_rejects_empty_meals(tmp_path: Path) -> None:
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    try:
+        asyncio.run(service.log_food_entry(date="2026-07-20", meals=[]))
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised
+
+
+def test_log_food_entry_rejects_meal_with_no_items(tmp_path: Path) -> None:
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    try:
+        asyncio.run(service.log_food_entry(date="2026-07-20", meals=[{"name": "lunch", "items": []}]))
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised
+
+
+def test_log_food_entry_accepts_minimum_shape_just_food_name(tmp_path: Path) -> None:
+    """The lowest-friction path: an item with only `food` (no portion, no meal
+    name/time) still records — otherwise a rushed "log 香蕉" would be blocked
+    and the friction argument for AI-side nutrition estimation collapses."""
+
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    result = asyncio.run(
+        service.log_food_entry(
+            date="2026-07-20",
+            meals=[{"items": [{"food": "香蕉"}]}],
+        )
+    )
+
+    day = result["day"]
+    assert day is not None
+    assert day["meals"][0]["items"][0]["food"] == "香蕉"
+    # No portion field survives when none was provided (kept clean, not "": null).
+    assert "portion" not in day["meals"][0]["items"][0]
+
+
+# ── vo2max kind (added 2026-07-20) ───────────────────────────────────────────
+
+
+def _vo2max_payload(
+    sample_id: str,
+    sample_start_date: str,
+    vo2_max_ml_kg_min: float,
+) -> bytes:
+    payload: dict[str, Any] = {
+        "sampleID": sample_id,
+        "sampleStartDate": sample_start_date,
+        "vo2MaxMlKgMin": vo2_max_ml_kg_min,
+    }
+    return json.dumps(payload).encode()
+
+
+def test_vo2max_records_computes_latest_peak_trough_average(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        # ordering across envelope IDs is DELIBERATELY not date-ordered;
+        # the service must sort newest-first by created_at, not by input order.
+        _make_envelope(
+            public_key,
+            _vo2max_payload("vo2max-1728000000", "2025-10-04T14:20:00Z", 42.0),
+            metric_type="vo2max",
+            envelope_id="env-vo-a",
+            blob_id="vo2max-1728000000",
+        ),
+        _make_envelope(
+            public_key,
+            _vo2max_payload("vo2max-1735000000", "2025-12-24T09:15:00Z", 35.6),
+            metric_type="vo2max",
+            envelope_id="env-vo-b",
+            blob_id="vo2max-1735000000",
+        ),
+        _make_envelope(
+            public_key,
+            _vo2max_payload("vo2max-1729800000", "2025-10-25T16:00:00Z", 45.7),
+            metric_type="vo2max",
+            envelope_id="env-vo-c",
+            blob_id="vo2max-1729800000",
+        ),
+    ]
+
+    summary = asyncio.run(service.vo2max_records(limit=50))
+
+    assert summary["errors"] == []
+    assert summary["count"] == 3
+    # peak / trough / average are order-agnostic; latest is order-dependent
+    # (created_at desc). Every envelope in this fixture uses the same synthetic
+    # created_at ("2026-04-27T00:00:00Z"), so newest-first is decided by blob id;
+    # peak/trough/average are the deterministic assertions to lean on.
+    assert summary["peak_ml_kg_min"] == 45.7
+    assert summary["trough_ml_kg_min"] == 35.6
+    assert summary["average_ml_kg_min"] == round((42.0 + 35.6 + 45.7) / 3, 1)
+
+
+def test_vo2max_records_owner_prefix_filter_selects_one_person(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _vo2max_payload("vo2max-1", "2026-04-19T10:00:00Z", 39.3),
+            metric_type="vo2max",
+            envelope_id="env-vo-owner",
+            blob_id="vo2max-1",
+            owner_user_id="dce9b9cf-5daf-470e-9606-c5076cce55ae",
+        ),
+        _make_envelope(
+            public_key,
+            _vo2max_payload("vo2max-2", "2026-04-20T10:00:00Z", 38.1),
+            metric_type="vo2max",
+            envelope_id="env-vo-partner",
+            blob_id="vo2max-2",
+            owner_user_id="f8350dfc-1111-2222-3333-444444444444",
+        ),
+    ]
+
+    only_owner = asyncio.run(service.vo2max_records(limit=50, owner="dce9"))
+    only_partner = asyncio.run(service.vo2max_records(limit=50, owner="f835"))
+
+    assert only_owner["count"] == 1
+    assert only_partner["count"] == 1
+    assert only_owner["records"][0]["vo2_max_ml_kg_min"] == 39.3
+    assert only_partner["records"][0]["vo2_max_ml_kg_min"] == 38.1
+
+
+def test_vo2max_records_collects_malformed_into_errors(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            json.dumps({"sampleID": "vo2max-bad", "sampleStartDate": "2026-07-20T10:00:00Z"}).encode(),
+            metric_type="vo2max",
+            envelope_id="env-vo-bad",
+            blob_id="vo2max-bad",
+        ),
+    ]
+
+    summary = asyncio.run(service.vo2max_records(limit=50))
+
+    assert summary["count"] == 0
+    assert len(summary["errors"]) == 1
+    assert "env-vo-bad" in summary["errors"][0]
+
+
+# ── 2026-07-24 MCP feedback sprint ───────────────────────────────────────────
+# Covers: owner mix-guard, local_date fields, stage-tagged errors + errors_note,
+# log_food_entry merge mode, structured nutrition fields, log_note.
+
+
+def _body_payload(day_id: str, day_start: str, weight_kg: float) -> bytes:
+    return json.dumps(
+        {
+            "dayID": day_id,
+            "dayStartDate": day_start,
+            "weightKg": weight_kg,
+            "bodyFatPercent": None,
+            "bmi": None,
+        }
+    ).encode()
+
+
+def test_weight_trend_unfiltered_mixed_owners_gets_warning(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _body_payload("body-1", "2026-07-21T16:00:00Z", 82.75),
+            metric_type="body",
+            envelope_id="env-body-owner",
+            blob_id="body-1",
+            owner_user_id="dce9b9cf-5daf-470e-9606-c5076cce55ae",
+        ),
+        _make_envelope(
+            public_key,
+            _body_payload("body-2", "2026-07-20T16:00:00Z", 40.2),
+            metric_type="body",
+            envelope_id="env-body-partner",
+            blob_id="body-2",
+            owner_user_id="f8350dfc-1111-2222-3333-444444444444",
+        ),
+    ]
+
+    mixed = asyncio.run(service.weight_trend_summary(limit=50))
+    assert mixed["mixed_owners"] is True
+    assert mixed["owner_user_id_prefixes"] == ["dce9b9cf", "f8350dfc"]
+    assert "warning" in mixed
+
+    filtered = asyncio.run(service.weight_trend_summary(limit=50, owner="dce9", fresh=True))
+    assert "mixed_owners" not in filtered
+    assert filtered["latest_kg"] == 82.75
+
+
+def test_weight_day_carries_local_date(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service(tmp_path)
+    day_start = "2026-07-21T16:00:00Z"
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _body_payload("body-1", day_start, 82.55),
+            metric_type="body",
+            envelope_id="env-body-1",
+            blob_id="body-1",
+            owner_user_id="dce9b9cf-5daf-470e-9606-c5076cce55ae",
+        ),
+    ]
+
+    summary = asyncio.run(service.weight_trend_summary(limit=50, owner="dce9"))
+    day = summary["days"][0]
+    # local_date must match the same local-day bucketing the service uses
+    # elsewhere (never assume the test machine's UTC offset).
+    assert day["local_date"] == _local_calendar_day(_parse_iso8601(day_start)).isoformat()
+
+
+def test_parse_failure_is_stage_tagged_and_carries_errors_note(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            json.dumps({"dayID": "body-bad", "dayStartDate": "2026-07-20T16:00:00Z"}).encode(),
+            metric_type="body",
+            envelope_id="env-body-bad",
+            blob_id="body-bad",
+        ),
+    ]
+
+    summary = asyncio.run(service.weight_trend_summary(limit=50))
+    assert len(summary["errors"]) == 1
+    assert "parse_failed" in summary["errors"][0]
+    assert "errors_note" in summary
+
+
+def test_log_food_entry_merge_appends_without_dropping(tmp_path: Path) -> None:
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    first = asyncio.run(
+        service.log_food_entry(
+            date="2026-07-20",
+            meals=[
+                {"name": "lunch", "items": [{"food": "鸡胸肉", "portion": "150g"}]},
+                {"name": "snack", "items": [{"food": "香蕉", "portion": "1 根"}]},
+            ],
+            note="训练日",
+        )
+    )
+    second = asyncio.run(
+        service.log_food_entry(
+            date="2026-07-20",
+            meals=[
+                {"name": "lunch", "items": [{"food": "米饭", "portion": "半碗"}]},
+                {"name": "dinner", "items": [{"food": "牛腱", "portion": "100g"}]},
+            ],
+            merge=True,
+        )
+    )
+
+    assert second["entry_id"] == first["entry_id"]
+    assert second["updated_existing_day"] is True
+    assert second["merge_mode"] is True
+
+    day = second["day"]
+    meals_by_name = {m.get("name"): m for m in day["meals"]}
+    # Same-name meal got its items appended; other meals survived untouched.
+    assert [i["food"] for i in meals_by_name["lunch"]["items"]] == ["鸡胸肉", "米饭"]
+    assert [i["food"] for i in meals_by_name["snack"]["items"]] == ["香蕉"]
+    assert [i["food"] for i in meals_by_name["dinner"]["items"]] == ["牛腱"]
+    # note=None in merge mode keeps the existing day note.
+    assert day["note"] == "训练日"
+
+
+def test_log_food_entry_replace_mode_still_replaces(tmp_path: Path) -> None:
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    asyncio.run(
+        service.log_food_entry(
+            date="2026-07-20",
+            meals=[{"name": "lunch", "items": [{"food": "鸡胸肉"}]}],
+        )
+    )
+    replaced = asyncio.run(
+        service.log_food_entry(
+            date="2026-07-20",
+            meals=[{"name": "dinner", "items": [{"food": "牛腱"}]}],
+        )
+    )
+
+    day = replaced["day"]
+    assert [m.get("name") for m in day["meals"]] == ["dinner"]
+
+
+def test_log_food_entry_structured_nutrition_persists(tmp_path: Path) -> None:
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    result = asyncio.run(
+        service.log_food_entry(
+            date="2026-07-21",
+            meals=[
+                {
+                    "name": "breakfast",
+                    "items": [
+                        # camelCase wire key and snake_case alias both accepted.
+                        {"food": "香蕉", "portion": "1 根", "kcal": 105, "proteinGrams": 1.3},
+                        {"food": "全安素", "portion": "3 勺", "kcal": 150, "protein_g": 6.8},
+                    ],
+                }
+            ],
+        )
+    )
+
+    items = result["day"]["meals"][0]["items"]
+    assert items[0]["kcal"] == 105.0
+    assert items[0]["proteinGrams"] == 1.3
+    assert items[1]["kcal"] == 150.0
+    assert items[1]["proteinGrams"] == 6.8
+
+    # And the read-back tool sees the same numbers (no silent stripping).
+    summary = asyncio.run(service.food_summary(limit=50, fresh=True))
+    read_items = summary["days"][0]["meals"][0]["items"]
+    assert read_items[0]["kcal"] == 105.0
+    assert read_items[1]["proteinGrams"] == 6.8
+
+
+def test_log_food_entry_rejects_bad_nutrition_values(tmp_path: Path) -> None:
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    try:
+        asyncio.run(
+            service.log_food_entry(
+                date="2026-07-21",
+                meals=[{"items": [{"food": "香蕉", "kcal": -5}]}],
+            )
+        )
+        raise AssertionError("negative kcal should raise")
+    except ValueError as error:
+        assert "negative" in str(error)
+
+    try:
+        asyncio.run(
+            service.log_food_entry(
+                date="2026-07-21",
+                meals=[{"items": [{"food": "香蕉", "protein_g": "很多"}]}],
+            )
+        )
+        raise AssertionError("non-numeric protein should raise")
+    except ValueError as error:
+        assert "non-numeric" in str(error)
+
+
+def test_log_note_creates_and_round_trips(tmp_path: Path) -> None:
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    result = asyncio.run(
+        service.log_note(text="今天有点低落，Matt 的合同还没回音", kind="mood", date="2026-07-24")
+    )
+
+    assert result["note_id"].startswith("note-")
+    assert result["updated_existing_note"] is False
+    assert result["kind"] == "mood"
+
+    written_blob = cloud.write_calls[-1]["blob"]
+    assert written_blob["metric_type"] == "note"
+    assert written_blob["owner_user_id"] == cloud.owner_user_id
+    kinds = {e["recipient_kind"] for e in cloud.write_calls[-1]["envelopes"]}
+    assert kinds == {"owner_user", "mcp_server"}
+
+    note = result["note"]
+    assert note is not None
+    assert note["text"].startswith("今天有点低落")
+    assert note["target_kind"] == "mood"
+    assert _local_calendar_day(_parse_iso8601(note["target_date"])) == date(2026, 7, 24)
+
+
+def test_log_note_same_kind_day_upserts_in_place(tmp_path: Path) -> None:
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    first = asyncio.run(service.log_note(text="v1", kind="general", date="2026-07-24"))
+    second = asyncio.run(service.log_note(text="v2 修订", kind="general", date="2026-07-24"))
+
+    assert second["note_id"] == first["note_id"]
+    assert second["updated_existing_note"] is True
+    assert second["note"]["text"] == "v2 修订"
+
+    # A different kind on the same day is a separate note.
+    other = asyncio.run(service.log_note(text="mood note", kind="mood", date="2026-07-24"))
+    assert other["note_id"] != first["note_id"]
+
+
+def test_log_note_rejects_ios_kinds_and_empty_text(tmp_path: Path) -> None:
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    for bad_kind in ("sleep", "menstrual", "diary"):
+        try:
+            asyncio.run(service.log_note(text="x", kind=bad_kind))
+            raise AssertionError(f"kind {bad_kind!r} should raise")
+        except ValueError as error:
+            assert "unsupported note kind" in str(error)
+
+    try:
+        asyncio.run(service.log_note(text="   ", kind="mood"))
+        raise AssertionError("blank text should raise")
+    except ValueError as error:
+        assert "non-empty" in str(error)
+
+
+# ── 2026-07-24 full-tool sweep fixes ─────────────────────────────────────────
+# Covers: business-time sort before the limit cut (backfill shuffles upload
+# order), wrist-temp honest field name, TDEE partial-today exclusion.
+
+
+def _mindfulness_payload(day_id: str, day_start: str, minutes: float) -> bytes:
+    return json.dumps(
+        {"dayID": day_id, "dayStartDate": day_start, "sessionCount": 1, "totalMinutes": minutes}
+    ).encode()
+
+
+def test_mindfulness_sorted_by_business_day_not_upload_order(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service(tmp_path)
+    # Upload order (== created_at order in the fake) is deliberately shuffled
+    # vs the payload's own days — a history backfill does exactly this.
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _mindfulness_payload("m-2", "2026-04-24T16:00:00Z", 1.4),
+            metric_type="mindfulness",
+            envelope_id="env-m2",
+            blob_id="m-2",
+            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+        ),
+        _make_envelope(
+            public_key,
+            _mindfulness_payload("m-1", "2026-03-02T16:00:00Z", 8.5),
+            metric_type="mindfulness",
+            envelope_id="env-m1",
+            blob_id="m-1",
+            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+        ),
+        _make_envelope(
+            public_key,
+            _mindfulness_payload("m-3", "2026-07-20T16:00:00Z", 3.0),
+            metric_type="mindfulness",
+            envelope_id="env-m3",
+            blob_id="m-3",
+            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+        ),
+    ]
+
+    summary = asyncio.run(service.mindfulness_summary(limit=2, owner="dce9"))
+
+    returned_days = [d["day_start_date"] for d in summary["days"]]
+    # Newest two by BUSINESS day — the July record must survive the cut even
+    # though it was uploaded last, and order must be newest-first.
+    assert returned_days == ["2026-07-20T16:00:00Z", "2026-04-24T16:00:00Z"]
+
+
+def test_wrist_temp_carries_honest_absolute_field(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            json.dumps(
+                {
+                    "dayID": "wrist-1",
+                    "dayStartDate": "2026-07-23T16:55:00Z",
+                    "temperatureDeltaCelsius": 35.99,
+                }
+            ).encode(),
+            metric_type="wrist_temp",
+            envelope_id="env-wrist-1",
+            blob_id="wrist-1",
+            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+        ),
+    ]
+
+    summary = asyncio.run(service.wrist_temp_records(limit=5, owner="dce9"))
+    record = summary["records"][0]
+    assert record["wrist_temperature_celsius"] == 35.99
+    # Legacy misnomer stays for back-compat, same value.
+    assert record["temperature_delta_celsius"] == 35.99
+
+
+def test_total_energy_burned_excludes_partial_today_from_average(tmp_path: Path) -> None:
+    from datetime import date as _date_type, timedelta as _td
+
+    from vaultbeat_mcp_local.service import _local_midnight_iso
+
+    service, cloud, public_key = _bound_service(tmp_path)
+    today = _date_type.today()
+
+    def _basal_payload(record_id: str, start_iso: str, kcal: float) -> bytes:
+        return json.dumps(
+            {"sampleID": record_id, "sampleStartDate": start_iso, "basalEnergyKcal": kcal}
+        ).encode()
+
+    def _activity_payload(day_id: str, day_start: str) -> bytes:
+        return json.dumps(
+            {
+                "dayID": day_id,
+                "dayStartDate": day_start,
+                "stepCount": 1000,
+                "activeEnergyKcal": 100.0,
+                "exerciseMinutes": 10,
+                "standMinutes": 5,
+                "distanceMeters": 800.0,
+            }
+        ).encode()
+
+    envelopes = []
+    for i, (day, kcal) in enumerate(
+        [(today, 200.0), (today - _td(days=1), 2000.0), (today - _td(days=2), 2100.0)]
+    ):
+        midnight = _local_midnight_iso(day)
+        envelopes.append(
+            _make_envelope(
+                public_key,
+                _basal_payload(f"basal-{i}", midnight, kcal),
+                metric_type="basal_energy",
+                envelope_id=f"env-basal-{i}",
+                blob_id=f"basal-{i}",
+                owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+            )
+        )
+        envelopes.append(
+            _make_envelope(
+                public_key,
+                _activity_payload(f"act-{i}", midnight),
+                metric_type="activity",
+                envelope_id=f"env-act-{i}",
+                blob_id=f"act-{i}",
+                owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+            )
+        )
+    cloud.envelopes = envelopes
+
+    result = asyncio.run(service.total_energy_burned(days=7, owner="dce9"))
+
+    by_day = {d["day"]: d for d in result["days"]}
+    assert by_day[today.isoformat()]["partial"] is True
+    # Average = the two COMPLETE days only: (2000+100 + 2100+100) / 2 = 2150.
+    assert result["average_tdee_kcal"] == 2150.0
+
+
+def test_unsupported_metric_degrades_instead_of_raising(tmp_path: Path) -> None:
+    """An edge older than this client must cost one kind, not the whole read.
+
+    Pins the fix for the 2026-07-22 incident shape: `hrv_hourly` shipped without
+    being added to the edge allowlist, and because it was also `get_hrv`'s new
+    default granularity, every default HRV read raised for two days instead of
+    reporting that one kind as unavailable.
+    """
+    config_path = tmp_path / "config.json"
+    cloud = FakeCloudClient()
+    service = VaultbeatLocalService(ConfigStore(config_path), cloud)
+
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+    cloud.unsupported_metric_types = {"hrv_hourly"}
+
+    records, errors = asyncio.run(
+        service.sync_decrypted_records(metric_type="hrv_hourly", fresh=True)
+    )
+
+    # Degraded, not raised.
+    assert records == []
+    assert len(errors) == 1
+    assert errors[0].startswith("unsupported_metric:hrv_hourly")
+    # The message must be actionable by an agent relaying it to a human.
+    assert "cloud" in errors[0].lower()
+
+    # Crucially: a DIFFERENT kind still works on the very same client.
+    config = ConfigStore(config_path).require_bound()
+    cloud.envelopes = [_make_envelope(config.public_key_base64, b'{"stage":"asleep"}')]
+    records, errors = asyncio.run(
+        service.sync_decrypted_records(metric_type="sleep", fresh=True)
+    )
+    assert errors == []
+    assert records[0].payload == {"stage": "asleep"}

@@ -9,11 +9,17 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Protocol
 
 from vaultbeat_mcp_local.cache import LocalRecordCache
-from vaultbeat_mcp_local.client import PollBindingResult, VaultbeatCloudClient
+from vaultbeat_mcp_local.client import (
+    PollBindingResult,
+    VaultbeatCloudClient,
+    VaultbeatUnsupportedMetricError,
+)
 from vaultbeat_mcp_local.crypto import (
+    RecipientKey,
     VaultbeatCryptoError,
     decode_json_payload,
     decrypt_blob_payload,
+    encrypt_blob_payload,
 )
 from vaultbeat_mcp_local.store import ConfigStore, LocalServerConfig, now_iso
 
@@ -33,9 +39,14 @@ METRIC_RESTING_HR = "resting_hr"
 METRIC_WORKOUT = "workout"
 METRIC_MINDFULNESS = "mindfulness"
 METRIC_HRV = "hrv"
+METRIC_HRV_HOURLY = "hrv_hourly"
 METRIC_WRIST_TEMP = "wrist_temp"
 METRIC_SYMPTOM = "symptom"
 METRIC_NOTE = "note"
+METRIC_STRENGTH = "strength"
+METRIC_FOOD = "food"
+METRIC_VO2MAX = "vo2max"
+METRIC_BASAL_ENERGY = "basal_energy"
 
 # Every metric kind this layer understands. Doubles as the safety gate for
 # anything derived from a caller-supplied metric_type (cache file names, the
@@ -52,9 +63,14 @@ KNOWN_METRIC_TYPES = frozenset(
         METRIC_WORKOUT,
         METRIC_MINDFULNESS,
         METRIC_HRV,
+        METRIC_HRV_HOURLY,
         METRIC_WRIST_TEMP,
         METRIC_SYMPTOM,
         METRIC_NOTE,
+        METRIC_STRENGTH,
+        METRIC_FOOD,
+        METRIC_VO2MAX,
+        METRIC_BASAL_ENERGY,
     }
 )
 
@@ -88,6 +104,22 @@ class CloudClientProtocol(Protocol):
     async def sync(
         self, server_token: str, *, metric_type: str | None = None
     ) -> list[dict[str, Any]]: ...
+
+    async def write_strength_blob(
+        self, server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]
+    ) -> dict[str, Any]: ...
+
+    async def write_food_blob(
+        self, server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]
+    ) -> dict[str, Any]: ...
+
+    async def write_body_blob(
+        self, server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]
+    ) -> dict[str, Any]: ...
+
+    async def write_note_blob(
+        self, server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]
+    ) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -157,6 +189,7 @@ class WaterDay:
         return {
             "day_id": self.day_id,
             "day_start_date": self.day_start_date,
+            **_local_date_fields(self.day_start_date),
             "container_volume_liters": self.container_volume_liters,
             "refill_count": self.refill_count,
             "intake_liters": self.intake_liters,
@@ -185,6 +218,7 @@ class BodyDay:
         return {
             "day_id": self.day_id,
             "day_start_date": self.day_start_date,
+            **_local_date_fields(self.day_start_date),
             "weight_kg": self.weight_kg,
             "body_fat_percent": self.body_fat_percent,
             "bmi": self.bmi,
@@ -219,6 +253,7 @@ class MenstrualDay:
         return {
             "day_id": self.day_id,
             "day_start_date": self.day_start_date,
+            **_local_date_fields(self.day_start_date),
             "samples": [sample.to_dict() for sample in self.samples],
             "owner_user_id": self.owner_user_id,
         }
@@ -241,6 +276,7 @@ class ActivityDay:
         return {
             "day_id": self.day_id,
             "day_start_date": self.day_start_date,
+            **_local_date_fields(self.day_start_date),
             "step_count": self.step_count,
             "active_energy_kcal": self.active_energy_kcal,
             "exercise_minutes": self.exercise_minutes,
@@ -260,7 +296,13 @@ class RestingHrRecord:
     owner_user_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"record_id": self.record_id, "date": self.date, "bpm": self.bpm, "owner_user_id": self.owner_user_id}
+        return {
+            "record_id": self.record_id,
+            "date": self.date,
+            **_local_date_fields(self.date),
+            "bpm": self.bpm,
+            "owner_user_id": self.owner_user_id,
+        }
 
 
 @dataclass(frozen=True)
@@ -281,6 +323,7 @@ class WorkoutRecord:
             "workout_id": self.workout_id,
             "activity_type": self.activity_type,
             "start_date": self.start_date,
+            **_local_date_fields(self.start_date, with_time=True),
             "end_date": self.end_date,
             "duration_seconds": self.duration_seconds,
             "active_kcal": self.active_kcal,
@@ -303,6 +346,7 @@ class MindfulnessDay:
         return {
             "day_id": self.day_id,
             "day_start_date": self.day_start_date,
+            **_local_date_fields(self.day_start_date),
             "session_count": self.session_count,
             "total_minutes": self.total_minutes,
             "owner_user_id": self.owner_user_id,
@@ -319,12 +363,68 @@ class HRVRecord:
     owner_user_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"record_id": self.record_id, "date": self.date, "sdnn_ms": self.sdnn_ms, "owner_user_id": self.owner_user_id}
+        return {
+            "record_id": self.record_id,
+            "date": self.date,
+            **_local_date_fields(self.date, with_time=True),
+            "sdnn_ms": self.sdnn_ms,
+            "owner_user_id": self.owner_user_id,
+        }
+
+
+@dataclass(frozen=True)
+class HRVHourlyBucket:
+    """One hourly-averaged HRV bucket decoded from a metric_type="hrv_hourly" blob.
+
+    Companion aggregate kind to raw HRV — 30-day rolling window, one blob
+    per UTC hour, `avg_sdnn_ms` is the arithmetic mean of every raw SDNN
+    sample whose midpoint fell inside the hour (via HKStatisticsCollection
+    Query `.discreteAverage` on iOS). `sample_count` lets consumers weight
+    buckets when computing a longer-window average or detect low-
+    confidence hours (sample_count == 1 = a single 5-min reading).
+    """
+
+    record_id: str
+    date: str
+    avg_sdnn_ms: float
+    sample_count: int
+    owner_user_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        # `sdnn_ms` is a back-compat alias for callers migrating from the
+        # pre-build-77 `get_hrv` default that returned raw per-sample records.
+        # Value is identical to `avg_sdnn_ms` — semantically it is the arithmetic
+        # mean of every raw SDNN sample in this hour, which is the closest
+        # single-value analogue to the old raw kind's per-sample sdnn_ms.
+        # Any agent/skill/prompt/jq pipeline that read `records[].sdnn_ms`
+        # under the old default keeps working; new callers should prefer
+        # `avg_sdnn_ms` (self-documenting) plus `sample_count` for weighting.
+        # Adversarial review 2026-07-22 caught the silent-rename regression.
+        return {
+            "record_id": self.record_id,
+            "date": self.date,
+            **_local_date_fields(self.date, with_time=True),
+            "avg_sdnn_ms": self.avg_sdnn_ms,
+            "sdnn_ms": self.avg_sdnn_ms,
+            "sample_count": self.sample_count,
+            "owner_user_id": self.owner_user_id,
+        }
 
 
 @dataclass(frozen=True)
 class WristTempRecord:
-    """One sleeping wrist temperature sample decoded from a metric_type="wrist_temp" blob."""
+    """One sleeping wrist temperature sample decoded from a metric_type="wrist_temp" blob.
+
+    ⚠️ Field-name lie inherited from the wire contract: iOS named the payload
+    field `temperatureDeltaCelsius`, but `appleSleepingWristTemperature` is an
+    ABSOLUTE skin temperature (observed 35.5-36.5 °C), not a baseline delta —
+    the iOS reader stores `sample.quantity.doubleValue(for: .degreeCelsius())`
+    verbatim (confirmed 2026-07-24 against live data + HealthKit docs). The
+    wire name cannot change without a two-sided migration, so the output keeps
+    the legacy key for compatibility and adds an honestly-named twin. Baseline
+    deviation must be DERIVED (reading minus the person's rolling baseline),
+    which is exactly what the ovulation detector does with day-to-day shifts.
+    """
 
     record_id: str
     date: str
@@ -335,7 +435,60 @@ class WristTempRecord:
         return {
             "record_id": self.record_id,
             "date": self.date,
+            **_local_date_fields(self.date),
+            # Honest name first; legacy misnomer kept for back-compat.
+            "wrist_temperature_celsius": self.temperature_delta_celsius,
             "temperature_delta_celsius": self.temperature_delta_celsius,
+            "owner_user_id": self.owner_user_id,
+        }
+
+
+@dataclass(frozen=True)
+class BasalEnergyRecord:
+    """One basal-energy-burned sample decoded from a metric_type="basal_energy" blob.
+
+    Watch estimates BMR from age/sex/height/weight + observed HR patterns,
+    typically emitting one sample per hour (or more granular). Unit: kcal.
+    Sum over a day = daily BMR contribution (typically 1500-2000 kcal for
+    active young adults).
+    """
+
+    record_id: str
+    date: str
+    kcal: float
+    owner_user_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "record_id": self.record_id,
+            "date": self.date,
+            **_local_date_fields(self.date, with_time=True),
+            "kcal": self.kcal,
+            "owner_user_id": self.owner_user_id,
+        }
+
+
+@dataclass(frozen=True)
+class VO2MaxRecord:
+    """One VO2Max sample decoded from a metric_type="vo2max" blob.
+
+    Unit: mL O2 · kg⁻¹ · min⁻¹ (the SI unit Apple Watch reports; iOS
+    HKUnit(from: "mL/kg*min")). Higher = better cardiorespiratory fitness.
+    Reference bands (male, 20-29): <35 poor · 35-42 fair · 42-46 good ·
+    46-50 excellent · 50+ superior.
+    """
+
+    record_id: str
+    date: str
+    vo2_max_ml_kg_min: float
+    owner_user_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "record_id": self.record_id,
+            "date": self.date,
+            **_local_date_fields(self.date, with_time=True),
+            "vo2_max_ml_kg_min": self.vo2_max_ml_kg_min,
             "owner_user_id": self.owner_user_id,
         }
 
@@ -364,7 +517,94 @@ class NoteRecord:
             "note_id": self.note_id,
             "target_kind": self.target_kind,
             "target_date": self.target_date,
+            **_local_date_fields(self.target_date),
             "text": self.text,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "owner_user_id": self.owner_user_id,
+        }
+
+
+@dataclass(frozen=True)
+class StrengthRecord:
+    """One strength-training session pinned to a local day, decoded from a
+    metric_type="strength" blob — exercise-level detail (movement, weight,
+    sets × reps) that HealthKit's workout type cannot carry. Owner's own AI
+    only in v1 (no partner fan-out)."""
+
+    entry_id: str
+    date: str
+    exercises: list[dict[str, Any]]
+    note: str | None
+    created_at: str | None
+    updated_at: str | None
+    owner_user_id: str | None
+
+    @property
+    def total_volume_kg(self) -> float:
+        """Σ weight × reps across every set — the one number lifters compare."""
+        total = 0.0
+        for exercise in self.exercises:
+            for one_set in exercise.get("sets", []):
+                try:
+                    total += float(one_set["weightKg"]) * int(one_set["reps"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return total
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "entry_id": self.entry_id,
+            "date": self.date,
+            **_local_date_fields(self.date),
+            "exercises": self.exercises,
+            "note": self.note,
+            "total_volume_kg": round(self.total_volume_kg, 1),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "owner_user_id": self.owner_user_id,
+        }
+
+
+@dataclass(frozen=True)
+class FoodRecord:
+    """One day's food-intake log, decoded from a metric_type="food" blob.
+
+    Structure mirrors strength on purpose (per-day entry with a list of meals,
+    each meal with a list of items) so the two features share test/UI patterns.
+    Nutrition estimation is intentionally NOT recorded here — the AI derives
+    kcal/protein/carbs at analysis time from the item name + portion using its
+    own commonsense, keeping data-entry friction minimal (the deciding factor
+    for a log the owner has to feed every day). Owner's own AI only in v1
+    (no partner fan-out)."""
+
+    entry_id: str
+    date: str
+    meals: list[dict[str, Any]]
+    note: str | None
+    created_at: str | None
+    updated_at: str | None
+    owner_user_id: str | None
+
+    @property
+    def total_item_count(self) -> int:
+        """Σ items across all meals — a lightweight "how much did I eat today"
+        proxy that costs no schema. Not calories."""
+        total = 0
+        for meal in self.meals:
+            items = meal.get("items")
+            if isinstance(items, list):
+                total += len(items)
+        return total
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "entry_id": self.entry_id,
+            "date": self.date,
+            **_local_date_fields(self.date),
+            "meals": self.meals,
+            "note": self.note,
+            "total_item_count": self.total_item_count,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "owner_user_id": self.owner_user_id,
@@ -407,6 +647,7 @@ class SymptomDay:
         return {
             "day_id": self.day_id,
             "day_start_date": self.day_start_date,
+            **_local_date_fields(self.day_start_date),
             "owner_user_id": self.owner_user_id,
             "samples": [sample.to_dict() for sample in self.samples],
         }
@@ -580,6 +821,29 @@ def parse_hrv_record(payload: Any, *, owner_user_id: str | None = None) -> HRVRe
     )
 
 
+def parse_hrv_hourly_record(payload: Any, *, owner_user_id: str | None = None) -> HRVHourlyBucket:
+    """Decode a decrypted hrv_hourly blob into a typed HRVHourlyBucket.
+
+    Wire contract mirrors iOS VaultbeatHRVHourlySharedCloudPayload:
+    {hourID, hourStartDate, avgSdnnMilliseconds, sampleCount}.
+    """
+
+    data = _require_mapping(payload, METRIC_HRV_HOURLY)
+    avg = data.get("avgSdnnMilliseconds")
+    if not isinstance(avg, (int, float)) or isinstance(avg, bool):
+        raise VaultbeatCryptoError("hrv_hourly payload is missing avgSdnnMilliseconds")
+    count = data.get("sampleCount")
+    if not isinstance(count, int) or isinstance(count, bool):
+        raise VaultbeatCryptoError("hrv_hourly payload is missing sampleCount")
+    return HRVHourlyBucket(
+        record_id=str(data["hourID"]),
+        date=str(data["hourStartDate"]),
+        avg_sdnn_ms=float(avg),
+        sample_count=int(count),
+        owner_user_id=owner_user_id,
+    )
+
+
 def parse_wrist_temp_record(payload: Any, *, owner_user_id: str | None = None) -> WristTempRecord:
     """Decode a decrypted wrist_temp blob into a typed WristTempRecord.
 
@@ -595,6 +859,44 @@ def parse_wrist_temp_record(payload: Any, *, owner_user_id: str | None = None) -
         record_id=str(data["dayID"]),
         date=str(data["dayStartDate"]),
         temperature_delta_celsius=float(delta),
+        owner_user_id=owner_user_id,
+    )
+
+
+def parse_basal_energy_record(payload: Any, *, owner_user_id: str | None = None) -> BasalEnergyRecord:
+    """Decode a decrypted basal_energy blob into a typed BasalEnergyRecord.
+
+    Wire contract mirrors iOS VaultbeatBasalEnergySharedCloudPayload:
+    {sampleID, sampleStartDate, basalEnergyKcal}.
+    """
+
+    data = _require_mapping(payload, METRIC_BASAL_ENERGY)
+    value = data.get("basalEnergyKcal")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise VaultbeatCryptoError("basal_energy payload is missing basalEnergyKcal")
+    return BasalEnergyRecord(
+        record_id=str(data["sampleID"]),
+        date=str(data["sampleStartDate"]),
+        kcal=float(value),
+        owner_user_id=owner_user_id,
+    )
+
+
+def parse_vo2max_record(payload: Any, *, owner_user_id: str | None = None) -> VO2MaxRecord:
+    """Decode a decrypted vo2max blob into a typed VO2MaxRecord.
+
+    Wire contract mirrors iOS VaultbeatVO2MaxSharedCloudPayload:
+    {sampleID, sampleStartDate, vo2MaxMlKgMin}.
+    """
+
+    data = _require_mapping(payload, METRIC_VO2MAX)
+    value = data.get("vo2MaxMlKgMin")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise VaultbeatCryptoError("vo2max payload is missing vo2MaxMlKgMin")
+    return VO2MaxRecord(
+        record_id=str(data["sampleID"]),
+        date=str(data["sampleStartDate"]),
+        vo2_max_ml_kg_min=float(value),
         owner_user_id=owner_user_id,
     )
 
@@ -695,6 +997,131 @@ def parse_note(payload: Any, *, owner_user_id: str | None = None) -> NoteRecord:
     )
 
 
+def parse_strength(payload: Any, *, owner_user_id: str | None = None) -> StrengthRecord:
+    """Decode a decrypted strength blob into a typed StrengthRecord.
+
+    Wire contract mirrors iOS VaultbeatStrengthCloudPayload:
+    {entryID, date, exercises: [{name, sets: [{weightKg, reps}]}], note?,
+    createdAt, updatedAt}. A non-empty exercises list is required; timestamps
+    and note are tolerated missing.
+    """
+
+    data = _require_mapping(payload, METRIC_STRENGTH)
+    exercises = data.get("exercises")
+    if not isinstance(exercises, list) or not exercises:
+        raise VaultbeatCryptoError("strength payload is missing exercises")
+    cleaned: list[dict[str, Any]] = []
+    for exercise in exercises:
+        if not isinstance(exercise, dict):
+            raise VaultbeatCryptoError("strength exercise is not a mapping")
+        name = exercise.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise VaultbeatCryptoError("strength exercise is missing name")
+        sets = exercise.get("sets")
+        if not isinstance(sets, list):
+            raise VaultbeatCryptoError("strength exercise is missing sets")
+        cleaned.append({"name": name, "sets": sets})
+    note = data.get("note")
+    return StrengthRecord(
+        entry_id=str(data["entryID"]),
+        date=str(data["date"]),
+        exercises=cleaned,
+        note=(str(note) if isinstance(note, str) and note.strip() else None),
+        created_at=(str(data["createdAt"]) if data.get("createdAt") is not None else None),
+        updated_at=(str(data["updatedAt"]) if data.get("updatedAt") is not None else None),
+        owner_user_id=owner_user_id,
+    )
+
+
+def summarize_strength(entries: list[StrengthRecord], *, limit_days: int | None = None) -> dict[str, Any]:
+    """Recent strength sessions, newest day first, with per-session volume.
+
+    Dedup by entry_id (newest updated_at wins — edits upsert the same blob id).
+    Pass `limit_days` to keep only the most recent N sessions after dedup.
+    """
+
+    by_id: dict[str, StrengthRecord] = {}
+    for entry in entries:
+        existing = by_id.get(entry.entry_id)
+        new_key = entry.updated_at or entry.created_at or ""
+        old_key = existing.updated_at or existing.created_at or "" if existing else ""
+        if existing is None or new_key >= old_key:
+            by_id[entry.entry_id] = entry
+
+    ordered = sorted(by_id.values(), key=lambda e: e.date, reverse=True)
+    if limit_days is not None:
+        ordered = ordered[:limit_days]
+
+    return {
+        "session_count": len(ordered),
+        "sessions": [entry.to_dict() for entry in ordered],
+    }
+
+
+def parse_food(payload: Any, *, owner_user_id: str | None = None) -> FoodRecord:
+    """Decode a decrypted food blob into a typed FoodRecord.
+
+    Wire contract mirrors iOS VaultbeatFoodCloudPayload:
+    {entryID, date, meals: [{name?, timeOfDay?, items: [{food, portion?, note?}]}], note?,
+    createdAt, updatedAt}. A non-empty meals list is required; per-item
+    portion/note and per-meal name/timeOfDay are all optional (the recording
+    friction we're minimizing is real — you can just write down "香蕉" and
+    have the AI figure out kcal later).
+    """
+
+    data = _require_mapping(payload, METRIC_FOOD)
+    meals = data.get("meals")
+    if not isinstance(meals, list) or not meals:
+        raise VaultbeatCryptoError("food payload is missing meals")
+    cleaned: list[dict[str, Any]] = []
+    for meal in meals:
+        if not isinstance(meal, dict):
+            raise VaultbeatCryptoError("food meal is not a mapping")
+        items = meal.get("items")
+        if not isinstance(items, list):
+            raise VaultbeatCryptoError("food meal is missing items")
+        cleaned_meal: dict[str, Any] = {"items": items}
+        for optional_key in ("name", "timeOfDay", "note"):
+            if optional_key in meal:
+                cleaned_meal[optional_key] = meal[optional_key]
+        cleaned.append(cleaned_meal)
+    note = data.get("note")
+    return FoodRecord(
+        entry_id=str(data["entryID"]),
+        date=str(data["date"]),
+        meals=cleaned,
+        note=(str(note) if isinstance(note, str) and note.strip() else None),
+        created_at=(str(data["createdAt"]) if data.get("createdAt") is not None else None),
+        updated_at=(str(data["updatedAt"]) if data.get("updatedAt") is not None else None),
+        owner_user_id=owner_user_id,
+    )
+
+
+def summarize_food(entries: list[FoodRecord], *, limit_days: int | None = None) -> dict[str, Any]:
+    """Recent food-intake logs, newest day first.
+
+    Dedup by entry_id (newest updated_at wins — edits upsert the same blob id).
+    Pass `limit_days` to keep only the most recent N days after dedup.
+    """
+
+    by_id: dict[str, FoodRecord] = {}
+    for entry in entries:
+        existing = by_id.get(entry.entry_id)
+        new_key = entry.updated_at or entry.created_at or ""
+        old_key = existing.updated_at or existing.created_at or "" if existing else ""
+        if existing is None or new_key >= old_key:
+            by_id[entry.entry_id] = entry
+
+    ordered = sorted(by_id.values(), key=lambda e: e.date, reverse=True)
+    if limit_days is not None:
+        ordered = ordered[:limit_days]
+
+    return {
+        "day_count": len(ordered),
+        "days": [entry.to_dict() for entry in ordered],
+    }
+
+
 def summarize_notes(notes: list[NoteRecord], *, target_kind: str | None = None) -> dict[str, Any]:
     """Recent notes grouped by target kind, each carrying its writer.
 
@@ -742,6 +1169,118 @@ def _parse_iso8601(value: str) -> datetime:
     # iOS JSONEncoder emits ...Z; datetime.fromisoformat only learned to parse a bare
     # trailing Z in 3.11, but normalise defensively so behaviour matches the contract.
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _local_date_fields(iso: str | None, *, with_time: bool = False) -> dict[str, Any]:
+    """Human-readable local-calendar fields for a wire timestamp.
+
+    Wire dates are UTC instants ("2026-07-21T16:00:00Z" is local 2026-07-22
+    midnight for a UTC+8 user); every consumer was doing the +8h conversion by
+    hand and occasionally off-by-one-day'ing it. Emit the server-local calendar
+    day — and, for intra-day kinds, the local clock time — alongside the raw
+    value. Same "server runs in the phone's timezone" assumption as
+    ``_local_calendar_day``. Unparseable/missing input yields {} so a record
+    with a malformed date degrades to the raw fields instead of raising.
+    """
+
+    if not isinstance(iso, str) or not iso:
+        return {}
+    try:
+        parsed = _parse_iso8601(iso)
+    except ValueError:
+        return {}
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    local = parsed.astimezone(datetime.now(timezone.utc).astimezone().tzinfo)
+    fields: dict[str, Any] = {"local_date": local.date().isoformat()}
+    if with_time:
+        fields["local_time"] = local.strftime("%Y-%m-%dT%H:%M")
+    return fields
+
+
+_ERRORS_NOTE = (
+    "Each entry in `errors` is ONE blob that failed to decrypt (`decrypt_failed`: "
+    "usually a historical-backfill blob sealed with a stale envelope key — cosmetic) "
+    "or to parse (`parse_failed`: payload written by an older/newer schema). "
+    "A failed blob is skipped; every other record in this result is complete, so a "
+    "handful of errors among hundreds of records is NOT a data-integrity problem."
+)
+
+
+def _attach_errors(summary: dict[str, Any], errors: list[str]) -> dict[str, Any]:
+    """Standard error reporting: the raw list plus, when non-empty, a note that
+    explains what an error means so callers stop treating two stale-key blobs
+    as a broken dataset (2026-07-23 client feedback)."""
+
+    summary["errors"] = errors
+    if errors:
+        summary["errors_note"] = _ERRORS_NOTE
+    return summary
+
+
+def _attach_owner_guard(
+    summary: dict[str, Any], records: list["DecryptedRecord"], owner: str | None
+) -> dict[str, Any]:
+    """Flag cross-user mixing when the caller did not filter by owner.
+
+    This server holds BOTH partners' envelopes, so an unfiltered query blends
+    two people's records and every aggregate (average weight, per-day sleep
+    selection, weekly rate…) becomes a meaningless blend — e.g. `average_kg`
+    once came out 53.79 from an ~82 kg owner and a ~40 kg partner
+    (2026-07-23). Kept additive (a warning, not a hard error) for
+    backward compatibility with deliberate both-people queries.
+    """
+
+    if owner:
+        return summary
+    owners = sorted({r.owner_user_id[:8] for r in records if r.owner_user_id})
+    if len(owners) <= 1:
+        return summary
+    summary["mixed_owners"] = True
+    summary["owner_user_id_prefixes"] = owners
+    summary["warning"] = (
+        "Records from MULTIPLE people are mixed in this result (owner prefixes: "
+        + ", ".join(owners)
+        + "). Aggregate numbers blend both people and are meaningless — "
+        're-query with owner="<prefix>" to select one person.'
+    )
+    return summary
+
+
+def _merge_food_meals(
+    existing: list[dict[str, Any]], new: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Append-merge for ``log_food_entry(merge=True)``.
+
+    A new meal whose (case-insensitive) name matches an existing named meal has
+    its items appended to that meal; every other new meal is appended whole.
+    Existing content is NEVER dropped or rewritten — the whole point of merge
+    mode is that "log one forgotten snack" cannot wipe the rest of the day.
+    ``existing`` comes from the decoded cloud payload and is trusted as-is
+    (re-normalizing it would strip fields this normalizer doesn't know about).
+    """
+
+    merged: list[dict[str, Any]] = [
+        dict(meal, items=list(meal.get("items") or [])) for meal in existing if isinstance(meal, dict)
+    ]
+    by_name: dict[str, dict[str, Any]] = {}
+    for meal in merged:
+        name = meal.get("name")
+        if isinstance(name, str) and name.strip():
+            by_name.setdefault(name.strip().casefold(), meal)
+    for meal in new:
+        name = meal.get("name")
+        key = name.strip().casefold() if isinstance(name, str) and name.strip() else None
+        target = by_name.get(key) if key is not None else None
+        if target is not None:
+            target["items"].extend(meal.get("items") or [])
+            if meal.get("note") and not target.get("note"):
+                target["note"] = meal["note"]
+        else:
+            merged.append(meal)
+            if key is not None:
+                by_name.setdefault(key, meal)
+    return merged
 
 
 def summarize_water_intake(days: list[WaterDay]) -> dict[str, Any]:
@@ -910,6 +1449,148 @@ def _local_calendar_day(value: datetime) -> date:
     if value.tzinfo is not None:
         value = value.astimezone(datetime.now(timezone.utc).astimezone().tzinfo)
     return value.date()
+
+
+def _local_midnight_iso(day: date) -> str:
+    """UTC ISO8601 instant for local midnight of `day` — the inverse of
+    ``_local_calendar_day``, used when the agent writes a brand-new entry for a
+    given local calendar day. Same "server runs in the phone's timezone"
+    assumption as that function; see its docstring.
+    """
+
+    local_tz = datetime.now(timezone.utc).astimezone().tzinfo
+    local_midnight = datetime(day.year, day.month, day.day, tzinfo=local_tz)
+    return local_midnight.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _normalize_strength_exercises(exercises: Any) -> list[dict[str, Any]]:
+    """Validate + coerce agent-supplied exercises into the iOS wire shape.
+
+    Accepts `weightKg` or `weight_kg` for the common case of an agent writing
+    snake_case; the OUTPUT is always camelCase (`weightKg`) to match what the
+    iOS decoder and every other reader (`parse_strength`) expects.
+    """
+
+    if not isinstance(exercises, list) or not exercises:
+        raise ValueError("exercises must be a non-empty list")
+
+    normalized: list[dict[str, Any]] = []
+    for exercise in exercises:
+        if not isinstance(exercise, dict):
+            raise ValueError("each exercise must be an object")
+        name = exercise.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("each exercise needs a non-empty name")
+        sets_in = exercise.get("sets")
+        if not isinstance(sets_in, list) or not sets_in:
+            raise ValueError(f"exercise {name!r} needs a non-empty sets list")
+
+        sets_out: list[dict[str, Any]] = []
+        for one_set in sets_in:
+            if not isinstance(one_set, dict):
+                raise ValueError(f"exercise {name!r} has a non-object set")
+            weight = one_set.get("weightKg", one_set.get("weight_kg"))
+            reps = one_set.get("reps")
+            if weight is None or reps is None:
+                raise ValueError(f"exercise {name!r} has a set missing weight/reps")
+            try:
+                weight_kg = float(weight)
+                rep_count = int(reps)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"exercise {name!r} has a non-numeric weight/reps") from error
+            if weight_kg < 0 or rep_count <= 0:
+                raise ValueError(f"exercise {name!r} has an invalid weight/reps")
+            sets_out.append({"weightKg": weight_kg, "reps": rep_count})
+
+        normalized.append({"name": name.strip(), "sets": sets_out})
+    return normalized
+
+
+# Optional structured nutrition on a food item: wire key (camelCase, matching
+# every other wire field) plus the snake_case aliases an agent will naturally
+# type. Values are kcal / grams. Recording stays optional — friction-free "just
+# log 香蕉" still works — but when the agent DOES estimate at logging time the
+# numbers persist instead of living only in free-text portion strings that every
+# later session re-parses inconsistently (2026-07-23 client feedback). iOS-safe:
+# Swift's Codable ignores unknown keys; an iOS edit of the same day re-encodes
+# without them (acceptable — editing a day is defined as rewriting it).
+_FOOD_NUTRITION_KEYS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("kcal", ("kcal", "calories")),
+    ("proteinGrams", ("proteinGrams", "protein_g", "protein_grams")),
+    ("fatGrams", ("fatGrams", "fat_g", "fat_grams")),
+    ("carbGrams", ("carbGrams", "carb_g", "carb_grams", "carbs_g")),
+)
+
+
+def _normalize_food_meals(meals: Any) -> list[dict[str, Any]]:
+    """Validate + coerce agent-supplied meals into the iOS wire shape.
+
+    Structure = `[{name?, timeOfDay?, items: [{food, portion?, note?,
+    kcal?, proteinGrams?, fatGrams?, carbGrams?}], note?}]`.
+    `name` (breakfast/lunch/…) and `timeOfDay` (HH:MM) are optional; `items` is
+    required non-empty; per-item `food` is required; `portion` is a free-text
+    (e.g. "1 根" / "300g" / "小份") because tight units would kill entry speed
+    for the marginal analytical value — the AI can normalize on read. The
+    nutrition fields are optional numbers (see _FOOD_NUTRITION_KEYS); anything
+    NOT in the allow-list is dropped, so numbers passed under an unknown key
+    would vanish silently — hence the aliases.
+    """
+
+    if not isinstance(meals, list) or not meals:
+        raise ValueError("meals must be a non-empty list")
+
+    normalized: list[dict[str, Any]] = []
+    for meal in meals:
+        if not isinstance(meal, dict):
+            raise ValueError("each meal must be an object")
+        items_in = meal.get("items")
+        if not isinstance(items_in, list) or not items_in:
+            raise ValueError("each meal needs a non-empty items list")
+
+        items_out: list[dict[str, Any]] = []
+        for item in items_in:
+            if not isinstance(item, dict):
+                raise ValueError("each meal item must be an object")
+            food = item.get("food")
+            if not isinstance(food, str) or not food.strip():
+                raise ValueError("each meal item needs a non-empty food name")
+            out_item: dict[str, Any] = {"food": food.strip()}
+            portion = item.get("portion")
+            if isinstance(portion, str) and portion.strip():
+                out_item["portion"] = portion.strip()
+            item_note = item.get("note")
+            if isinstance(item_note, str) and item_note.strip():
+                out_item["note"] = item_note.strip()
+            for out_key, aliases in _FOOD_NUTRITION_KEYS:
+                for alias in aliases:
+                    value = item.get(alias)
+                    if value is None:
+                        continue
+                    try:
+                        number = float(value)
+                    except (TypeError, ValueError) as error:
+                        raise ValueError(
+                            f"item {food!r} has a non-numeric {alias}: {value!r}"
+                        ) from error
+                    if number < 0:
+                        raise ValueError(f"item {food!r} has a negative {alias}")
+                    out_item[out_key] = number
+                    break
+            items_out.append(out_item)
+
+        out_meal: dict[str, Any] = {"items": items_out}
+        name = meal.get("name")
+        if isinstance(name, str) and name.strip():
+            out_meal["name"] = name.strip()
+        time_of_day = meal.get("timeOfDay", meal.get("time_of_day"))
+        if isinstance(time_of_day, str) and time_of_day.strip():
+            out_meal["timeOfDay"] = time_of_day.strip()
+        meal_note = meal.get("note")
+        if isinstance(meal_note, str) and meal_note.strip():
+            out_meal["note"] = meal_note.strip()
+        normalized.append(out_meal)
+
+    return normalized
 
 
 def detect_ovulation_from_wrist_temp(
@@ -1245,7 +1926,20 @@ class VaultbeatLocalService:
                     records = records[:limit]
                 return records, cached_errors
 
-        envelope_rows = await self._client(config).sync(server_token, metric_type=metric_type)
+        try:
+            envelope_rows = await self._client(config).sync(server_token, metric_type=metric_type)
+        except VaultbeatUnsupportedMetricError as error:
+            # Version skew: this MCP server knows a kind the deployed edge
+            # function does not. Degrade to "this one kind is unavailable"
+            # rather than raising — every other tool call still works, and the
+            # agent gets a message it can relay instead of an opaque failure.
+            # (2026-07-22: the opposite behaviour took ALL default HRV reads
+            # down for two days.)
+            return [], [
+                f"unsupported_metric:{error.metric_type} — the Vaultbeat cloud "
+                "has not been updated to serve this data type yet; every other "
+                "data type is unaffected"
+            ]
         records = []
         errors: list[str] = []
 
@@ -1254,7 +1948,11 @@ class VaultbeatLocalService:
                 records.append(self._decrypt_row(row, config))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 envelope_id = str(row.get("id", "<unknown>"))
-                errors.append(f"{envelope_id}: {type(error).__name__}")
+                # Stage-tagged so a consumer can tell "sealed with a stale key /
+                # corrupt ciphertext" apart from the parse_failed entries the
+                # per-metric decoders append (2026-07-23 client feedback: a bare
+                # exception name gave no clue whether the error mattered).
+                errors.append(f"{envelope_id}: decrypt_failed ({type(error).__name__})")
 
         if metric_type is not None:
             # Defensive filter: also correct against pre-metric_type edge deploys.
@@ -1392,7 +2090,7 @@ class VaultbeatLocalService:
                     "respiratory_rate_samples": len(payload.get("respiratoryRateSamples", [])),
                 })
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
-                errors.append(f"{record.envelope_id}: {type(error).__name__}")
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
 
         daily_summary = _select_primary_sessions(sessions)
 
@@ -1401,12 +2099,13 @@ class VaultbeatLocalService:
             kept_dates = {d["date"] for d in daily_summary}
             sessions = [s for s in sessions if s.get("local_date") in kept_dates]
 
-        return {
+        summary = {
             "daily_summary": daily_summary,
             "sessions": sessions,
             "count": len(sessions),
-            "errors": errors,
         }
+        _attach_errors(summary, errors)
+        return _attach_owner_guard(summary, records, owner)
 
     async def sleep_detail_records(
         self, *, limit: int | None = None, fresh: bool = False,
@@ -1574,7 +2273,7 @@ class VaultbeatLocalService:
                     "timeline": timeline,
                 })
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
-                errors.append(f"{record.envelope_id}: {type(error).__name__}")
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
 
         by_date: dict[str, list[dict[str, Any]]] = {}
         for n in all_nights:
@@ -1595,11 +2294,12 @@ class VaultbeatLocalService:
         if limit is not None:
             result_nights = result_nights[:limit]
 
-        return {
+        summary = {
             "nights": result_nights,
             "count": len(result_nights),
-            "errors": errors,
         }
+        _attach_errors(summary, errors)
+        return _attach_owner_guard(summary, records, owner)
 
     async def water_intake_summary(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent daily water intake plus the computed average over the window."""
@@ -1614,10 +2314,10 @@ class VaultbeatLocalService:
             try:
                 days.append(parse_water_day(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
-                errors.append(f"{record.envelope_id}: {type(error).__name__}")
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
         summary = summarize_water_intake(days)
-        summary["errors"] = errors
-        return summary
+        _attach_errors(summary, errors)
+        return _attach_owner_guard(summary, records, owner)
 
     async def weight_trend_summary(
         self, *, limit: int | None = None, goal_kg: float | None = None, owner: str | None = None, fresh: bool = False
@@ -1640,10 +2340,10 @@ class VaultbeatLocalService:
             try:
                 days.append(parse_body_day(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
-                errors.append(f"{record.envelope_id}: {type(error).__name__}")
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
         summary = summarize_weight_trend(days, goal_kg=goal_kg)
-        summary["errors"] = errors
-        return summary
+        _attach_errors(summary, errors)
+        return _attach_owner_guard(summary, records, owner)
 
     async def menstrual_cycle_summary(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent menstrual cycle samples plus a simple next-period prediction.
@@ -1670,11 +2370,11 @@ class VaultbeatLocalService:
                 if record.owner_user_id:
                     menstrual_owners.add(record.owner_user_id)
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
-                errors.append(f"{record.envelope_id}: {type(error).__name__}")
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
         wrist_readings = await self._wrist_readings_for_owner(menstrual_owners, errors, fresh=fresh)
         summary = summarize_menstrual_cycle(days, wrist_readings=wrist_readings)
-        summary["errors"] = errors
-        return summary
+        _attach_errors(summary, errors)
+        return _attach_owner_guard(summary, records, owner)
 
     async def _wrist_readings_for_owner(
         self, menstrual_owners: set[str], errors: list[str], *, fresh: bool = False
@@ -1702,7 +2402,7 @@ class VaultbeatLocalService:
                 parsed = parse_wrist_temp_record(record.payload, owner_user_id=record.owner_user_id)
                 readings.append((_parse_iso8601(parsed.date), parsed.temperature_delta_celsius))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
-                errors.append(f"{record.envelope_id}: {type(error).__name__}")
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
         return readings or None
 
     async def activity_summary(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
@@ -1711,15 +2411,22 @@ class VaultbeatLocalService:
         records, errors = await self._records_for_metric(METRIC_ACTIVITY, limit=None, fresh=fresh)
         if owner:
             records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
-        if limit is not None:
-            records = records[:limit]
         days: list[ActivityDay] = []
         for record in records:
             try:
                 days.append(parse_activity_day(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
-                errors.append(f"{record.envelope_id}: {type(error).__name__}")
-        return {"days": [d.to_dict() for d in days], "count": len(days), "errors": errors}
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        # Sort by the payload's own day, NOT created_at: a history backfill
+        # uploads years of old records in one batch, so upload order stops
+        # matching business time and a created_at cut can drop the newest days
+        # (2026-07-24: mindfulness/vo2max came back visibly shuffled).
+        days.sort(key=lambda d: d.day_start_date, reverse=True)
+        if limit is not None:
+            days = days[:limit]
+        summary = {"days": [d.to_dict() for d in days], "count": len(days)}
+        _attach_errors(summary, errors)
+        return _attach_owner_guard(summary, records, owner)
 
     async def resting_hr_records(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent resting heart rate samples."""
@@ -1727,22 +2434,25 @@ class VaultbeatLocalService:
         records, errors = await self._records_for_metric(METRIC_RESTING_HR, limit=None, fresh=fresh)
         if owner:
             records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
-        if limit is not None:
-            records = records[:limit]
         hr_records: list[RestingHrRecord] = []
         for record in records:
             try:
                 hr_records.append(parse_resting_hr_record(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
-                errors.append(f"{record.envelope_id}: {type(error).__name__}")
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        # Business-time sort before the cut (see activity_summary's comment).
+        hr_records.sort(key=lambda r: r.date, reverse=True)
+        if limit is not None:
+            hr_records = hr_records[:limit]
         bpms = [r.bpm for r in hr_records]
         average_bpm = sum(bpms) / len(bpms) if bpms else None
-        return {
+        summary = {
             "records": [r.to_dict() for r in hr_records],
             "count": len(hr_records),
             "average_bpm": round(average_bpm, 1) if average_bpm is not None else None,
-            "errors": errors,
         }
+        _attach_errors(summary, errors)
+        return _attach_owner_guard(summary, records, owner)
 
     async def workout_records(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent workout sessions."""
@@ -1750,21 +2460,24 @@ class VaultbeatLocalService:
         records, errors = await self._records_for_metric(METRIC_WORKOUT, limit=None, fresh=fresh)
         if owner:
             records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
-        if limit is not None:
-            records = records[:limit]
         workouts: list[WorkoutRecord] = []
         for record in records:
             try:
                 workouts.append(parse_workout_record(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
-                errors.append(f"{record.envelope_id}: {type(error).__name__}")
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        # Business-time sort before the cut (see activity_summary's comment).
+        workouts.sort(key=lambda w: w.start_date, reverse=True)
+        if limit is not None:
+            workouts = workouts[:limit]
         total_duration = sum(w.duration_seconds for w in workouts)
-        return {
+        summary = {
             "workouts": [w.to_dict() for w in workouts],
             "count": len(workouts),
             "total_duration_hours": round(total_duration / 3600, 2),
-            "errors": errors,
         }
+        _attach_errors(summary, errors)
+        return _attach_owner_guard(summary, records, owner)
 
     async def mindfulness_summary(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent daily mindfulness data (session count and total minutes)."""
@@ -1772,21 +2485,24 @@ class VaultbeatLocalService:
         records, errors = await self._records_for_metric(METRIC_MINDFULNESS, limit=None, fresh=fresh)
         if owner:
             records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
-        if limit is not None:
-            records = records[:limit]
         days: list[MindfulnessDay] = []
         for record in records:
             try:
                 days.append(parse_mindfulness_day(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
-                errors.append(f"{record.envelope_id}: {type(error).__name__}")
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        # Business-time sort before the cut (see activity_summary's comment).
+        days.sort(key=lambda d: d.day_start_date, reverse=True)
+        if limit is not None:
+            days = days[:limit]
         total_minutes = sum(d.total_minutes for d in days)
-        return {
+        summary = {
             "days": [d.to_dict() for d in days],
             "count": len(days),
             "total_minutes": round(total_minutes, 1),
-            "errors": errors,
         }
+        _attach_errors(summary, errors)
+        return _attach_owner_guard(summary, records, owner)
 
     async def hrv_records(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent HRV (SDNN) samples."""
@@ -1794,22 +2510,77 @@ class VaultbeatLocalService:
         records, errors = await self._records_for_metric(METRIC_HRV, limit=None, fresh=fresh)
         if owner:
             records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
-        if limit is not None:
-            records = records[:limit]
         hrv_list: list[HRVRecord] = []
         for record in records:
             try:
                 hrv_list.append(parse_hrv_record(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
-                errors.append(f"{record.envelope_id}: {type(error).__name__}")
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        # Business-time sort before the cut (see activity_summary's comment).
+        hrv_list.sort(key=lambda r: r.date, reverse=True)
+        if limit is not None:
+            hrv_list = hrv_list[:limit]
         sdnns = [r.sdnn_ms for r in hrv_list]
         average_sdnn = sum(sdnns) / len(sdnns) if sdnns else None
-        return {
+        summary = {
             "records": [r.to_dict() for r in hrv_list],
             "count": len(hrv_list),
             "average_sdnn_ms": round(average_sdnn, 1) if average_sdnn is not None else None,
-            "errors": errors,
         }
+        _attach_errors(summary, errors)
+        return _attach_owner_guard(summary, records, owner)
+
+    async def hrv_hourly_records(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+        """Return recent hourly-averaged HRV (SDNN) buckets.
+
+        Companion aggregate view of raw HRV — same underlying SDNN
+        measurements but pre-averaged per UTC hour bucket, so a 30-day
+        window returns ≤720 rows instead of the raw kind's thousands.
+        This is the default MCP granularity (`get_hrv()` without
+        `granularity="raw"`) — saves context and is the right shape for
+        trend/aggregate queries. For 5-15min spike-precision analysis
+        (e.g. "HRV during those 3 minutes when I checked my phone"),
+        callers should pass `granularity="raw"` which routes to
+        `hrv_records`.
+
+        `average_sdnn_ms` here is a sample-weighted average across all
+        returned buckets. Note: it is NOT directly comparable to the raw
+        kind's `average_sdnn_ms` — the two averages observe different
+        underlying sample pools (hourly's 30d window vs raw's 3d window)
+        plus the raw side includes any legacy per-sample blobs from
+        before build 77. The previous "identical number regardless of
+        granularity" claim was retracted 2026-07-22 (adversarial review
+        pointed out the window mismatch).
+        """
+
+        records, errors = await self._records_for_metric(METRIC_HRV_HOURLY, limit=None, fresh=fresh)
+        if owner:
+            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+        buckets: list[HRVHourlyBucket] = []
+        for record in records:
+            try:
+                buckets.append(parse_hrv_hourly_record(record.payload, owner_user_id=record.owner_user_id))
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        # Business-time sort before the cut (see activity_summary's comment).
+        buckets.sort(key=lambda b: b.date, reverse=True)
+        if limit is not None:
+            buckets = buckets[:limit]
+        # Sample-weighted average so a hour with 12 samples counts more than
+        # a hour with 1 sample. Matches the raw-kind average exactly (both
+        # are means over the same underlying samples). Zero-sample buckets
+        # were elided by the reader, so `sample_count` is guaranteed >= 1.
+        total_weight = sum(b.sample_count for b in buckets)
+        weighted_sum = sum(b.avg_sdnn_ms * b.sample_count for b in buckets)
+        average = (weighted_sum / total_weight) if total_weight else None
+        summary = {
+            "records": [b.to_dict() for b in buckets],
+            "count": len(buckets),
+            "total_sample_count": total_weight,
+            "average_sdnn_ms": round(average, 1) if average is not None else None,
+        }
+        _attach_errors(summary, errors)
+        return _attach_owner_guard(summary, records, owner)
 
     async def wrist_temp_records(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent sleeping wrist temperature samples."""
@@ -1817,22 +2588,205 @@ class VaultbeatLocalService:
         records, errors = await self._records_for_metric(METRIC_WRIST_TEMP, limit=None, fresh=fresh)
         if owner:
             records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
-        if limit is not None:
-            records = records[:limit]
         temp_list: list[WristTempRecord] = []
         for record in records:
             try:
                 temp_list.append(parse_wrist_temp_record(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
-                errors.append(f"{record.envelope_id}: {type(error).__name__}")
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        # Business-time sort before the cut (see activity_summary's comment).
+        temp_list.sort(key=lambda r: r.date, reverse=True)
+        if limit is not None:
+            temp_list = temp_list[:limit]
         deltas = [r.temperature_delta_celsius for r in temp_list]
         average_delta = sum(deltas) / len(deltas) if deltas else None
-        return {
+        summary = {
             "records": [r.to_dict() for r in temp_list],
             "count": len(temp_list),
             "average_delta_celsius": round(average_delta, 2) if average_delta is not None else None,
-            "errors": errors,
         }
+        _attach_errors(summary, errors)
+        return _attach_owner_guard(summary, records, owner)
+
+    async def basal_energy_records(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+        """Return recent basal-energy-burned samples (Watch BMR estimate, kcal).
+
+        Watch typically emits hourly samples, so a `limit` of ~168 covers a week.
+        Groups by local calendar day for a daily-BMR view (usually 1500-2000
+        kcal for an active young adult). Combine with `get_activity`'s
+        `active_energy_kcal` for a proper TDEE (see `total_energy_burned`).
+        """
+
+        records, errors = await self._records_for_metric(METRIC_BASAL_ENERGY, limit=None, fresh=fresh)
+        if owner:
+            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+        if limit is not None:
+            records = records[:limit]
+
+        parsed: list[BasalEnergyRecord] = []
+        for record in records:
+            try:
+                parsed.append(parse_basal_energy_record(record.payload, owner_user_id=record.owner_user_id))
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+
+        # Group by LOCAL calendar day. The old `r.date[:10]` cut took the UTC
+        # date prefix, which for a UTC+8 user mis-filed every sample between
+        # local 00:00-08:00 (= previous UTC day) into the PREVIOUS day —
+        # ~600-700 kcal of sleeping basal per night, self-cancelling on middle
+        # days but visibly wrong on the edges (2026-07-24 11:40 "today" showed
+        # 191.9 kcal when local 00:00-11:40 alone should hold ~900).
+        by_day: dict[str, float] = {}
+        for r in parsed:
+            try:
+                day_key = _local_calendar_day(_parse_iso8601(r.date)).isoformat()
+            except ValueError:
+                day_key = r.date[:10]  # unparseable date: degrade to old cut
+            by_day[day_key] = by_day.get(day_key, 0.0) + r.kcal
+        daily: list[dict[str, Any]] = sorted(
+            [{"day": d, "basal_kcal": round(kcal, 1)} for d, kcal in by_day.items()],
+            key=lambda x: str(x["day"]),
+            reverse=True,
+        )
+        latest_day_kcal: float | None = float(daily[0]["basal_kcal"]) if daily else None
+        avg_daily: float | None = (
+            round(sum(float(d["basal_kcal"]) for d in daily) / len(daily), 1) if daily else None
+        )
+
+        summary = {
+            "sample_count": len(parsed),
+            "day_count": len(daily),
+            "latest_day_basal_kcal": latest_day_kcal,
+            "average_daily_basal_kcal": avg_daily,
+            "daily": daily[:30],  # newest 30 days
+        }
+        _attach_errors(summary, errors)
+        return _attach_owner_guard(summary, records, owner)
+
+    async def total_energy_burned(
+        self,
+        *,
+        days: int = 7,
+        owner: str | None = None,
+        fresh: bool = False,
+    ) -> dict[str, Any]:
+        """Return TDEE (basal + active) per day for the last `days` days.
+
+        The truthful daily calorie burn — the number a diet target needs to
+        aim below to lose weight. Basal from Watch's `basalEnergyBurned`
+        (via `basal_energy_records`), active from `activity.active_energy_kcal`
+        (via `activity_summary`). If basal is empty (Vaultbeat hadn't ingested
+        the kind yet for the day, or Watch was off), the day's total is
+        active-only and flagged `basal_missing=true`.
+        """
+
+        # Pull both underlying streams in parallel — this is a compute
+        # aggregation, no new envelope fetches once both caches are warm.
+        basal_task = asyncio.create_task(self.basal_energy_records(owner=owner, fresh=fresh))
+        activity_task = asyncio.create_task(self.activity_summary(owner=owner, fresh=fresh))
+        basal = await basal_task
+        activity = await activity_task
+
+        # Build lookups: day -> kcal
+        basal_by_day = {d["day"]: d["basal_kcal"] for d in basal.get("daily", [])}
+
+        # activity_summary emits {"days": [{day_start_date, active_energy_kcal, ...}]}
+        active_by_day: dict[str, float] = {}
+        for d in activity.get("days", []):
+            raw = d.get("day_start_date") or ""
+            # HealthKit activity's day_start_date is an ISO instant of the local-day
+            # midnight-in-UTC (e.g. "2026-07-20T16:00:00Z" == 2026-07-21 00:00 CST).
+            # Convert to the caller's local calendar day for a clean join.
+            try:
+                dt = _parse_iso8601(raw)
+                day_key = _local_calendar_day(dt).isoformat()
+            except (ValueError, KeyError):
+                continue
+            active_by_day[day_key] = d.get("active_energy_kcal", 0.0)
+
+        all_days = sorted(set(basal_by_day) | set(active_by_day), reverse=True)[:days]
+
+        # Today is a PARTIAL day (its basal/active are still accumulating) —
+        # 2026-07-24 at 11:40 it showed 213 kcal and dragged a ~2617 average
+        # down to 2136, a distortion the size of an entire diet deficit. It
+        # stays in `days` (callers may want the live number) but is flagged
+        # and excluded from the average.
+        today_key = _local_calendar_day(datetime.now(timezone.utc)).isoformat()
+
+        out = []
+        for day in all_days:
+            b = basal_by_day.get(day)
+            a = active_by_day.get(day, 0.0)
+            total = (b or 0.0) + a
+            out.append({
+                "day": day,
+                "basal_kcal": b,
+                "active_kcal": round(a, 1),
+                "total_kcal": round(total, 1),
+                "basal_missing": b is None,
+                "partial": day == today_key,
+            })
+
+        totals_with_basal: list[float] = [
+            float(d["total_kcal"] or 0.0)
+            for d in out
+            if not d["basal_missing"] and not d["partial"]
+        ]
+        avg_tdee: float | None = (
+            round(sum(totals_with_basal) / len(totals_with_basal), 1)
+            if totals_with_basal
+            else None
+        )
+
+        return {
+            "days_returned": len(out),
+            "average_tdee_kcal": avg_tdee,
+            "average_note": "average excludes today (partial, still accumulating) and basal-missing days",
+            "days": out,
+            "basal_errors": basal.get("errors", []),
+            "activity_errors": activity.get("errors", []),
+        }
+
+    async def vo2max_records(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+        """Return recent VO2Max samples with a peak / trough summary.
+
+        Motivated by the 2026-11 萨武神山 备训 trend tracking (target 45+ from
+        current ~39.3, health.md 训练方案段). Watch computes VO2Max periodically
+        during outdoor brisk walk/run bouts — sparse samples over weeks/months,
+        so newest first and no artificial gap-filling.
+        """
+
+        records, errors = await self._records_for_metric(METRIC_VO2MAX, limit=None, fresh=fresh)
+        if owner:
+            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+        vo2_list: list[VO2MaxRecord] = []
+        for record in records:
+            try:
+                vo2_list.append(parse_vo2max_record(record.payload, owner_user_id=record.owner_user_id))
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        # Business-time sort before the cut — the old created_at cut only
+        # happened to put the newest sample first; a backfill batch breaks
+        # that (2026-07-24: vo2max came back visibly shuffled) and `latest`
+        # is defined as values[0], so the sort is what makes it truthful.
+        vo2_list.sort(key=lambda r: r.date, reverse=True)
+        if limit is not None:
+            vo2_list = vo2_list[:limit]
+        values = [r.vo2_max_ml_kg_min for r in vo2_list]
+        latest = values[0] if values else None
+        peak = max(values) if values else None
+        trough = min(values) if values else None
+        average = sum(values) / len(values) if values else None
+        summary = {
+            "records": [r.to_dict() for r in vo2_list],
+            "count": len(vo2_list),
+            "latest_ml_kg_min": round(latest, 1) if latest is not None else None,
+            "peak_ml_kg_min": round(peak, 1) if peak is not None else None,
+            "trough_ml_kg_min": round(trough, 1) if trough is not None else None,
+            "average_ml_kg_min": round(average, 1) if average is not None else None,
+        }
+        _attach_errors(summary, errors)
+        return _attach_owner_guard(summary, records, owner)
 
     async def symptom_summary(self, *, limit: int | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent symptom days grouped by data owner.
@@ -1851,10 +2805,9 @@ class VaultbeatLocalService:
             try:
                 days.append(parse_symptom_day(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
-                errors.append(f"{record.envelope_id}: {type(error).__name__}")
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
         summary = summarize_symptoms(days)
-        summary["errors"] = errors
-        return summary
+        return _attach_errors(summary, errors)
 
     async def notes_summary(
         self, *, limit: int | None = None, target_kind: str | None = None, fresh: bool = False
@@ -1876,10 +2829,645 @@ class VaultbeatLocalService:
             try:
                 notes.append(parse_note(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
-                errors.append(f"{record.envelope_id}: {type(error).__name__}")
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
         summary = summarize_notes(notes, target_kind=target_kind)
-        summary["errors"] = errors
-        return summary
+        return _attach_errors(summary, errors)
+
+    async def strength_summary(
+        self, *, limit: int | None = None, limit_days: int | None = None, fresh: bool = False
+    ) -> dict[str, Any]:
+        """Return recent strength-training sessions with exercise-level detail.
+
+        Logged manually in Vaultbeat (HealthKit's workout type has no per-set
+        data). Owner's own sessions only — strength has no partner fan-out.
+        """
+
+        records, errors = await self._records_for_metric(METRIC_STRENGTH, limit=limit, fresh=fresh)
+        if not records:
+            _LOG.info("no strength envelopes present (nothing logged yet)")
+        entries: list[StrengthRecord] = []
+        for record in records:
+            try:
+                entries.append(parse_strength(record.payload, owner_user_id=record.owner_user_id))
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        summary = summarize_strength(entries, limit_days=limit_days)
+        return _attach_errors(summary, errors)
+
+    async def log_strength_entry(
+        self,
+        *,
+        date: str,
+        exercises: list[dict[str, Any]],
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Encrypt and upsert one strength-training session on the owner's behalf.
+
+        `date` is the LOCAL calendar day ("YYYY-MM-DD"). If that day already has
+        a session — logged by the app or by a previous agent write — this reuses
+        its entryID so the upsert replaces the ciphertext in place (mirrors the
+        iOS editor's "editing a day reuses the id" invariant); otherwise a fresh
+        opaque entryID is minted. Sealed for the owner (readable in the app's own
+        account, though the iOS app does not yet display agent-authored sessions
+        — see StrengthOwnBlobPullClient) and for this MCP server (so a later
+        `get_strength_log` sees it immediately).
+
+        Requires a bind that carried owner identity through the handshake
+        (owner_user_id / owner_public_key_base64 / owner_device_id) — a bind
+        from before this feature shipped predates that and must re-bind.
+        """
+
+        from datetime import date as _date_type
+
+        requested_day = _date_type.fromisoformat(date)
+        normalized_exercises = _normalize_strength_exercises(exercises)
+        cleaned_note = note.strip() if isinstance(note, str) and note.strip() else None
+
+        config = self.store.require_bound()
+        server_token = config.server_token
+        if not (
+            server_token
+            and config.owner_user_id
+            and config.owner_public_key_base64
+            and config.owner_device_id
+            and config.server_id
+        ):
+            raise RuntimeError(
+                "This bind predates the agent write path (missing owner identity/device). "
+                "Run `vaultbeat-mcp-local bind` again to re-pair."
+            )
+
+        existing_summary = await self.strength_summary(fresh=True)
+        existing_entry_id: str | None = None
+        existing_created_at: str | None = None
+        for session in existing_summary.get("sessions", []):
+            session_date_raw = session.get("date")
+            if not isinstance(session_date_raw, str):
+                continue
+            try:
+                session_day = _local_calendar_day(_parse_iso8601(session_date_raw))
+            except ValueError:
+                continue
+            if session_day == requested_day:
+                existing_entry_id = session.get("entry_id")
+                existing_created_at = session.get("created_at")
+                break
+
+        now_iso_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        entry_id = existing_entry_id or ("strength-" + secrets.token_hex(16))
+        plaintext_obj = {
+            "entryID": entry_id,
+            "date": _local_midnight_iso(requested_day),
+            "exercises": normalized_exercises,
+            "note": cleaned_note,
+            "createdAt": existing_created_at or now_iso_utc,
+            "updatedAt": now_iso_utc,
+        }
+        plaintext_bytes = json.dumps(plaintext_obj, ensure_ascii=False).encode("utf-8")
+
+        recipients = [
+            RecipientKey(
+                recipient_kind="owner_user",
+                recipient_id=config.owner_user_id,
+                public_key_base64=config.owner_public_key_base64,
+            ),
+            RecipientKey(
+                recipient_kind="mcp_server",
+                recipient_id=config.server_id,
+                public_key_base64=config.public_key_base64,
+            ),
+        ]
+        ciphertext_base64, sealed_envelopes = encrypt_blob_payload(
+            plaintext=plaintext_bytes, recipients=recipients
+        )
+
+        blob = {
+            "id": entry_id,
+            "owner_user_id": config.owner_user_id,
+            "source_device_id": config.owner_device_id,
+            "metric_type": METRIC_STRENGTH,
+            "encryption_version": "v1",
+            "ciphertext": ciphertext_base64,
+        }
+        envelope_rows = [
+            {
+                "recipient_kind": envelope.recipient_kind,
+                "recipient_id": envelope.recipient_id,
+                "encrypted_data_key": envelope.encrypted_data_key_base64,
+            }
+            for envelope in sealed_envelopes
+        ]
+
+        server_response = await self._client(config).write_strength_blob(
+            server_token, blob=blob, envelopes=envelope_rows
+        )
+
+        refreshed = await self.strength_summary(fresh=True)
+        session = next(
+            (s for s in refreshed.get("sessions", []) if s.get("entry_id") == entry_id), None
+        )
+        return {
+            "entry_id": entry_id,
+            "date": requested_day.isoformat(),
+            "updated_existing_day": existing_entry_id is not None,
+            "server_response": server_response,
+            "session": session,
+        }
+
+    async def food_summary(
+        self, *, limit: int | None = None, limit_days: int | None = None, fresh: bool = False
+    ) -> dict[str, Any]:
+        """Return recent daily food-intake logs with per-day meals + items.
+
+        Logged manually in Vaultbeat (no automatic HealthKit source — HealthKit's
+        dietary types are point samples that don't survive as "what a meal actually
+        was"). Owner's own days only — food has no partner fan-out in v1.
+        """
+
+        records, errors = await self._records_for_metric(METRIC_FOOD, limit=limit, fresh=fresh)
+        if not records:
+            _LOG.info("no food envelopes present (nothing logged yet)")
+        entries: list[FoodRecord] = []
+        for record in records:
+            try:
+                entries.append(parse_food(record.payload, owner_user_id=record.owner_user_id))
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        summary = summarize_food(entries, limit_days=limit_days)
+        return _attach_errors(summary, errors)
+
+    async def log_food_entry(
+        self,
+        *,
+        date: str,
+        meals: list[dict[str, Any]],
+        note: str | None = None,
+        merge: bool = False,
+    ) -> dict[str, Any]:
+        """Encrypt and upsert one day's food-intake log on the owner's behalf.
+
+        Same shape / invariants as `log_strength_entry`: `date` is the LOCAL
+        calendar day ("YYYY-MM-DD"); an existing day (app- or agent-authored)
+        reuses its entryID for an upsert-in-place edit instead of forking a new
+        blob; sealed for the owner + this MCP server (no partner, own-AI only).
+
+        Two write modes (2026-07-23 client feedback — replace-only silently ate
+        every meal the caller forgot to re-send when "adding one snack"):
+        - ``merge=False`` (default, back-compat): the supplied meals REPLACE the
+          whole day.
+        - ``merge=True``: the supplied meals are APPENDED to the day's existing
+          meals (same-name meals get their items appended; see
+          ``_merge_food_meals``). ``note=None`` keeps the existing day note.
+
+        Requires a bind that carried owner identity through the handshake — a
+        bind from before this feature shipped predates that and must re-bind.
+        """
+
+        from datetime import date as _date_type
+
+        requested_day = _date_type.fromisoformat(date)
+        normalized_meals = _normalize_food_meals(meals)
+        cleaned_note = note.strip() if isinstance(note, str) and note.strip() else None
+
+        config = self.store.require_bound()
+        server_token = config.server_token
+        if not (
+            server_token
+            and config.owner_user_id
+            and config.owner_public_key_base64
+            and config.owner_device_id
+            and config.server_id
+        ):
+            raise RuntimeError(
+                "This bind predates the agent write path (missing owner identity/device). "
+                "Run `vaultbeat-mcp-local bind` again to re-pair."
+            )
+
+        existing_summary = await self.food_summary(fresh=True)
+        existing_entry_id: str | None = None
+        existing_created_at: str | None = None
+        existing_day: dict[str, Any] | None = None
+        for day in existing_summary.get("days", []):
+            day_date_raw = day.get("date")
+            if not isinstance(day_date_raw, str):
+                continue
+            try:
+                parsed_day = _local_calendar_day(_parse_iso8601(day_date_raw))
+            except ValueError:
+                continue
+            if parsed_day == requested_day:
+                existing_entry_id = day.get("entry_id")
+                existing_created_at = day.get("created_at")
+                existing_day = day
+                break
+
+        if merge and existing_day is not None:
+            existing_meals = existing_day.get("meals")
+            normalized_meals = _merge_food_meals(
+                existing_meals if isinstance(existing_meals, list) else [], normalized_meals
+            )
+            if cleaned_note is None:
+                existing_note = existing_day.get("note")
+                if isinstance(existing_note, str) and existing_note.strip():
+                    cleaned_note = existing_note
+
+        now_iso_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        entry_id = existing_entry_id or ("food-" + secrets.token_hex(16))
+        plaintext_obj = {
+            "entryID": entry_id,
+            "date": _local_midnight_iso(requested_day),
+            "meals": normalized_meals,
+            "note": cleaned_note,
+            "createdAt": existing_created_at or now_iso_utc,
+            "updatedAt": now_iso_utc,
+        }
+        plaintext_bytes = json.dumps(plaintext_obj, ensure_ascii=False).encode("utf-8")
+
+        recipients = [
+            RecipientKey(
+                recipient_kind="owner_user",
+                recipient_id=config.owner_user_id,
+                public_key_base64=config.owner_public_key_base64,
+            ),
+            RecipientKey(
+                recipient_kind="mcp_server",
+                recipient_id=config.server_id,
+                public_key_base64=config.public_key_base64,
+            ),
+        ]
+        ciphertext_base64, sealed_envelopes = encrypt_blob_payload(
+            plaintext=plaintext_bytes, recipients=recipients
+        )
+
+        blob = {
+            "id": entry_id,
+            "owner_user_id": config.owner_user_id,
+            "source_device_id": config.owner_device_id,
+            "metric_type": METRIC_FOOD,
+            "encryption_version": "v1",
+            "ciphertext": ciphertext_base64,
+        }
+        envelope_rows = [
+            {
+                "recipient_kind": envelope.recipient_kind,
+                "recipient_id": envelope.recipient_id,
+                "encrypted_data_key": envelope.encrypted_data_key_base64,
+            }
+            for envelope in sealed_envelopes
+        ]
+
+        server_response = await self._client(config).write_food_blob(
+            server_token, blob=blob, envelopes=envelope_rows
+        )
+
+        refreshed = await self.food_summary(fresh=True)
+        day = next(
+            (d for d in refreshed.get("days", []) if d.get("entry_id") == entry_id), None
+        )
+        return {
+            "entry_id": entry_id,
+            "date": requested_day.isoformat(),
+            "updated_existing_day": existing_entry_id is not None,
+            "merge_mode": merge,
+            "server_response": server_response,
+            "day": day,
+        }
+
+    async def log_weight_entry(
+        self,
+        *,
+        weight_kg: float,
+        date: str | None = None,
+    ) -> dict[str, Any]:
+        """Encrypt and upsert one weight blob on the owner's behalf (agent write).
+
+        `weight_kg` = kilograms. `date` = LOCAL calendar day "YYYY-MM-DD" (defaults
+        to today). One blob per local day (dayID = `body-{dayStart.epoch}`) so
+        re-recording the same day upserts in place — same convention as the iOS
+        weight card. Sealed for owner + this MCP server (own AI only).
+
+        ⚠️ CAVEAT: agent-written weight ONLY lands in Vaultbeat cloud + MCP
+        (visible to `get_weight_trend`). It does NOT write to Apple Health
+        (HealthKit is iOS-only). If the owner also wants the number in the
+        iPhone Health app, they need to record it manually in the Vaultbeat
+        weight card (which does the HealthKit write). Design decision:
+        keeping this MCP tool light + read-only wrt HealthKit avoids the
+        entire "server-triggered HealthKit push" complexity.
+
+        Requires a bind that carried owner identity through the handshake
+        (owner_user_id / owner_public_key_base64 / owner_device_id).
+        """
+
+        from datetime import date as _date_type
+
+        requested_day = _date_type.fromisoformat(date) if date else _date_type.today()
+
+        config = self.store.require_bound()
+        server_token = config.server_token
+        if not (
+            server_token
+            and config.owner_user_id
+            and config.owner_public_key_base64
+            and config.owner_device_id
+            and config.server_id
+        ):
+            raise RuntimeError(
+                "This bind predates the agent write path (missing owner identity/device). "
+                "Run `vaultbeat-mcp-local bind` again to re-pair."
+            )
+
+        if weight_kg <= 0 or weight_kg > 500:
+            raise ValueError(f"weight_kg out of realistic range: {weight_kg}")
+
+        # Match iOS: dayID = "body-{dayStart.epoch}", dayStart = local midnight
+        local_tz = datetime.now(timezone.utc).astimezone().tzinfo
+        day_start_local = datetime(
+            requested_day.year, requested_day.month, requested_day.day, tzinfo=local_tz
+        )
+        day_start_epoch = int(day_start_local.timestamp())
+        day_id = f"body-{day_start_epoch}"
+
+        plaintext_obj = {
+            "dayID": day_id,
+            "dayStartDate": day_start_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "weightKg": float(weight_kg),
+            "bodyFatPercent": None,
+            "bmi": None,
+        }
+        plaintext_bytes = json.dumps(plaintext_obj, ensure_ascii=False).encode("utf-8")
+
+        recipients = [
+            RecipientKey(
+                recipient_kind="owner_user",
+                recipient_id=config.owner_user_id,
+                public_key_base64=config.owner_public_key_base64,
+            ),
+            RecipientKey(
+                recipient_kind="mcp_server",
+                recipient_id=config.server_id,
+                public_key_base64=config.public_key_base64,
+            ),
+        ]
+        ciphertext_base64, sealed_envelopes = encrypt_blob_payload(
+            plaintext=plaintext_bytes, recipients=recipients
+        )
+
+        blob = {
+            "id": day_id,
+            "owner_user_id": config.owner_user_id,
+            "source_device_id": config.owner_device_id,
+            "metric_type": METRIC_BODY,
+            "encryption_version": "v1",
+            "ciphertext": ciphertext_base64,
+        }
+        envelope_rows = [
+            {
+                "recipient_kind": envelope.recipient_kind,
+                "recipient_id": envelope.recipient_id,
+                "encrypted_data_key": envelope.encrypted_data_key_base64,
+            }
+            for envelope in sealed_envelopes
+        ]
+
+        server_response = await self._client(config).write_body_blob(
+            server_token, blob=blob, envelopes=envelope_rows
+        )
+
+        # Verify by re-reading (cache-bypass)
+        refreshed = await self.weight_trend_summary(fresh=True, limit=30)
+        latest = refreshed.get("days", [{}])[0] if refreshed.get("days") else {}
+        return {
+            "day_id": day_id,
+            "date": requested_day.isoformat(),
+            "weight_kg": weight_kg,
+            "server_response": server_response,
+            "latest_after_write": latest,
+        }
+
+    async def log_note(
+        self,
+        *,
+        text: str,
+        kind: str = "general",
+        date: str | None = None,
+    ) -> dict[str, Any]:
+        """Encrypt and upsert one agent-authored note on the owner's behalf.
+
+        Fills the gap the 2026-07-23 roadmap entry describes: "今天为什么情绪
+        低落 / 发生了什么" narratives had nowhere to live in Vaultbeat (the
+        `note` kind's targetKind was only ever written as sleep/menstrual by
+        iOS), so they piled up in local markdown where no metric join can see
+        them. `kind` is "mood" or "general" — agent-only kinds; iOS's
+        VaultbeatNoteTargetKind stores the raw string on the wire and has no
+        note pull path, so a new kind is wire-safe by construction. sleep and
+        menstrual stay iOS-authored (writing them here would silently coexist
+        with an app-authored note for the same day and confuse dedup).
+
+        `date` = LOCAL calendar day "YYYY-MM-DD" (default today). One
+        agent-authored note per (kind, local day): logging the same kind+day
+        again reuses the noteID and overwrites in place — to APPEND to an
+        existing note, `get_notes` first and resend the combined text.
+        Sealed for owner + this MCP server (own AI only, no partner fan-out).
+        """
+
+        from datetime import date as _date_type
+
+        allowed_kinds = {"mood", "general"}
+        if kind not in allowed_kinds:
+            raise ValueError(
+                f"unsupported note kind {kind!r}; expected one of {sorted(allowed_kinds)} "
+                "(sleep/menstrual notes are iOS-authored)"
+            )
+        cleaned_text = text.strip() if isinstance(text, str) else ""
+        if not cleaned_text:
+            raise ValueError("note text must be a non-empty string")
+        requested_day = _date_type.fromisoformat(date) if date else _date_type.today()
+
+        config = self.store.require_bound()
+        server_token = config.server_token
+        if not (
+            server_token
+            and config.owner_user_id
+            and config.owner_public_key_base64
+            and config.owner_device_id
+            and config.server_id
+        ):
+            raise RuntimeError(
+                "This bind predates the agent write path (missing owner identity/device). "
+                "Run `vaultbeat-mcp-local bind` again to re-pair."
+            )
+
+        # Upsert key: an existing agent-authored note for the same (kind, day).
+        existing_note_id: str | None = None
+        existing_created_at: str | None = None
+        existing_summary = await self.notes_summary(target_kind=kind, fresh=True)
+        for kind_group in existing_summary.get("kinds", []):
+            for note_row in kind_group.get("notes", []):
+                raw_date = note_row.get("target_date")
+                if not isinstance(raw_date, str):
+                    continue
+                try:
+                    parsed_day = _local_calendar_day(_parse_iso8601(raw_date))
+                except ValueError:
+                    continue
+                if parsed_day == requested_day:
+                    existing_note_id = note_row.get("note_id")
+                    existing_created_at = note_row.get("created_at")
+                    break
+            if existing_note_id:
+                break
+
+        now_iso_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        note_id = existing_note_id or ("note-" + secrets.token_hex(16))
+        plaintext_obj = {
+            "noteID": note_id,
+            "targetKind": kind,
+            "targetDate": _local_midnight_iso(requested_day),
+            "text": cleaned_text,
+            "createdAt": existing_created_at or now_iso_utc,
+            "updatedAt": now_iso_utc,
+        }
+        plaintext_bytes = json.dumps(plaintext_obj, ensure_ascii=False).encode("utf-8")
+
+        recipients = [
+            RecipientKey(
+                recipient_kind="owner_user",
+                recipient_id=config.owner_user_id,
+                public_key_base64=config.owner_public_key_base64,
+            ),
+            RecipientKey(
+                recipient_kind="mcp_server",
+                recipient_id=config.server_id,
+                public_key_base64=config.public_key_base64,
+            ),
+        ]
+        ciphertext_base64, sealed_envelopes = encrypt_blob_payload(
+            plaintext=plaintext_bytes, recipients=recipients
+        )
+
+        blob = {
+            "id": note_id,
+            "owner_user_id": config.owner_user_id,
+            "source_device_id": config.owner_device_id,
+            "metric_type": METRIC_NOTE,
+            "encryption_version": "v1",
+            "ciphertext": ciphertext_base64,
+        }
+        envelope_rows = [
+            {
+                "recipient_kind": envelope.recipient_kind,
+                "recipient_id": envelope.recipient_id,
+                "encrypted_data_key": envelope.encrypted_data_key_base64,
+            }
+            for envelope in sealed_envelopes
+        ]
+
+        server_response = await self._client(config).write_note_blob(
+            server_token, blob=blob, envelopes=envelope_rows
+        )
+
+        refreshed = await self.notes_summary(target_kind=kind, fresh=True)
+        written = None
+        for kind_group in refreshed.get("kinds", []):
+            for note_row in kind_group.get("notes", []):
+                if note_row.get("note_id") == note_id:
+                    written = note_row
+                    break
+        return {
+            "note_id": note_id,
+            "kind": kind,
+            "date": requested_day.isoformat(),
+            "updated_existing_note": existing_note_id is not None,
+            "server_response": server_response,
+            "note": written,
+        }
+
+    def _probe_cloud(self, api_base_url: str) -> tuple[bool, str]:
+        """Reachability probe: any HTTP answer (even 401/405) proves the edge
+        is reachable; only transport-level failures count as unreachable.
+        Split out so tests can monkeypatch it without a network."""
+        import httpx  # lazy — keep the cache-hit CLI start fast
+
+        try:
+            response = httpx.get(
+                api_base_url.rstrip("/") + "/mcp-sync", timeout=10.0
+            )
+            return True, f"cloud answered HTTP {response.status_code}"
+        except httpx.HTTPError as error:
+            return False, f"{type(error).__name__}: {error}"
+
+    async def doctor(self) -> dict[str, Any]:
+        """Aggregated self-diagnosis for the install/binding first mile
+        (roadmap v1.2.1 "绑定失败自诊断"). Returns machine-readable checks;
+        the CLI renders them as an [OK]/[FAIL] list with hints."""
+        checks: list[dict[str, Any]] = []
+
+        def add(name: str, ok: bool, detail: str, hint: str | None = None) -> None:
+            check: dict[str, Any] = {"name": name, "ok": ok, "detail": detail}
+            if hint and not ok:
+                check["hint"] = hint
+            checks.append(check)
+
+        config = self.store.load()
+        if not config:
+            add(
+                "config", False, f"no config at {self.store.path}",
+                hint="Run `vaultbeat-mcp bind` to initialize and pair with the iOS app.",
+            )
+            return {"ok": False, "checks": checks}
+        add("config", True, str(self.store.path))
+
+        add(
+            "identity_key", bool(config.private_key_base64),
+            "private key present" if config.private_key_base64 else "private key missing",
+            hint="The Keychain entry is gone or unreadable. Re-run `vaultbeat-mcp bind` to mint a fresh identity.",
+        )
+
+        reachable, probe_detail = self._probe_cloud(config.api_base_url)
+        add(
+            "cloud_reachable", reachable, probe_detail,
+            hint="Check your internet connection / proxy. The cloud endpoint is "
+            f"{config.api_base_url}",
+        )
+
+        add(
+            "bound", config.is_bound,
+            f"server_id={config.server_id}" if config.is_bound else "not bound to an iOS app",
+            hint="Run `vaultbeat-mcp bind`, then scan the QR with Vaultbeat on iOS "
+            "(Settings → Data & AI → MCP Server). Codes expire after 10 minutes — "
+            "if the phone scanned but this side stayed pending, re-run bind for a fresh code.",
+        )
+        # Informational only: legacy bindings predate the owner-identity
+        # handshake and still decrypt fine — absence must not fail the doctor.
+        add(
+            "owner_identity", True,
+            "owner identity received"
+            if config.owner_user_id and config.owner_public_key_base64
+            else "owner identity missing (legacy binding — reads unaffected)",
+        )
+
+        if config.is_bound and reachable:
+            try:
+                records, errors = await self._records_for_metric(
+                    METRIC_SLEEP, limit=1, fresh=True
+                )
+                if errors and not records:
+                    add(
+                        "data_roundtrip", False,
+                        f"fetch ok but decrypt failed ({errors[0]})",
+                        hint="The stored key can no longer decrypt your data — "
+                        "delete this server in the iOS app and bind again.",
+                    )
+                else:
+                    add("data_roundtrip", True, f"decrypted {len(records)} sleep record(s)")
+            except Exception as error:  # noqa: BLE001 — diagnostic surface, report everything
+                add(
+                    "data_roundtrip", False, f"{type(error).__name__}: {error}",
+                    hint="The server token may have been revoked — check the server "
+                    "still exists in the iOS app (Settings → Data & AI), or bind again.",
+                )
+
+        return {"ok": all(check["ok"] for check in checks), "checks": checks}
 
     def status(self) -> dict[str, Any]:
         config = self.store.load()

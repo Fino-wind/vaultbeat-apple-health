@@ -90,6 +90,16 @@ Then just ask your agent: *“How did we sleep last night?”*
 | `get_mindfulness` | Mindful sessions and minutes per day |
 | `get_hrv` | Heart-rate variability (SDNN) records + window mean |
 | `get_wrist_temp` | Sleeping wrist-temperature baseline deviation |
+| `get_hrv_hourly` *(via `get_hrv(granularity="hourly")`)* | Hour-bucketed HRV averages over 30 days — the context-cheap default; `granularity="raw"` keeps minute-level spike precision |
+| `get_vo2max` | VO₂ max records + latest / peak / trough / window average |
+| `get_basal_energy` | Basal (resting) energy burned, per hour bucket |
+| `get_total_energy_burned` | **TDEE** — basal + active per day, measured rather than estimated, with today flagged partial and excluded from the average |
+| `get_strength_log` | Structured strength training: exercise, sets, reps, weight per day |
+| `get_food_log` | Meals as free text with optional portions and timing |
+| `log_weight_entry` | **Write** a weight entry (optionally mirrored into Apple Health when the user opts in) |
+| `log_strength_entry` | **Write** a strength-training entry for a given day |
+| `log_food_entry` | **Write** a meal entry for a given day |
+| `log_note` | **Write** a mood or general note for a given day |
 
 Every data tool accepts `owner` (a user-ID prefix) to filter to one person — the server may hold both your and your partner's shared records, and omitting `owner` mixes them into one pool, so per-person questions should always pass it. (Earlier releases named some tools `get_partner_*` / `tether_*`; they were renamed in the 16-tool and Vaultbeat releases.)
 

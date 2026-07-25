@@ -214,3 +214,12 @@ def test_water_subcommand_returns_3_on_decode_errors(
     exit_code = cli.main(["--config", str(tmp_path / "config.json"), "water"])
 
     assert exit_code == 3  # mirrors `sync`'s nonzero exit when records failed to decode
+
+
+def test_doctor_returns_1_and_prints_fail_when_unbound(tmp_path: Path, capsys: Any) -> None:
+    exit_code = cli.main(["--config", str(tmp_path / "config.json"), "doctor"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "[FAIL] config" in captured.out
+    assert "bind" in captured.out

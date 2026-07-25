@@ -1017,40 +1017,6 @@ wheels = [
 ]
 
 [[package]]
-name = "tether-mcp-local"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "cryptography" },
-    { name = "httpx" },
-    { name = "keyring" },
-    { name = "mcp" },
-]
-
-[package.optional-dependencies]
-dev = [
-    { name = "mypy" },
-    { name = "pytest" },
-    { name = "ruff" },
-]
-qr = [
-    { name = "qrcode" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "cryptography", specifier = ">=42.0.0,<47.0.0" },
-    { name = "httpx", specifier = ">=0.28.0,<1.0.0" },
-    { name = "keyring", specifier = ">=24" },
-    { name = "mcp", specifier = ">=1.13.0,<2.0.0" },
-    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.13.0,<2.0.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.0,<9.0.0" },
-    { name = "qrcode", marker = "extra == 'qr'", specifier = ">=8.0.0,<9.0.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.11.0,<1.0.0" },
-]
-provides-extras = ["dev", "qr"]
-
-[[package]]
 name = "typing-extensions"
 version = "4.15.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1083,6 +1049,40 @@ sdist = { url = "https://files.pythonhosted.org/packages/e6/bf/f6544ba992ddb9a60
 wheels = [
     { url = "https://files.pythonhosted.org/packages/01/be/72532be3da7acc5fdfbccdb95215cd04f995a0886532a5b423f929cda4cc/uvicorn-0.48.0-py3-none-any.whl", hash = "sha256:48097851328b87ec36117d3d575234519eb58c2b22d79666e9bbc6c49a761dad", size = 71410, upload-time = "2026-05-24T12:08:40.258Z" },
 ]
+
+[[package]]
+name = "vaultbeat-mcp"
+version = "0.1.2"
+source = { editable = "." }
+dependencies = [
+    { name = "cryptography" },
+    { name = "httpx" },
+    { name = "keyring" },
+    { name = "mcp" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "ruff" },
+]
+qr = [
+    { name = "qrcode" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cryptography", specifier = ">=42.0.0,<47.0.0" },
+    { name = "httpx", specifier = ">=0.28.0,<1.0.0" },
+    { name = "keyring", specifier = ">=24" },
+    { name = "mcp", specifier = ">=1.13.0,<2.0.0" },
+    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.13.0,<2.0.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.0,<9.0.0" },
+    { name = "qrcode", marker = "extra == 'qr'", specifier = ">=8.0.0,<9.0.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.11.0,<1.0.0" },
+]
+provides-extras = ["dev", "qr"]
 
 [[package]]
 name = "zipp"
