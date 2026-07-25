@@ -9,6 +9,33 @@ from vaultbeat_mcp_local.service import VaultbeatLocalService
 from vaultbeat_mcp_local.store import ConfigStore
 
 
+def _annotate_if_empty(result: dict[str, Any], kind: str, rows_key: str) -> dict[str, Any]:
+    """Explain an empty result for a kind that older apps never wrote.
+
+    An agent calling `get_strength_log` on an account whose app predates
+    strength logging gets `{"sessions": []}` — indistinguishable from "you never
+    trained" and from "something is broken". There is no other signal anywhere:
+    no error, no warning. This attaches the reason to the result itself so the
+    agent can relay it without having to know that a separate diagnostic exists.
+
+    ADD-ONLY, deliberately: it introduces a `hint` key and never reads, edits or
+    removes an existing field, and it does nothing at all when there IS data.
+    Payload shape is the one contract layer no server can validate (see AGENTS.md
+    § app↔MCP coupling), so anything touching a response has to be additive.
+    """
+    since = VaultbeatLocalService.KIND_MIN_APP_RELEASE.get(kind)
+    if since is None or result.get(rows_key):
+        return result
+    result.setdefault(
+        "hint",
+        f"No {kind} data on this account. This data type requires an iOS build "
+        f"from {since} or later — if the app is current, it simply hasn't been "
+        f"recorded yet (or its Apple Health permission is off). "
+        f"Run `vaultbeat-mcp doctor` or call the vaultbeat_doctor tool for a full report.",
+    )
+    return result
+
+
 _LOOPBACK_HOSTNAMES = {"localhost"}
 
 
@@ -122,6 +149,28 @@ def run_mcp_server(
         return service.status()
 
     @mcp.tool()
+    async def vaultbeat_doctor() -> dict[str, Any]:
+        """Diagnose this Vaultbeat MCP install, and report which data types are unavailable.
+
+        Call this when a read tool returns nothing, or when anything fails, before
+        telling the user their data is missing. Two distinct things come back:
+
+        `checks` — the install/binding chain: config present, keypair usable,
+        binding valid, cloud reachable, a real record decryptable end to end.
+        A failure here means the setup is broken, not that data is absent.
+
+        `capabilities` — which metric kinds actually have data, and which empty
+        ones are explained by an older iOS app (with the release date each
+        needs). An empty kind is NOT proof the user never recorded it: their app
+        may predate the feature entirely.
+
+        This runs a cloud round trip, so it is slower than `vaultbeat_status`
+        (local config only) — prefer status for a quick liveness check.
+        """
+
+        return await service.doctor()
+
+    @mcp.tool()
     async def vaultbeat_sync_sleep(
         limit: int = 50, owner: str | None = None, fresh: bool = False
     ) -> dict[str, Any]:
@@ -211,7 +260,11 @@ def run_mcp_server(
         analysis. Pass limit_days to cap how many sessions return.
         """
 
-        return await service.strength_summary(limit=limit, limit_days=limit_days, fresh=fresh)
+        return _annotate_if_empty(
+            await service.strength_summary(limit=limit, limit_days=limit_days, fresh=fresh),
+            "strength",
+            "sessions",
+        )
 
     @mcp.tool()
     async def log_strength_entry(
@@ -246,7 +299,11 @@ def run_mcp_server(
         Owner's own days only. Pass limit_days to cap how many days return.
         """
 
-        return await service.food_summary(limit=limit, limit_days=limit_days, fresh=fresh)
+        return _annotate_if_empty(
+            await service.food_summary(limit=limit, limit_days=limit_days, fresh=fresh),
+            "food",
+            "days",
+        )
 
     @mcp.tool()
     async def log_food_entry(
@@ -488,7 +545,11 @@ def run_mcp_server(
         returns per-day BMR (~1500-2000 kcal for active young adults) + average.
         Use `owner` prefix to filter by person."""
 
-        return await service.basal_energy_records(limit=limit, owner=owner, fresh=fresh)
+        return _annotate_if_empty(
+            await service.basal_energy_records(limit=limit, owner=owner, fresh=fresh),
+            "basal_energy",
+            "daily",
+        )
 
     @mcp.tool()
     async def get_total_energy_burned(days: int = 7, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
@@ -514,7 +575,11 @@ def run_mcp_server(
         computes it during outdoor brisk walk/run bouts, days apart), so a
         limit of 30 usually covers many months."""
 
-        return await service.vo2max_records(limit=limit, owner=owner, fresh=fresh)
+        return _annotate_if_empty(
+            await service.vo2max_records(limit=limit, owner=owner, fresh=fresh),
+            "vo2max",
+            "records",
+        )
 
     @mcp.tool()
     async def get_mindfulness(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:

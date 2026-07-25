@@ -75,6 +75,7 @@ Then just ask your agent: *“How did we sleep last night?”*
 | Tool | Returns |
 |---|---|
 | `vaultbeat_status` | Local binding state (never exposes keys or tokens) |
+| `vaultbeat_doctor` | Full self-diagnosis: install/binding chain **plus** which data types have data and which need a newer iOS build — call this before concluding data is missing |
 | `vaultbeat_start_binding` | A fresh QR binding payload for the iOS app to scan |
 | `vaultbeat_poll_binding` | One poll for the iOS authorization to complete binding |
 | `vaultbeat_sync_sleep` | Recent sleep sessions incl. heart-rate samples, per-day primary-session selection matching the iOS app |

@@ -61,6 +61,23 @@ def handle_doctor(args: argparse.Namespace) -> int:
             print(f"{marker} {check['name']}: {check['detail']}")
             if not check["ok"] and check.get("hint"):
                 print(f"       → {check['hint']}")
+
+        # Capability gap: tools that exist here but have nothing to read. Without
+        # this, an empty result is indistinguishable from a broken one — the
+        # question "why does get_total_energy_burned return nothing" has no
+        # answer anywhere else.
+        caps = report.get("capabilities") or {}
+        if caps.get("available"):
+            gated = caps.get("possibly_needs_newer_app") or {}
+            if gated:
+                print()
+                print("[WARN] Some tools have no data on this account:")
+                for kind, since in sorted(gated.items()):
+                    print(f"       {kind} — needs an iOS build from {since} or later")
+                print(f"       → {caps['note']}")
+            else:
+                print(f"[OK]   capabilities: all {len(caps.get('kinds_with_data', []))} data types present")
+
         print("All checks passed." if report["ok"] else "Some checks failed — follow the hints above.")
     return 0 if report["ok"] else 1
 

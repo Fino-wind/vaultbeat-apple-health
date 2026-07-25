@@ -3467,7 +3467,67 @@ class VaultbeatLocalService:
                     "still exists in the iOS app (Settings → Data & AI), or bind again.",
                 )
 
-        return {"ok": all(check["ok"] for check in checks), "checks": checks}
+        report: dict[str, Any] = {
+            "ok": all(check["ok"] for check in checks),
+            "checks": checks,
+        }
+        if config.is_bound:
+            report["capabilities"] = await self._capability_report()
+        return report
+
+    # Metric kinds that only exist from a given iOS release onward. A tool whose
+    # backing kind predates the user's app returns nothing — with no error, which
+    # is indistinguishable from "you have no data" unless we say so here.
+    #
+    # This is derived from the DATA, not from an app-reported version number.
+    # Asking the app to report its version would only help users who later
+    # install a build that knows to report it — useless for the people already
+    # affected, and it would mean changing the payload shape, which is the one
+    # thing the wire contract most wants left alone.
+    KIND_MIN_APP_RELEASE: dict[str, str] = {
+        "strength": "2026-07-19",
+        "food": "2026-07-20",
+        "vo2max": "2026-07-20",
+        "basal_energy": "2026-07-21",
+        "hrv_hourly": "2026-07-22",
+    }
+
+    async def _capability_report(self) -> dict[str, Any]:
+        """Which metric kinds actually have data for this account, and which
+        tools are consequently dead weight.
+
+        Deliberately does NOT claim to know the app's version: an empty kind
+        means either "the app is older than this feature" or "the user has never
+        recorded it / not granted that HealthKit permission". Both are reported
+        the same way, because the actionable advice is identical — update the app
+        and check the permission — and pretending to distinguish them would be
+        guessing.
+        """
+        present: list[str] = []
+        absent: list[str] = []
+        try:
+            records, _ = await self.sync_decrypted_records()
+        except Exception:  # noqa: BLE001 — diagnostics must not raise
+            return {"available": False, "reason": "could not read cloud data"}
+
+        seen = {r.metric_type or "sleep" for r in records}
+        for kind in sorted(KNOWN_METRIC_TYPES):
+            (present if kind in seen else absent).append(kind)
+
+        gated = {k: v for k, v in self.KIND_MIN_APP_RELEASE.items() if k in absent}
+        return {
+            "available": True,
+            "kinds_with_data": present,
+            "kinds_without_data": absent,
+            "possibly_needs_newer_app": gated,
+            "note": (
+                "Empty kinds listed under possibly_needs_newer_app require an iOS "
+                "build from the stated date or later. If your app is current, the "
+                "kind is simply unrecorded (or its HealthKit permission is off)."
+            )
+            if gated
+            else "Every kind this server knows about has data.",
+        }
 
     def status(self) -> dict[str, Any]:
         config = self.store.load()
