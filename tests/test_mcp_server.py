@@ -215,3 +215,115 @@ def test_run_mcp_server_registers_water_and_menstrual_tools(
     assert "vaultbeat_sync_sleep" in registered
     assert "get_water_intake" in registered
     assert "get_menstrual_cycle" in registered
+
+
+def test_get_hrv_falls_back_to_raw_when_hourly_is_empty(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """An app too old to write hourly buckets must still get its HRV.
+
+    `hrv_hourly` only exists from iOS build 77 (2026-07-22). Serving the empty
+    hourly result to an App Store user on 1.2.0 would report "no HRV data" for
+    an account full of raw HRV — a regression against 0.1.2, which read raw
+    unconditionally. App and MCP versions drift permanently (users update them
+    independently), so the aggregate degrades to the kind it aggregates.
+    """
+    tools: dict[str, Any] = {}
+
+    class FakeFastMCP:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def tool(self) -> Any:
+            def decorator(function: Any) -> Any:
+                tools[function.__name__] = function
+                return function
+
+            return decorator
+
+        def run(self, **kwargs: Any) -> None:
+            pass
+
+    fake_module = types.ModuleType("mcp.server.fastmcp")
+    fake_module.FastMCP = FakeFastMCP
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_module)
+
+    hourly_empty = {"records": [], "count": 0, "average_sdnn_ms": None}
+    raw_present = {
+        "records": [{"sdnn_ms": 42.0}],
+        "count": 1,
+        "average_sdnn_ms": 42.0,
+    }
+
+    async def fake_hourly(**_: Any) -> dict[str, Any]:
+        return dict(hourly_empty)
+
+    async def fake_raw(**_: Any) -> dict[str, Any]:
+        return dict(raw_present)
+
+    monkeypatch.setattr(
+        "vaultbeat_mcp_local.service.VaultbeatLocalService.hrv_hourly_records",
+        lambda self, **kw: fake_hourly(**kw),
+    )
+    monkeypatch.setattr(
+        "vaultbeat_mcp_local.service.VaultbeatLocalService.hrv_records",
+        lambda self, **kw: fake_raw(**kw),
+    )
+
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+    get_hrv = tools["get_hrv"]
+
+    # Default (hourly) with no hourly data → raw, clearly labelled.
+    result = asyncio.run(get_hrv())
+    assert result["count"] == 1
+    assert result["granularity"] == "raw"
+    assert "2026-07-22" in result["granularity_note"]
+
+    # Explicit raw is untouched by the fallback path.
+    result = asyncio.run(get_hrv(granularity="raw"))
+    assert result["count"] == 1
+    assert "granularity_note" not in result
+
+
+def test_get_hrv_prefers_hourly_when_available(monkeypatch: Any, tmp_path: Path) -> None:
+    """The fallback must not fire when hourly data exists (no silent downgrade)."""
+    tools: dict[str, Any] = {}
+
+    class FakeFastMCP:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def tool(self) -> Any:
+            def decorator(function: Any) -> Any:
+                tools[function.__name__] = function
+                return function
+
+            return decorator
+
+        def run(self, **kwargs: Any) -> None:
+            pass
+
+    fake_module = types.ModuleType("mcp.server.fastmcp")
+    fake_module.FastMCP = FakeFastMCP
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_module)
+
+    async def fake_hourly(**_: Any) -> dict[str, Any]:
+        return {"records": [{"avg_sdnn_ms": 40.0}], "count": 1, "average_sdnn_ms": 40.0}
+
+    async def fake_raw(**_: Any) -> dict[str, Any]:
+        raise AssertionError("raw must not be queried when hourly has data")
+
+    monkeypatch.setattr(
+        "vaultbeat_mcp_local.service.VaultbeatLocalService.hrv_hourly_records",
+        lambda self, **kw: fake_hourly(**kw),
+    )
+    monkeypatch.setattr(
+        "vaultbeat_mcp_local.service.VaultbeatLocalService.hrv_records",
+        lambda self, **kw: fake_raw(**kw),
+    )
+
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+    result = asyncio.run(tools["get_hrv"]())
+
+    assert result["count"] == 1
+    assert "granularity_note" not in result
