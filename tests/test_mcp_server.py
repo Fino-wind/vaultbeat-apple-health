@@ -374,6 +374,12 @@ def test_empty_newer_kind_explains_itself(monkeypatch: Any, tmp_path: Path) -> N
     assert result["sessions"] == []
     assert "2026-07-19" in result["hint"]
     assert "vaultbeat_doctor" in result["hint"]
+    # The hint must offer the permission cause and its recovery path, not just
+    # "update your app". A HealthKit READ denial is invisible to the app — it
+    # reports success and delivers nothing — so an agent relaying this has no
+    # other way to suggest the one action that fixes it.
+    assert "Apple Health access" in result["hint"]
+    assert "not been recorded yet" in result["hint"]
     # Add-only: the original keys survive untouched.
     assert result["errors"] == []
 

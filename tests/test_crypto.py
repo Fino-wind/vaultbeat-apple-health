@@ -13,6 +13,8 @@ from vaultbeat_mcp_local.crypto import (
     ENVELOPE_INFO,
     RecipientKey,
     VaultbeatCryptoError,
+    VaultbeatDekMismatchError,
+    VaultbeatEnvelopeNotForMeError,
     decrypt_blob_payload,
     decrypt_sleep_payload,
     encrypt_blob_payload,
@@ -442,5 +444,110 @@ def test_decrypt_blob_payload_rejects_non_base64_encrypted_data_key() -> None:
         decrypt_blob_payload(
             ciphertext_base64=ct_b64,
             encrypted_data_key_base64="not!!valid!!base64",
+            private_key_base64=priv,
+        )
+
+
+# ---------------------------------------------------------------------------
+# The integrity safety line: NotForMe vs DekMismatch (AGENTS.md Invariant 34)
+#
+# AES-GCM reports both failures identically at the InvalidTag layer, so these
+# pin that decrypt_blob_payload still tells them apart — the distinction the
+# self-healing GC's repair decision depends on.
+# ---------------------------------------------------------------------------
+
+
+def test_decrypt_blob_payload_healthy_pair_succeeds() -> None:
+    priv, pub = generate_x25519_keypair()
+    ct_b64, envelopes = encrypt_blob_payload(
+        plaintext=b"night",
+        recipients=[RecipientKey("owner_user", "u-1", pub)],
+    )
+
+    plaintext = decrypt_blob_payload(
+        ciphertext_base64=ct_b64,
+        encrypted_data_key_base64=envelopes[0].encrypted_data_key_base64,
+        private_key_base64=priv,
+    )
+
+    assert plaintext == b"night"
+
+
+def test_decrypt_blob_payload_raises_not_for_me_when_sealed_for_another_recipient() -> None:
+    """A rotated key or someone else's row — the ONE case that must never be
+    treated as damage. Distinct exception type from DekMismatch."""
+    mine_priv, _ = generate_x25519_keypair()
+    _, theirs_pub = generate_x25519_keypair()
+    ct_b64, envelopes = encrypt_blob_payload(
+        plaintext=b"night",
+        recipients=[RecipientKey("owner_user", "u-2", theirs_pub)],
+    )
+
+    with pytest.raises(VaultbeatEnvelopeNotForMeError):
+        decrypt_blob_payload(
+            ciphertext_base64=ct_b64,
+            encrypted_data_key_base64=envelopes[0].encrypted_data_key_base64,
+            private_key_base64=mine_priv,
+        )
+
+
+def test_decrypt_blob_payload_raises_dek_mismatch_when_envelope_key_opens_nothing() -> None:
+    """Envelope unwraps to a VALID DEK that does not open the ciphertext —
+    exactly what a re-encrypted blob with a stale envelope looks like
+    (Invariant 32/33's production bug). Proven damage, distinct exception type."""
+    priv, pub = generate_x25519_keypair()
+    # Two independent encryptions to the SAME recipient — different DEKs by
+    # construction. Splice envelope A onto ciphertext B.
+    ct_a_b64, envelopes_a = encrypt_blob_payload(plaintext=b"night A", recipients=[RecipientKey("owner_user", "u-1", pub)])
+    ct_b_b64, _ = encrypt_blob_payload(plaintext=b"night B", recipients=[RecipientKey("owner_user", "u-1", pub)])
+    assert ct_a_b64 != ct_b_b64
+
+    with pytest.raises(VaultbeatDekMismatchError):
+        decrypt_blob_payload(
+            ciphertext_base64=ct_b_b64,
+            encrypted_data_key_base64=envelopes_a[0].encrypted_data_key_base64,
+            private_key_base64=priv,
+        )
+
+
+def test_dek_mismatch_and_not_for_me_are_both_still_crypto_errors() -> None:
+    """Backward compatibility: every existing `except VaultbeatCryptoError`
+    call site (service.py's per-record catch) must keep working unchanged."""
+    assert issubclass(VaultbeatDekMismatchError, VaultbeatCryptoError)
+    assert issubclass(VaultbeatEnvelopeNotForMeError, VaultbeatCryptoError)
+    assert not issubclass(VaultbeatDekMismatchError, VaultbeatEnvelopeNotForMeError)
+    assert not issubclass(VaultbeatEnvelopeNotForMeError, VaultbeatDekMismatchError)
+
+
+def test_tampered_ciphertext_tag_is_dek_mismatch_not_not_for_me() -> None:
+    """A flipped ciphertext byte fails at the SECOND decrypt stage — this must
+    classify as DekMismatch (proven damage), not NotForMe."""
+    priv, pub = generate_x25519_keypair()
+    ct_b64, envelopes = encrypt_blob_payload(plaintext=b"secret data", recipients=[RecipientKey("owner_user", "u-1", pub)])
+    ct = base64.b64decode(ct_b64)
+    tampered_ct_b64 = base64.b64encode(ct[:-1] + bytes([ct[-1] ^ 0xFF])).decode()
+
+    with pytest.raises(VaultbeatDekMismatchError):
+        decrypt_blob_payload(
+            ciphertext_base64=tampered_ct_b64,
+            encrypted_data_key_base64=envelopes[0].encrypted_data_key_base64,
+            private_key_base64=priv,
+        )
+
+
+def test_tampered_wrapped_dek_tag_is_not_for_me_not_dek_mismatch() -> None:
+    """A flipped wrapped-DEK byte fails at the FIRST decrypt stage (the
+    envelope itself) — this must classify as NotForMe, never repaired."""
+    priv, pub = generate_x25519_keypair()
+    ct_b64, envelopes = encrypt_blob_payload(plaintext=b"secret data", recipients=[RecipientKey("owner_user", "u-1", pub)])
+    env_json = json.loads(base64.b64decode(envelopes[0].encrypted_data_key_base64))
+    wsk = base64.b64decode(env_json["wrappedSymmetricKeyBase64"])
+    env_json["wrappedSymmetricKeyBase64"] = base64.b64encode(wsk[:-1] + bytes([wsk[-1] ^ 0xFF])).decode()
+    tampered_env_b64 = base64.b64encode(json.dumps(env_json).encode()).decode()
+
+    with pytest.raises(VaultbeatEnvelopeNotForMeError):
+        decrypt_blob_payload(
+            ciphertext_base64=ct_b64,
+            encrypted_data_key_base64=tampered_env_b64,
             private_key_base64=priv,
         )

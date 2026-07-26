@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vaultbeat-mcp"
-version = "0.2.2"
+version = "0.2.3"
 description = "Local MCP server for Vaultbeat — AI Health Sync: your AI agent reads your end-to-end-encrypted Apple Health data (sleep, cycle, weight, water), decrypted only on your machine"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,6 +20,13 @@ dev = [
   "pytest>=8.3.0,<9.0.0",
   "ruff>=0.11.0,<1.0.0",
   "mypy>=1.13.0,<2.0.0",
+  # The streamable-HTTP transport tests reach uvicorn through `mcp`'s server
+  # stack. It was never declared: this checkout's venv happened to carry it, so
+  # `pytest` was green here while a clean clone (the public repo, and therefore
+  # anyone running the suite from scratch) failed on ModuleNotFoundError.
+  # Found 2026-07-26 while preparing the 0.2.3 release from the public repo.
+  # httpx needs no entry — it is already a runtime dependency above.
+  "uvicorn>=0.30.0",
 ]
 qr = [
   "qrcode>=8.0.0,<9.0.0",

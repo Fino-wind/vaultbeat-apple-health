@@ -28,10 +28,15 @@ def _annotate_if_empty(result: dict[str, Any], kind: str, rows_key: str) -> dict
         return result
     result.setdefault(
         "hint",
-        f"No {kind} data on this account. This data type requires an iOS build "
-        f"from {since} or later — if the app is current, it simply hasn't been "
-        f"recorded yet (or its Apple Health permission is off). "
-        f"Run `vaultbeat-mcp doctor` or call the vaultbeat_doctor tool for a full report.",
+        f"No {kind} data on this account. Three causes produce an identical empty "
+        f"result and this server cannot tell them apart — it only sees that no rows "
+        f"arrived: (1) the iOS app predates this data type, which needs a build from "
+        f"{since} or later; (2) Apple Health access for it was never granted — a read "
+        f"denial is invisible to the app, so this looks the same as having no data, and "
+        f"the recovery path is the app's Settings → Data & AI → 'Apple Health access' "
+        f"row, which re-presents the permission sheet; (3) it genuinely has not been "
+        f"recorded yet. Run `vaultbeat-mcp doctor` or call the vaultbeat_doctor tool "
+        f"for a full report.",
     )
     return result
 

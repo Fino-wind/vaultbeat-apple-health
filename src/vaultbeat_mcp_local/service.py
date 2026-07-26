@@ -17,6 +17,7 @@ from vaultbeat_mcp_local.client import (
 from vaultbeat_mcp_local.crypto import (
     RecipientKey,
     VaultbeatCryptoError,
+    VaultbeatDekMismatchError,
     decode_json_payload,
     decrypt_blob_payload,
     encrypt_blob_payload,
@@ -120,6 +121,8 @@ class CloudClientProtocol(Protocol):
     async def write_note_blob(
         self, server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]
     ) -> dict[str, Any]: ...
+
+    async def report_decrypt_failures(self, server_token: str, *, items: list[dict[str, str]]) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -1942,10 +1945,27 @@ class VaultbeatLocalService:
             ]
         records = []
         errors: list[str] = []
+        # Blobs whose envelope unwrapped to a valid DEK that then failed to
+        # open the ciphertext — proven damage from THIS server's vantage point,
+        # collected so it can be reported to `report_decrypt_failures` after the
+        # loop. Deliberately NOT every decrypt_failed entry: a plain
+        # VaultbeatCryptoError also covers "not for me" (rotated key, unfinished
+        # rebind), which must never trigger a report — see Invariant 34.
+        undecryptable: list[dict[str, str]] = []
 
         for row in envelope_rows:
             try:
                 records.append(self._decrypt_row(row, config))
+            except VaultbeatDekMismatchError as error:
+                blob = row.get("encrypted_sleep_blobs")
+                if isinstance(blob, list):
+                    blob = blob[0] if blob else None
+                blob_id = str(row.get("blob_id", "")) if isinstance(blob, dict) else ""
+                kind = blob.get("metric_type") if isinstance(blob, dict) else None
+                if blob_id and isinstance(kind, str) and kind in KNOWN_METRIC_TYPES:
+                    undecryptable.append({"blob_id": blob_id, "metric_type": kind})
+                envelope_id = str(row.get("id", "<unknown>"))
+                errors.append(f"{envelope_id}: decrypt_failed ({type(error).__name__})")
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 envelope_id = str(row.get("id", "<unknown>"))
                 # Stage-tagged so a consumer can tell "sealed with a stale key /
@@ -1953,6 +1973,17 @@ class VaultbeatLocalService:
                 # per-metric decoders append (2026-07-23 client feedback: a bare
                 # exception name gave no clue whether the error mattered).
                 errors.append(f"{envelope_id}: decrypt_failed ({type(error).__name__})")
+
+        if undecryptable:
+            # Best-effort: a failed report must never surface as a read
+            # failure. Nothing is lost by swallowing it here — the same blob
+            # gets another chance to be reported on the next call that reaches
+            # it (the cloud side upserts on blob_id, so repeat reports just
+            # refresh reported_at).
+            try:
+                await self._client(config).report_decrypt_failures(server_token, items=undecryptable)
+            except Exception:
+                pass
 
         if metric_type is not None:
             # Defensive filter: also correct against pre-metric_type edge deploys.
@@ -3522,8 +3553,12 @@ class VaultbeatLocalService:
             "possibly_needs_newer_app": gated,
             "note": (
                 "Empty kinds listed under possibly_needs_newer_app require an iOS "
-                "build from the stated date or later. If your app is current, the "
-                "kind is simply unrecorded (or its HealthKit permission is off)."
+                "build from the stated date or later. If the app is already newer "
+                "than that, the two remaining causes are that Apple Health access "
+                "for the kind was never granted — a read denial is invisible to the "
+                "app, so it looks identical to having no data; recover via the app's "
+                "Settings → Data & AI → 'Apple Health access' row — or that it "
+                "genuinely has not been recorded yet."
             )
             if gated
             else "Every kind this server knows about has data.",

@@ -20,6 +20,32 @@ class VaultbeatCryptoError(ValueError):
     pass
 
 
+class VaultbeatDekMismatchError(VaultbeatCryptoError):
+    """The envelope unwrapped to a valid 32-byte DEK, but that DEK does not
+    open the blob's ciphertext.
+
+    Distinct from every other ``VaultbeatCryptoError`` raised by
+    ``decrypt_blob_payload``, all of which mean "this envelope was never
+    addressed to me" (wrong/rotated key, malformed field, someone else's
+    row) — states this reader must never act on. This one means the
+    opposite: the recipient match succeeded and the data itself is broken.
+    Nothing legitimate produces it — see AGENTS.md Invariant 32/33/34, and
+    the iOS counterpart ``E2EEIntegrityVerdict.dekMismatch`` in
+    ``E2EEProvider.swift``, which this mirrors so both platforms draw the
+    safety line in the same place.
+    """
+
+
+class VaultbeatEnvelopeNotForMeError(VaultbeatCryptoError):
+    """The envelope itself would not unwrap under this private key.
+
+    This is what a rotated identity key, an unfinished rebind, or an
+    envelope genuinely addressed to a different recipient looks like —
+    never evidence of data damage. Mirrors iOS's
+    ``E2EEIntegrityVerdict.notForMe``.
+    """
+
+
 @dataclass(frozen=True)
 class RecipientKey:
     """A recipient an envelope is sealed for, with its raw Curve25519 public key (base64)."""
@@ -143,16 +169,32 @@ def decrypt_blob_payload(
     # …)` in service.py and one bad envelope would abort the ENTIRE sync across
     # all metric types instead of landing in that record's errors[] entry.
     # Normalize it at this boundary like every other crypto-layer failure.
+    #
+    # TWO separate try/excepts, not one — this is the whole safety line. The two
+    # decrypt calls answer different questions and must never be conflated:
+    #   1. unwrap:  is this envelope addressed to ME?      → NotForMe on failure
+    #   2. open:    does its DEK match the CIPHERTEXT?     → DekMismatch on failure
+    # Collapsing them ("decrypt failed, so it's broken") is exactly what would
+    # make a routine key rotation look identical to real data corruption. Mirrors
+    # `E2EEProvider.integrityVerdict`'s two-stage `unseal` on iOS byte-for-byte.
+    wrapped_dek_combined = _b64decode(wrapped_symmetric_key_base64, "wrappedSymmetricKeyBase64")
+    wrapped_nonce, wrapped_ciphertext = _split_apple_aes_gcm_combined(wrapped_dek_combined)
     try:
-        wrapped_dek_combined = _b64decode(wrapped_symmetric_key_base64, "wrappedSymmetricKeyBase64")
-        wrapped_nonce, wrapped_ciphertext = _split_apple_aes_gcm_combined(wrapped_dek_combined)
         dek = AESGCM(wrapping_key).decrypt(wrapped_nonce, wrapped_ciphertext, None)
+    except InvalidTag as error:
+        raise VaultbeatEnvelopeNotForMeError(
+            "envelope did not unwrap under this identity key (rotated key, unfinished rebind, "
+            "or addressed to a different recipient) — not evidence of data damage"
+        ) from error
 
-        ciphertext_combined = _b64decode(ciphertext_base64, "ciphertext")
-        ciphertext_nonce, ciphertext = _split_apple_aes_gcm_combined(ciphertext_combined)
+    ciphertext_combined = _b64decode(ciphertext_base64, "ciphertext")
+    ciphertext_nonce, ciphertext = _split_apple_aes_gcm_combined(ciphertext_combined)
+    try:
         return AESGCM(dek).decrypt(ciphertext_nonce, ciphertext, None)
     except InvalidTag as error:
-        raise VaultbeatCryptoError("AES-GCM authentication failed (tampered or mis-keyed envelope)") from error
+        raise VaultbeatDekMismatchError(
+            "envelope unwrapped to a valid DEK that does not open the ciphertext — proven data damage"
+        ) from error
 
 
 def encrypt_blob_payload(

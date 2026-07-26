@@ -192,6 +192,43 @@ class VaultbeatCloudClient:
             )
         return self._decode_response(response)
 
+    async def report_decrypt_failures(
+        self,
+        server_token: str,
+        *,
+        items: list[dict[str, str]],
+    ) -> None:
+        """Tells the cloud "these blob ids are undecryptable from MY (this MCP
+        server's) key" — the half of the blob-integrity GC that only this
+        server can supply.
+
+        Why this exists: iOS's `VaultbeatBlobIntegrityRepairCoordinator` can
+        only verify the OWNER's own envelope (it has no other private key). A
+        blob whose owner envelope is healthy but whose mcp_server envelope is
+        stale — exactly what Invariant 33's duplicate-blobID bug left behind —
+        is invisible to that check and never gets repaired. This call is the
+        other eye: whenever THIS server's own decrypt fails with a proven
+        DEK-mismatch (never on a mere "not for me"), it reports the blob id so
+        iOS can forget its upload fingerprint and re-upload it, regardless of
+        what the owner-side check concluded. See AGENTS.md Invariant 34.
+
+        Best-effort by design (see the caller in service.py): a report that
+        never arrives just means this blob waits for the next call that
+        reaches it, not a broken read.
+        """
+
+        if not items:
+            return
+
+        import httpx
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            await client.post(
+                f"{self.api_base_url}/mcp-report-decrypt-failures",
+                headers={"Authorization": f"Bearer {server_token}"},
+                json={"items": items},
+            )
+
     @staticmethod
     def _decode_response(response: "httpx.Response") -> dict[str, Any]:
         try:
