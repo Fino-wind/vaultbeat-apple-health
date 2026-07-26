@@ -16,6 +16,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from vaultbeat_mcp_local.client import PollBindingResult, VaultbeatUnsupportedMetricError
 from vaultbeat_mcp_local.crypto import ENVELOPE_INFO
 from vaultbeat_mcp_local.crypto import VaultbeatCryptoError
+from vaultbeat_mcp_local.crypto import generate_x25519_keypair
 from vaultbeat_mcp_local.service import (
     BodyDay,
     _local_calendar_day,
@@ -58,6 +59,11 @@ class FakeCloudClient:
         # edge older than this client. Requesting one raises the same error the
         # real edge's 400 invalid_metric_type produces.
         self.unsupported_metric_types: set[str] = set()
+        # Every report_decrypt_failures call, in order — {items, server_token}.
+        self.report_calls: list[dict[str, Any]] = []
+        # When set, report_decrypt_failures raises this instead of recording —
+        # used to prove a reporting failure never breaks the read itself.
+        self.report_raises: Exception | None = None
 
     async def poll_binding(self, poll_id: str) -> PollBindingResult:
         self.poll_id = poll_id
@@ -110,6 +116,11 @@ class FakeCloudClient:
     ) -> dict[str, Any]:
         return await self._record_write(server_token, blob=blob, envelopes=envelopes)
 
+    async def report_decrypt_failures(self, server_token: str, *, items: list[dict[str, str]]) -> None:
+        if self.report_raises is not None:
+            raise self.report_raises
+        self.report_calls.append({"server_token": server_token, "items": items})
+
     async def _record_write(
         self, server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]
     ) -> dict[str, Any]:
@@ -151,6 +162,7 @@ def _make_envelope(
     envelope_id: str = "env-1",
     blob_id: str = "blob-1",
     owner_user_id: str | None = None,
+    dek: bytes = b"\x07" * 32,
 ) -> dict[str, Any]:
     recipient_public = x25519.X25519PublicKey.from_public_bytes(base64.b64decode(public_key_base64))
     sender_private = x25519.X25519PrivateKey.generate()
@@ -161,7 +173,6 @@ def _make_envelope(
         salt=b"",
         info=ENVELOPE_INFO,
     ).derive(shared_secret)
-    dek = b"\x07" * 32
     wrapped_nonce = b"\x03" * 12
     wrapped_dek = wrapped_nonce + AESGCM(wrapping_key).encrypt(wrapped_nonce, dek, None)
     sender_public_raw = sender_private.public_key().public_bytes(
@@ -229,6 +240,106 @@ def test_sync_decrypts_cloud_envelopes(tmp_path: Path) -> None:
     assert cloud.synced_with_token == "token-1"
     assert records[0].payload == {"stage": "asleep"}
     assert records[0].blob_id == "blob-1"
+
+
+# ---------------------------------------------------------------------------
+# The MCP-side half of the blob-integrity GC (AGENTS.md Invariant 34):
+# a proven DEK mismatch is reported to the cloud; a merely-unreadable ("not
+# for me") envelope never is.
+# ---------------------------------------------------------------------------
+
+
+def test_sync_reports_dek_mismatch_but_not_a_healthy_record(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    cloud = FakeCloudClient()
+    service = VaultbeatLocalService(ConfigStore(config_path), cloud)
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+    config = ConfigStore(config_path).require_bound()
+
+    healthy = _make_envelope(
+        config.public_key_base64, b'{"bpm":64}', metric_type="resting_hr", envelope_id="env-ok", blob_id="resting_hr-1"
+    )
+    # Same construction as the production bug: an envelope that unwraps to a
+    # VALID dek (\x09*32), spliced onto ciphertext sealed under a DIFFERENT dek
+    # (\x07*32, the default). Proven damage, not a permissions problem.
+    wrong_dek_row = _make_envelope(
+        config.public_key_base64, b'{"bpm":99}', metric_type="resting_hr", envelope_id="env-bad", blob_id="resting_hr-2"
+    )
+    mismatched_envelope = _make_envelope(
+        config.public_key_base64, b"unused", metric_type="resting_hr", envelope_id="env-mismatch", dek=b"\x09" * 32
+    )
+    wrong_dek_row["encrypted_data_key"] = mismatched_envelope["encrypted_data_key"]
+    cloud.envelopes = [healthy, wrong_dek_row]
+
+    records, errors = asyncio.run(service.sync_decrypted_records(limit=10, fresh=True))
+
+    assert len(records) == 1, "the healthy record must still decrypt and land in results"
+    assert records[0].blob_id == "resting_hr-1"
+    assert len(errors) == 1
+    assert "decrypt_failed" in errors[0]
+
+    assert len(cloud.report_calls) == 1, "exactly one report call, for the mismatched blob only"
+    reported_items = cloud.report_calls[0]["items"]
+    assert reported_items == [{"blob_id": "resting_hr-2", "metric_type": "resting_hr"}]
+    assert cloud.report_calls[0]["server_token"] == "token-1"
+
+
+def test_sync_never_reports_an_envelope_sealed_for_a_different_recipient(tmp_path: Path) -> None:
+    """Sealing for a DIFFERENT public key reproduces a rotated-key / not-for-me
+    envelope. This must NEVER be reported — Invariant 34's whole point is that
+    only PROVEN damage triggers a repair signal."""
+    config_path = tmp_path / "config.json"
+    cloud = FakeCloudClient()
+    service = VaultbeatLocalService(ConfigStore(config_path), cloud)
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+
+    stranger_private, stranger_public = generate_x25519_keypair()
+    cloud.envelopes = [_make_envelope(stranger_public, b'{"bpm":64}', metric_type="resting_hr", blob_id="resting_hr-3")]
+
+    records, errors = asyncio.run(service.sync_decrypted_records(limit=10, fresh=True))
+
+    assert records == []
+    assert len(errors) == 1
+    assert cloud.report_calls == [], "not-for-me is not damage — never report it"
+
+
+def test_sync_survives_a_reporting_failure(tmp_path: Path) -> None:
+    """The report call is best-effort: if the network/edge fails, the READ must
+    still return its (correctly classified) results and errors unchanged."""
+    config_path = tmp_path / "config.json"
+    cloud = FakeCloudClient()
+    service = VaultbeatLocalService(ConfigStore(config_path), cloud)
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+    config = ConfigStore(config_path).require_bound()
+
+    wrong_dek_row = _make_envelope(config.public_key_base64, b'{"bpm":99}', metric_type="resting_hr", blob_id="resting_hr-4")
+    mismatched_envelope = _make_envelope(config.public_key_base64, b"unused", metric_type="resting_hr", dek=b"\x09" * 32)
+    wrong_dek_row["encrypted_data_key"] = mismatched_envelope["encrypted_data_key"]
+    cloud.envelopes = [wrong_dek_row]
+    cloud.report_raises = RuntimeError("edge unreachable")
+
+    records, errors = asyncio.run(service.sync_decrypted_records(limit=10, fresh=True))
+
+    assert records == []
+    assert len(errors) == 1
+    assert "decrypt_failed" in errors[0]
+
+
+def test_sync_reports_nothing_when_everything_is_healthy(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    cloud = FakeCloudClient()
+    service = VaultbeatLocalService(ConfigStore(config_path), cloud)
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+    config = ConfigStore(config_path).require_bound()
+    cloud.envelopes = [_make_envelope(config.public_key_base64, b'{"stage":"asleep"}')]
+
+    asyncio.run(service.sync_decrypted_records(limit=10, fresh=True))
+
+    assert cloud.report_calls == [], "the steady state must cost zero report calls"
 
 
 def _water_payload(day_id: str, day_start: str, container: float, refill_count: int) -> bytes:
@@ -2046,8 +2157,20 @@ def test_doctor_reports_capability_gap_for_an_older_app(tmp_path: Path) -> None:
     assert set(gated) == {"strength", "food", "vo2max", "basal_energy", "hrv_hourly"}
     assert gated["basal_energy"] == "2026-07-21"
     # It must not claim to know the app version — only that a newer one is needed.
-    assert "possibly" in "possibly_needs_newer_app"
-    assert "unrecorded" in caps["note"]
+    # (The previous form of this line asserted `"possibly" in "possibly_needs_newer_app"`,
+    # a substring check against a literal — always true, testing nothing.)
+    assert "possibly_needs_newer_app" in caps
+
+    # The note must not present "your app is old" as THE explanation: an empty
+    # kind has three indistinguishable causes from the server's side, and the
+    # permission one is the least obvious because a HealthKit read denial is
+    # invisible to the app — it reports success and simply delivers nothing.
+    # Naming the recovery path matters: the paying customer who prompted this
+    # had 7 kinds empty from authorization, not app age.
+    note = caps["note"]
+    assert "build from the stated date or later" in note
+    assert "Apple Health access" in note
+    assert "not been recorded yet" in note
 
 
 def test_doctor_capability_report_is_quiet_when_everything_has_data(tmp_path: Path) -> None:
