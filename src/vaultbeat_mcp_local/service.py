@@ -4014,6 +4014,18 @@ class VaultbeatLocalService:
                     "still exists in the iOS app (Settings → Data & AI), or bind again.",
                 )
 
+        installed, latest, version_note = self._client_version_status()
+        add(
+            "client_version",
+            latest is None or not self._version_is_older(installed, latest),
+            version_note,
+            hint=(
+                f"Run `uvx --refresh vaultbeat-mcp` (or `pip install -U vaultbeat-mcp`) "
+                f"to move from {installed} to {latest}. Older clients re-download the "
+                f"entire history on every read instead of only what changed."
+            ),
+        )
+
         report: dict[str, Any] = {
             "ok": all(check["ok"] for check in checks),
             "checks": checks,
@@ -4021,6 +4033,80 @@ class VaultbeatLocalService:
         if config.is_bound:
             report["capabilities"] = await self._capability_report()
         return report
+
+    # ── Client version freshness ─────────────────────────────────────────────
+    #
+    # 🔒 The upgrade prompt is generated HERE, from a version-number comparison.
+    # PyPI supplies one string that must parse as digits; every word the user or
+    # their agent reads is hardcoded above.
+    #
+    # This is deliberate and the alternative was rejected on 2026-07-29. The
+    # obvious design — have the SERVER return a `notice` string that the client
+    # passes through — would have handed whoever controls the backend a channel
+    # that writes arbitrary text straight into the user's agent context. MCP tool
+    # results and real user turns arrive under the same `user` role; a model
+    # cannot tell them apart. And this server exposes WRITE tools
+    # (log_food_entry / log_strength_entry / log_weight_entry / log_note), while
+    # the agent reading them usually has other MCPs attached (filesystem, shell,
+    # browser) — so the blast radius is the user's whole toolset, not this app.
+    # It also directly contradicts the product's one promise: a service that
+    # "cannot read your data" must not be able to put words in your AI's mouth.
+    #
+    # If a server-driven notice is ever genuinely needed, send an ENUM, never
+    # prose: `{"client_outdated": true, "min_version": "0.2.5"}` — the worst a
+    # compromised backend can then do is show a false upgrade prompt.
+    _PYPI_URL = "https://pypi.org/pypi/vaultbeat-mcp/json"
+
+    @staticmethod
+    def _version_tuple(value: str) -> tuple[int, ...]:
+        import re
+
+        return tuple(int(p) for p in re.findall(r"\d+", value)[:3])
+
+    @classmethod
+    def _version_is_older(cls, installed: str, latest: str) -> bool:
+        try:
+            return cls._version_tuple(installed) < cls._version_tuple(latest)
+        except (TypeError, ValueError):
+            return False
+
+    def _client_version_status(self) -> tuple[str, str | None, str]:
+        """(installed, latest_or_None, human_readable_detail).
+
+        Unreachable PyPI is NOT a failure — an offline machine still has a
+        perfectly working install, and a diagnostic that cries wolf about the
+        network teaches people to ignore it.
+        """
+
+        import json as _json
+        import os
+        import urllib.error
+        import urllib.request
+
+        from vaultbeat_mcp_local import __version__ as installed
+
+        # Injection point. Tests must not depend on the network — a unit suite
+        # that reaches PyPI is slow, flaky offline, and its result changes when
+        # someone publishes a release. Empty string = "PyPI unreachable", which
+        # is the branch that must stay non-failing. Also lets every branch be
+        # exercised once, including the one that reports being behind.
+        override = os.getenv("VAULTBEAT_MCP_FAKE_LATEST")
+        if override is not None:
+            if not override:
+                return installed, None, f"{installed} installed (could not reach PyPI to compare)"
+            if self._version_is_older(installed, override):
+                return installed, override, f"{installed} installed, {override} available"
+            return installed, override, f"{installed} installed (latest)"
+
+        try:
+            with urllib.request.urlopen(self._PYPI_URL, timeout=5) as response:
+                latest = str(_json.load(response)["info"]["version"])
+        except (urllib.error.URLError, TimeoutError, KeyError, ValueError, OSError):
+            return installed, None, f"{installed} installed (could not reach PyPI to compare)"
+
+        if self._version_is_older(installed, latest):
+            return installed, latest, f"{installed} installed, {latest} available"
+        return installed, latest, f"{installed} installed (latest)"
 
     # Metric kinds that only exist from a given iOS release onward. A tool whose
     # backing kind predates the user's app returns nothing — with no error, which
