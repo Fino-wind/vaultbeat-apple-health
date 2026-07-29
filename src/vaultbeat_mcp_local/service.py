@@ -6,12 +6,14 @@ import logging
 import secrets
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Protocol
+from collections.abc import Callable
+from typing import Any, Protocol, TypeVar
 
 from vaultbeat_mcp_local.cache import LocalRecordCache
 from vaultbeat_mcp_local.client import (
     PollBindingResult,
     VaultbeatCloudClient,
+    VaultbeatCloudError,
     VaultbeatUnsupportedMetricError,
 )
 from vaultbeat_mcp_local.crypto import (
@@ -26,6 +28,8 @@ from vaultbeat_mcp_local.store import ConfigStore, LocalServerConfig, now_iso
 
 
 _LOG = logging.getLogger("vaultbeat_mcp_local.service")
+
+_T = TypeVar("_T")
 
 # Health kinds carried in encrypted_sleep_blobs.metric_type. Decryption is identical
 # for every kind (Curve25519 ECDH + HKDF-SHA256 + AES-GCM); only the post-decrypt JSON
@@ -114,6 +118,21 @@ class CloudClientProtocol(Protocol):
 
     async def sync(
         self, server_token: str, *, metric_type: str | None = None
+    ) -> list[dict[str, Any]]: ...
+
+    # Catalog mode (2026-07-29). Test doubles that predate it can omit these —
+    # the service only calls them when a stored digest exists, and every failure
+    # path degrades to `sync`.
+    async def sync_digest(
+        self, server_token: str, *, metric_type: str | None = None
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None]: ...
+
+    async def sync_catalog(
+        self, server_token: str, *, metric_type: str | None = None
+    ) -> list[dict[str, Any]] | None: ...
+
+    async def sync_blobs(
+        self, server_token: str, *, blob_ids: list[str], metric_type: str | None = None
     ) -> list[dict[str, Any]]: ...
 
     async def write_strength_blob(
@@ -1226,6 +1245,34 @@ _ERRORS_NOTE = (
 )
 
 
+def _cut_newest_by(
+    items: list[_T], limit: int | None, *, key: Callable[[_T], str | None]
+) -> list[_T]:
+    """Keep the newest `limit` items by their OWN business date (Invariant 38).
+
+    Exists so the rule has ONE implementation instead of four copies. Invariant 38
+    has now regressed three times — 2026-07-24 (8 readers), 2026-07-27 (4 more that
+    the previous fix's own "unaffected" list wrongly cleared), and 2026-07-29
+    (symptom / note / strength / food, the four kinds the owner hand-logs daily).
+    Every time, the fix was recorded as "I fixed these N tools" rather than as a
+    reusable rule, so the next reader written or reviewed reintroduced it.
+
+    Why cutting earlier is wrong: `created_at` is an upload-batch stamp shared by
+    up to 50 blobs, and a history backfill uploads years of data in minutes, so it
+    carries no information about when anything actually happened. Slicing on it
+    returns "N arbitrary rows from whichever batch landed last" — and can drop the
+    newest record entirely, which is the failure the owner would actually hit:
+    log today's session, then ask what you trained recently, and not see it.
+
+    A None/empty key sorts last rather than raising — a malformed date should cost
+    that one record its position, not fail the whole read.
+    """
+
+    if limit is None:
+        return items
+    return sorted(items, key=lambda i: key(i) or "", reverse=True)[:limit]
+
+
 def _attach_errors(summary: dict[str, Any], errors: list[str]) -> dict[str, Any]:
     """Standard error reporting: the raw list plus, when non-empty, a note that
     explains what an error means so callers stop treating two stale-key blobs
@@ -2024,8 +2071,107 @@ class VaultbeatLocalService:
                     records = records[:limit]
                 return records, cached_errors
 
+        # ── Catalog path: ask what changed before asking for anything ────────
+        #
+        # A full fetch of one kind measured 12,108,143 bytes on 2026-07-29; the
+        # digest that decides whether it is needed measured 119. Three users had
+        # spent 21.877 GB of a 5 GB monthly allowance re-downloading history that
+        # had not changed, and the same queries put the instance into Unhealthy
+        # for 2.5 hours that day.
+        #
+        # `fresh=True` still comes through here on purpose: it means "do not
+        # trust age", not "re-download everything". The digest re-verifies
+        # against the server, which is strictly stronger than a TTL, so honouring
+        # --fresh no longer has to cost 12 MB.
+        #
+        # Every branch degrades to the full fetch, never to an error: an older
+        # edge deployment (no catalog mode), a cache with no stored digest, an
+        # unparseable catalog — all fall through with `envelope_rows = None`.
+        client = self._client(config)
+        envelope_rows: list[dict[str, Any]] | None = None
+        reusable_records: list[dict[str, Any]] = []
+        reusable_errors: list[str] = []
+        server_digest: dict[str, Any] | None = None
+        catalog_xmins: dict[str, str] = {}
+
+        # Capability probe, not defensive clutter: CloudClientProtocol declares
+        # the catalog trio optional, so a client object that predates it (an
+        # injected double, a pinned older transport) must degrade to the full
+        # fetch rather than raise AttributeError mid-read.
+        supports_catalog = all(
+            callable(getattr(client, name, None))
+            for name in ("sync_digest", "sync_catalog", "sync_blobs")
+        )
+
+        persisted = self.cache.load_persisted(server_id=server_id, metric_type=metric_type)
+        if supports_catalog and persisted is not None:
+            prev_records, prev_errors, prev_digest, prev_xmins = persisted
+            try:
+                server_digest, legacy_envelopes = await client.sync_digest(
+                    server_token, metric_type=metric_type
+                )
+            except VaultbeatUnsupportedMetricError:
+                raise
+            except VaultbeatCloudError:
+                # Digest is an optimization; a failure here must not fail the
+                # read. Fall through to the full fetch.
+                server_digest, legacy_envelopes = None, None
+
+            if legacy_envelopes is not None:
+                # Old edge ignored `fields` and sent everything. Do not pay for
+                # it twice — that response IS the data.
+                envelope_rows = legacy_envelopes
+            elif server_digest is not None and prev_digest is not None:
+                if server_digest == prev_digest:
+                    # Nothing changed. Zero further bytes.
+                    records = [DecryptedRecord.from_dict(row) for row in prev_records]
+                    self.cache.save(
+                        prev_records,
+                        server_id=server_id,
+                        metric_type=metric_type,
+                        errors=prev_errors,
+                        digest=prev_digest,
+                        blob_xmins=prev_xmins,
+                    )
+                    self.store.update(last_sync_at=now_iso())
+                    if limit is not None:
+                        records = records[:limit]
+                    return records, prev_errors
+
+                catalog = await client.sync_catalog(server_token, metric_type=metric_type)
+                if catalog is not None:
+                    catalog_xmins = {
+                        str(row.get("blob_id", "")): str(row.get("xmin", ""))
+                        for row in catalog
+                        if row.get("blob_id")
+                    }
+                    # Rows whose version differs, or that we have never seen.
+                    # A row missing from the catalog was deleted server-side and
+                    # is simply not carried forward — that is the delete path.
+                    needed = [
+                        blob_id
+                        for blob_id, xmin in catalog_xmins.items()
+                        if prev_xmins.get(blob_id) != xmin
+                    ]
+                    keep = {
+                        blob_id
+                        for blob_id, xmin in catalog_xmins.items()
+                        if prev_xmins.get(blob_id) == xmin
+                    }
+                    reusable_records = [
+                        row for row in prev_records if str(row.get("blob_id", "")) in keep
+                    ]
+                    # Errors belong to rows we are re-fetching, so they are
+                    # recomputed below rather than carried over — keeping them
+                    # would report a failure that may have just been repaired.
+                    reusable_errors = []
+                    envelope_rows = await client.sync_blobs(
+                        server_token, blob_ids=needed, metric_type=metric_type
+                    )
+
         try:
-            envelope_rows = await self._client(config).sync(server_token, metric_type=metric_type)
+            if envelope_rows is None:
+                envelope_rows = await client.sync(server_token, metric_type=metric_type)
         except VaultbeatUnsupportedMetricError as error:
             # Version skew: this MCP server knows a kind the deployed edge
             # function does not. Degrade to "this one kind is unavailable"
@@ -2084,16 +2230,81 @@ class VaultbeatLocalService:
             # Defensive filter: also correct against pre-metric_type edge deploys.
             records = [r for r in records if (r.metric_type or METRIC_SLEEP) == metric_type]
 
+        # Fold the rows we already held (verified unchanged by xmin) back in with
+        # the ones just fetched. Keyed by blob_id, freshly-fetched wins, then
+        # sorted so the stored order is deterministic regardless of which path
+        # produced it — every downstream reader re-sorts by business date anyway
+        # (Invariant 38), but a stable order keeps cache files diffable.
+        record_dicts = [record.to_dict() for record in records]
+        if reusable_records:
+            by_blob: dict[str, dict[str, Any]] = {}
+            for row in reusable_records:
+                by_blob[str(row.get("blob_id", ""))] = row
+            for row in record_dicts:
+                by_blob[str(row.get("blob_id", ""))] = row
+            record_dicts = sorted(by_blob.values(), key=lambda r: str(r.get("blob_id", "")))
+            records = [DecryptedRecord.from_dict(row) for row in record_dicts]
+            errors = reusable_errors + errors
+
+        # Came through the full-fetch path, so there is no catalog yet. Pull one
+        # (43 KB measured, once) and derive the digest FROM IT rather than asking
+        # the server separately: same response, so the stored digest and the
+        # stored per-row versions cannot disagree with each other. Without this
+        # the next read would have a digest to compare but no per-row versions to
+        # diff against, and would re-download everything to learn what changed.
+        if supports_catalog and not catalog_xmins:
+            try:
+                catalog = await client.sync_catalog(server_token, metric_type=metric_type)
+            except VaultbeatCloudError:
+                catalog = None
+            if catalog is not None:
+                catalog_xmins = {
+                    str(row.get("blob_id", "")): str(row.get("xmin", ""))
+                    for row in catalog
+                    if row.get("blob_id")
+                }
+                server_digest = self._digest_from_catalog(catalog_xmins)
+
         self.cache.save(
-            [record.to_dict() for record in records],
+            record_dicts,
             server_id=server_id,
             metric_type=metric_type,
             errors=errors,
+            digest=server_digest,
+            blob_xmins=catalog_xmins,
         )
         self.store.update(last_sync_at=now_iso())
         if limit is not None:
             records = records[:limit]
         return records, errors
+
+    @staticmethod
+    def _digest_from_catalog(blob_xmins: dict[str, str]) -> dict[str, Any] | None:
+        """Recompute mcp-sync's digest locally from a catalog response.
+
+        MUST stay identical to the server's arithmetic in
+        `supabase/functions/mcp-sync/index.ts` — count, max, sum over the same
+        rows. A mismatch would make every subsequent digest comparison fail and
+        silently degrade the client to full fetches (costly, never incorrect).
+        Returns None if any xmin is unparseable, which keeps a bad catalog from
+        poisoning the stored digest.
+        """
+
+        total = 0
+        largest = 0
+        for raw in blob_xmins.values():
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                return None
+            total += value
+            if value > largest:
+                largest = value
+        return {
+            "count": len(blob_xmins),
+            "max_xmin": str(largest),
+            "sum_xmin": str(total),
+        }
 
     async def _records_for_metric(
         self, metric_type: str, *, limit: int | None, fresh: bool = False
@@ -2997,7 +3208,8 @@ class VaultbeatLocalService:
         partner-AI ladder). Sensitive — decoded locally, never re-exported.
         """
 
-        records, errors = await self._records_for_metric(METRIC_SYMPTOM, limit=limit, fresh=fresh)
+        # Invariant 38 — see the identical note in strength_summary.
+        records, errors = await self._records_for_metric(METRIC_SYMPTOM, limit=None, fresh=fresh)
         if not records:
             _LOG.info("no symptom envelopes present (likely not opted in on iOS)")
         else:
@@ -3008,6 +3220,7 @@ class VaultbeatLocalService:
                 days.append(parse_symptom_day(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        days = _cut_newest_by(days, limit, key=lambda d: d.day_start_date)
         summary = summarize_symptoms(days)
         return _attach_errors(summary, errors)
 
@@ -3022,7 +3235,10 @@ class VaultbeatLocalService:
         locally, never re-exported.
         """
 
-        records, errors = await self._records_for_metric(METRIC_NOTE, limit=limit, fresh=fresh)
+        # Invariant 38 — see the identical note in strength_summary. Notes cut on
+        # target_date (the day the note is ABOUT), matching how summarize_notes
+        # orders them; created_at would reorder a backdated note to the front.
+        records, errors = await self._records_for_metric(METRIC_NOTE, limit=None, fresh=fresh)
         if not records:
             _LOG.info("no note envelopes present (nothing written or not shared)")
         else:
@@ -3033,6 +3249,7 @@ class VaultbeatLocalService:
                 notes.append(parse_note(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        notes = _cut_newest_by(notes, limit, key=lambda n: n.target_date)
         summary = summarize_notes(notes, target_kind=target_kind)
         return _attach_errors(summary, errors)
 
@@ -3045,7 +3262,11 @@ class VaultbeatLocalService:
         data). Owner's own sessions only — strength has no partner fan-out.
         """
 
-        records, errors = await self._records_for_metric(METRIC_STRENGTH, limit=limit, fresh=fresh)
+        # Invariant 38: fetch EVERYTHING, then cut on the payload's own date.
+        # Passing `limit` down would cut on created_at (an upload-batch stamp), and
+        # a history backfill uploads years of data in minutes — so upload order and
+        # business order are unrelated and the newest session can be dropped outright.
+        records, errors = await self._records_for_metric(METRIC_STRENGTH, limit=None, fresh=fresh)
         if not records:
             _LOG.info("no strength envelopes present (nothing logged yet)")
         entries: list[StrengthRecord] = []
@@ -3054,6 +3275,7 @@ class VaultbeatLocalService:
                 entries.append(parse_strength(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        entries = _cut_newest_by(entries, limit, key=lambda e: e.date)
         summary = summarize_strength(entries, limit_days=limit_days)
         return _attach_errors(summary, errors)
 
@@ -3236,7 +3458,8 @@ class VaultbeatLocalService:
         was"). Owner's own days only — food has no partner fan-out in v1.
         """
 
-        records, errors = await self._records_for_metric(METRIC_FOOD, limit=limit, fresh=fresh)
+        # Invariant 38 — see the identical note in strength_summary.
+        records, errors = await self._records_for_metric(METRIC_FOOD, limit=None, fresh=fresh)
         if not records:
             _LOG.info("no food envelopes present (nothing logged yet)")
         entries: list[FoodRecord] = []
@@ -3245,6 +3468,7 @@ class VaultbeatLocalService:
                 entries.append(parse_food(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        entries = _cut_newest_by(entries, limit, key=lambda e: e.date)
         summary = summarize_food(entries, limit_days=limit_days)
         return _attach_errors(summary, errors)
 

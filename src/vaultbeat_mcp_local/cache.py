@@ -101,6 +101,61 @@ class LocalRecordCache:
             [str(item) for item in errors],
         )
 
+    def load_persisted(
+        self, *, server_id: str, metric_type: str | None
+    ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any] | None, dict[str, str]] | None:
+        """Same file as `load`, but WITHOUT the TTL check.
+
+        The two exist because they answer different questions:
+
+        * `load`  — "may I skip the network entirely?" (TTL says the data is
+                    recent enough that a round trip is not worth it)
+        * `load_persisted` — "what do I already hold?" Freshness here is decided
+                    by comparing the server's digest against the stored one, so
+                    age is irrelevant: a year-old cache whose digest still
+                    matches is exactly as correct as a one-second-old one.
+
+        Returns `(records, errors, digest, blob_xmins)`. A file written before
+        this feature has no digest and reads as `(records, errors, None, {})` —
+        the caller treats a missing digest as "cannot verify", which costs one
+        full fetch and then self-heals.
+
+        Disabled (TTL=0) reads as a miss like everything else: that setting means
+        "keep nothing on disk", so there is by definition nothing to reuse.
+        """
+
+        if not self.enabled:
+            return None
+        path = self._path(metric_type)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError) as error:
+            _LOG.warning("Discarding unreadable cache %s: %s", path.name, type(error).__name__)
+            return None
+        if not isinstance(raw, dict) or raw.get("server_id") != server_id:
+            return None
+        records = raw.get("records")
+        if not isinstance(records, list):
+            return None
+        errors = raw.get("errors")
+        if not isinstance(errors, list):
+            errors = []
+        digest = raw.get("digest")
+        if not isinstance(digest, dict):
+            digest = None
+        xmins_raw = raw.get("blob_xmins")
+        blob_xmins: dict[str, str] = {}
+        if isinstance(xmins_raw, dict):
+            blob_xmins = {str(k): str(v) for k, v in xmins_raw.items()}
+        return (
+            [row for row in records if isinstance(row, dict)],
+            [str(item) for item in errors],
+            digest,
+            blob_xmins,
+        )
+
     def save(
         self,
         records: list[dict[str, Any]],
@@ -108,6 +163,8 @@ class LocalRecordCache:
         server_id: str,
         metric_type: str | None,
         errors: list[str] | None = None,
+        digest: dict[str, Any] | None = None,
+        blob_xmins: dict[str, str] | None = None,
     ) -> None:
         """Persist a FULL (never limit-truncated) result set; best-effort.
 
@@ -117,6 +174,12 @@ class LocalRecordCache:
         with cache warmth.
         """
 
+        # Still gated on `self.enabled`, deliberately. The catalog/digest path
+        # would work better with rows kept on disk even at TTL=0, and that was
+        # briefly implemented — but TTL=0 is how a user says "do not write my
+        # decrypted health data to disk", and that is a PRIVACY choice, not a
+        # bandwidth-tuning knob. Honour it; such a user pays for full fetches,
+        # which is the trade they asked for.
         if not self.enabled:
             return
         payload = {
@@ -125,6 +188,8 @@ class LocalRecordCache:
             "fetched_at": time.time(),
             "records": records,
             "errors": errors or [],
+            "digest": digest,
+            "blob_xmins": blob_xmins or {},
         }
         try:
             write_secret_file(
