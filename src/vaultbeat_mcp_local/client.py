@@ -134,6 +134,107 @@ class VaultbeatCloudClient:
             raise VaultbeatCloudError("Cloud response has invalid envelopes shape")
         return [row for row in envelopes if isinstance(row, dict)]
 
+    async def sync_digest(
+        self, server_token: str, *, metric_type: str | None = None
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None]:
+        """Ask what the server holds, in ~119 bytes.
+
+        Returns ``(digest, legacy_envelopes)``:
+
+        * ``(digest, None)`` — a catalog-aware deployment answered.
+        * ``(None, envelopes)`` — an OLDER deployment ignored ``fields`` and sent
+          the full payload instead. That response is not wasted: it IS the data,
+          so the caller uses it directly rather than paying for a second fetch.
+          This is the same "the parameter is an optimization, never a dependency"
+          contract ``metric_type`` has, and it is what lets a client upgrade
+          before the edge function does.
+
+        Never raises on an unknown shape — an unrecognised body degrades to the
+        legacy path rather than failing a read.
+        """
+
+        import httpx
+
+        params: dict[str, str] = {"fields": "digest"}
+        if metric_type:
+            params["metric_type"] = metric_type
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
+            response = await client.get(
+                f"{self.api_base_url}/mcp-sync",
+                headers={"Authorization": f"Bearer {server_token}"},
+                params=params,
+            )
+        payload = self._decode_response(response)
+        digest = payload.get("digest")
+        if isinstance(digest, dict):
+            return digest, None
+        envelopes = payload.get("envelopes")
+        if isinstance(envelopes, list):
+            return None, [row for row in envelopes if isinstance(row, dict)]
+        return None, None
+
+    async def sync_catalog(
+        self, server_token: str, *, metric_type: str | None = None
+    ) -> list[dict[str, Any]] | None:
+        """The `{blob_id, xmin}` list the client diffs against.
+
+        ``None`` means this deployment has no catalog mode — caller falls back to
+        a full fetch.
+        """
+
+        import httpx
+
+        params: dict[str, str] = {"fields": "meta"}
+        if metric_type:
+            params["metric_type"] = metric_type
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
+            response = await client.get(
+                f"{self.api_base_url}/mcp-sync",
+                headers={"Authorization": f"Bearer {server_token}"},
+                params=params,
+            )
+        payload = self._decode_response(response)
+        catalog = payload.get("catalog")
+        if not isinstance(catalog, list):
+            return None
+        return [row for row in catalog if isinstance(row, dict)]
+
+    # Kept in step with mcp-sync's MAX_BLOB_IDS. Exceeding it is a 400, so the
+    # caller chunks; this constant is what it chunks by.
+    MAX_BLOB_IDS_PER_REQUEST = 500
+
+    async def sync_blobs(
+        self, server_token: str, *, blob_ids: list[str], metric_type: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Fetch ONLY these blobs, in the same envelope shape as a full sync.
+
+        Chunked at MAX_BLOB_IDS_PER_REQUEST so the caller never has to think
+        about URL limits.
+        """
+
+        import httpx
+
+        if not blob_ids:
+            return []
+        collected: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
+            for start in range(0, len(blob_ids), self.MAX_BLOB_IDS_PER_REQUEST):
+                chunk = blob_ids[start : start + self.MAX_BLOB_IDS_PER_REQUEST]
+                params: dict[str, str] = {"blob_ids": ",".join(chunk)}
+                if metric_type:
+                    params["metric_type"] = metric_type
+                response = await client.get(
+                    f"{self.api_base_url}/mcp-sync",
+                    headers={"Authorization": f"Bearer {server_token}"},
+                    params=params,
+                )
+                payload = self._decode_response(response)
+                envelopes = payload.get("envelopes", [])
+                if not isinstance(envelopes, list):
+                    raise VaultbeatCloudError("Cloud response has invalid envelopes shape")
+                collected.extend(row for row in envelopes if isinstance(row, dict))
+        return collected
+
     async def write_strength_blob(
         self,
         server_token: str,

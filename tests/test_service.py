@@ -2225,27 +2225,83 @@ _UPLOAD_ORDER_DAYS = [
 _NEWEST_TWO_DAYS = ["2026-07-20T16:00:00Z", "2026-04-24T16:00:00Z"]
 _TEST_OWNER = "dce9b9cf-0000-0000-0000-000000000000"
 
+# strength / food / note carry a plain local day ("YYYY-MM-DD"), not a timestamp.
+# Same three days in the same deliberately-wrong upload order.
+_UPLOAD_ORDER_DATES = ["2026-04-24", "2026-03-02", "2026-07-20"]
+_NEWEST_TWO_DATES = ["2026-07-20", "2026-04-24"]
+
 
 @pytest.mark.parametrize(
-    ("metric_type", "build_payload", "call", "read_days"),
+    ("metric_type", "build_payload", "call", "read_days", "expected"),
     [
         (
             "water",
             lambda i, day: _water_payload(f"w-{i}", day, 0.5, 4),
             lambda svc: svc.water_intake_summary(limit=2, owner="dce9"),
             lambda summary: [d["day_start_date"] for d in summary["days"]],
+            _NEWEST_TWO_DAYS,
         ),
         (
             "body",
             lambda i, day: _body_payload(f"b-{i}", day, 80.0 + i),
             lambda svc: svc.weight_trend_summary(limit=2, owner="dce9"),
             lambda summary: [d["day_start_date"] for d in summary["days"]],
+            _NEWEST_TWO_DAYS,
         ),
         (
             "menstrual",
             lambda i, day: _menstrual_payload(f"mc-{i}", day, "medium"),
             lambda svc: svc.menstrual_cycle_summary(limit=2, owner="dce9"),
             lambda summary: [d["day_start_date"] for d in summary["days"]],
+            _NEWEST_TWO_DAYS,
+        ),
+        # ── The four hand-logged kinds (added 2026-07-29, third regression) ──
+        # These are the ones the owner writes daily via log_*, so "log today's
+        # session, then ask what I trained recently, and not see it" is the
+        # concrete failure. Their default limits (120/120/120/90) meant EVERY
+        # call cut on upload order, not just calls that passed limit explicitly.
+        (
+            "symptom",
+            lambda i, day: _symptom_payload(
+                f"sy-{i}",
+                day,
+                [
+                    {
+                        "symptomType": "headache",
+                        "severity": "mild",
+                        "startDate": day,
+                        "endDate": day,
+                    }
+                ],
+            ),
+            lambda svc: svc.symptom_summary(limit=2),
+            lambda summary: [d["day_start_date"] for d in summary["owners"][0]["days"]],
+            _NEWEST_TWO_DAYS,
+        ),
+        (
+            "note",
+            lambda i, day: _note_payload(f"n-{i}", "general", day[:10], f"note {i}"),
+            lambda svc: svc.notes_summary(limit=2),
+            lambda summary: [n["target_date"] for n in summary["kinds"][0]["notes"]],
+            _NEWEST_TWO_DATES,
+        ),
+        (
+            "strength",
+            lambda i, day: _strength_payload(
+                f"st-{i}", day[:10], [{"name": "squat", "sets": [{"weightKg": 60, "reps": 5}]}]
+            ),
+            lambda svc: svc.strength_summary(limit=2),
+            lambda summary: [s["date"] for s in summary["sessions"]],
+            _NEWEST_TWO_DATES,
+        ),
+        (
+            "food",
+            lambda i, day: _food_payload(
+                f"fd-{i}", day[:10], [{"items": [{"food": "rice"}]}]
+            ),
+            lambda svc: svc.food_summary(limit=2),
+            lambda summary: [d["date"] for d in summary["days"]],
+            _NEWEST_TWO_DATES,
         ),
     ],
 )
@@ -2255,6 +2311,7 @@ def test_limit_cuts_on_business_day_not_upload_order(
     build_payload: Any,
     call: Any,
     read_days: Any,
+    expected: list[str],
 ) -> None:
     service, cloud, public_key = _bound_service(tmp_path)
     cloud.envelopes = [
@@ -2273,7 +2330,7 @@ def test_limit_cuts_on_business_day_not_upload_order(
 
     # The July record must survive the cut even though it was uploaded LAST,
     # and the result must be newest-first.
-    assert read_days(summary) == _NEWEST_TWO_DAYS
+    assert read_days(summary) == expected
 
 
 def test_basal_energy_limit_cuts_on_business_day_not_upload_order(tmp_path: Path) -> None:
