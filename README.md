@@ -98,9 +98,16 @@ Then just ask your agent: *“How did we sleep last night?”*
 | `get_strength_log` | Structured strength training: exercise, sets, reps, weight per day |
 | `get_food_log` | Meals as free text with optional portions and timing |
 | `log_weight_entry` | **Write** a weight entry (optionally mirrored into Apple Health when the user opts in) |
-| `log_strength_entry` | **Write** a strength-training entry for a given day |
-| `log_food_entry` | **Write** a meal entry for a given day |
-| `log_note` | **Write** a mood or general note for a given day |
+| `log_strength_entry` | **Write** a strength-training entry for a given day (`merge=True` to append) |
+| `log_food_entry` | **Write** a meal entry for a given day (`merge=True` to append) |
+| `log_note` | **Write** a mood or general note for a given day (`merge=True` to append) |
+
+> ⚠️ **The three `log_*` write tools replace the WHOLE DAY by default.** Passing only what you
+> want to add will delete everything else recorded for that day. Pass `merge=True` to append
+> instead — that is almost always what you want when adding to a day that already has data.
+> Every write returns a `replaced_*` field naming exactly what it deleted, so an agent can
+> notice and re-send. Since 0.2.4; before that the deletion was silent and there was no
+> merge mode.
 
 Every data tool accepts `owner` (a user-ID prefix) to filter to one person — the server may hold both your and your partner's shared records, and omitting `owner` mixes them into one pool, so per-person questions should always pass it. (Earlier releases named some tools `get_partner_*` / `tether_*`; they were renamed in the 16-tool and Vaultbeat releases.)
 

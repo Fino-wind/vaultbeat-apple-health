@@ -51,16 +51,46 @@ class PollBindingResult:
 
 
 class VaultbeatCloudClient:
-    def __init__(self, api_base_url: str, *, timeout: float = 20.0):
+    # Read budget. Supabase edge functions cold-start at 20-63s measured
+    # (2026-07-27), and the old 20s ceiling meant the heaviest call — `sync`,
+    # which the cold-backup script runs first — timed out nearly every time the
+    # edge had gone cold. It failed three runs in a row that day before anyone
+    # looked, because `httpx.ReadTimeout` stringifies to "" and the CLI's
+    # catch-all printed a bare `error:` with no type name. Warming the edge with
+    # a throwaway request (the backup script does this) helps but does not fix
+    # the ceiling; this does.
+    DEFAULT_TIMEOUT_SECONDS = 90.0
+
+    # Connect stays short on purpose. A dead tunnel / DNS blackhole must surface
+    # in seconds, not after the full read budget — this box's uplink goes through
+    # a proxy that does flap. Separating the two is the whole point: tolerate a
+    # slow server, fail fast on a broken path.
+    CONNECT_TIMEOUT_SECONDS = 10.0
+
+    def __init__(self, api_base_url: str, *, timeout: float = DEFAULT_TIMEOUT_SECONDS):
         self.api_base_url = api_base_url.rstrip("/")
         self.timeout = timeout
+
+    def _timeout(self) -> httpx.Timeout:
+        """httpx timeout with a short connect and a long read.
+
+        Built per call rather than in `__init__` so httpx stays lazily imported
+        (the cache-hit CLI path must not pay its import cost). A caller passing
+        an explicit `timeout=` still wins — connect is clamped to it so a
+        deliberately tight budget is never silently widened.
+        """
+        import httpx
+
+        return httpx.Timeout(
+            self.timeout, connect=min(self.CONNECT_TIMEOUT_SECONDS, self.timeout)
+        )
 
     async def poll_binding(self, poll_id: str) -> PollBindingResult:
         # httpx is imported lazily so the CLI's cache-hit path (no network)
         # never pays its import cost.
         import httpx
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
             response = await client.post(
                 f"{self.api_base_url}/mcp-poll-binding",
                 params={"pollID": poll_id},
@@ -92,7 +122,7 @@ class VaultbeatCloudClient:
         params: dict[str, str] = {}
         if metric_type:
             params["metric_type"] = metric_type
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
             response = await client.get(
                 f"{self.api_base_url}/mcp-sync",
                 headers={"Authorization": f"Bearer {server_token}"},
@@ -121,7 +151,7 @@ class VaultbeatCloudClient:
 
         import httpx
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
             response = await client.post(
                 f"{self.api_base_url}/mcp-write-strength",
                 headers={"Authorization": f"Bearer {server_token}"},
@@ -144,7 +174,7 @@ class VaultbeatCloudClient:
 
         import httpx
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
             response = await client.post(
                 f"{self.api_base_url}/mcp-write-food",
                 headers={"Authorization": f"Bearer {server_token}"},
@@ -164,7 +194,7 @@ class VaultbeatCloudClient:
 
         import httpx
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
             response = await client.post(
                 f"{self.api_base_url}/mcp-write-body",
                 headers={"Authorization": f"Bearer {server_token}"},
@@ -184,7 +214,7 @@ class VaultbeatCloudClient:
 
         import httpx
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
             response = await client.post(
                 f"{self.api_base_url}/mcp-write-note",
                 headers={"Authorization": f"Bearer {server_token}"},
@@ -222,7 +252,7 @@ class VaultbeatCloudClient:
 
         import httpx
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
             await client.post(
                 f"{self.api_base_url}/mcp-report-decrypt-failures",
                 headers={"Authorization": f"Bearer {server_token}"},

@@ -289,5 +289,8 @@ class ConfigStore:
         if not current:
             raise ConfigError("Local MCP server is not initialized")
         if not current.is_bound:
-            raise ConfigError("Local MCP server is not bound; run `vaultbeat-mcp-local bind` first")
+            raise ConfigError(
+                "Local MCP server is not bound; call `vaultbeat_start_binding` then "
+                "`vaultbeat_poll_binding` (CLI equivalent: `vaultbeat-mcp bind`)"
+            )
         return current

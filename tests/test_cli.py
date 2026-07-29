@@ -6,6 +6,8 @@ import types
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 import vaultbeat_mcp_local.cli as cli
 from vaultbeat_mcp_local.mcp_server import _normalize_http_path, _normalize_transport, run_mcp_server
 from vaultbeat_mcp_local.service import VaultbeatLocalService
@@ -223,3 +225,74 @@ def test_doctor_returns_1_and_prints_fail_when_unbound(tmp_path: Path, capsys: A
     assert exit_code == 1
     assert "[FAIL] config" in captured.out
     assert "bind" in captured.out
+
+
+def test_notes_kind_accepts_every_readable_kind() -> None:
+    """`--kind` must cover the kinds this server itself writes.
+
+    2026-07-27: choices were the iOS pair (sleep/menstrual) only, so the
+    mood/general notes `log_note` creates were unfilterable from the CLI —
+    argparse rejected them with exit code 2.
+    """
+    parser = cli.build_parser()
+
+    for kind in ("sleep", "menstrual", "mood", "general"):
+        args = parser.parse_args(["notes", "--kind", kind])
+        assert args.kind == kind
+
+
+def test_notes_kind_still_rejects_an_unknown_kind(capsys: Any) -> None:
+    parser = cli.build_parser()
+
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["notes", "--kind", "not-a-kind"])
+
+    assert excinfo.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+
+
+def test_cli_error_names_the_exception_type_when_str_is_empty(
+    monkeypatch: Any, tmp_path: Path, capsys: Any
+) -> None:
+    """`httpx.ReadTimeout` stringifies to "" — the most common real failure here
+    (Supabase edge cold starts) produced a bare `error:` with zero diagnostic
+    content. Three consecutive cold-backup runs failed that way on 2026-07-27 and
+    the cause could only be found by bypassing this handler entirely."""
+
+    class SilentFailure(Exception):
+        def __str__(self) -> str:
+            return ""
+
+    async def boom(
+        self: VaultbeatLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
+    ) -> dict[str, Any]:
+        raise SilentFailure
+
+    monkeypatch.setattr(VaultbeatLocalService, "water_intake_summary", boom)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--config", str(tmp_path / "config.json"), "water"])
+
+    assert excinfo.value.code == 1
+    assert "SilentFailure" in capsys.readouterr().err
+
+
+def test_cli_error_keeps_the_message_when_there_is_one(
+    monkeypatch: Any, tmp_path: Path, capsys: Any
+) -> None:
+    """Naming the type must not cost the message — both are printed."""
+
+    async def boom(
+        self: VaultbeatLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
+    ) -> dict[str, Any]:
+        raise ValueError("config is unreadable")
+
+    monkeypatch.setattr(VaultbeatLocalService, "water_intake_summary", boom)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--config", str(tmp_path / "config.json"), "water"])
+
+    assert excinfo.value.code == 1
+    err = capsys.readouterr().err
+    assert "ValueError" in err
+    assert "config is unreadable" in err
