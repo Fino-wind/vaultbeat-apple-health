@@ -8,6 +8,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -2192,3 +2193,620 @@ def test_doctor_capability_report_is_quiet_when_everything_has_data(tmp_path: Pa
     caps = asyncio.run(service.doctor())["capabilities"]
     assert caps["possibly_needs_newer_app"] == {}
     assert caps["kinds_without_data"] == []
+
+
+# ── limit must cut on BUSINESS time, not upload order (2026-07-27) ────────────
+#
+# `_records_for_metric` sorts by created_at = UPLOAD BATCH time (one batch holds
+# up to 50 blobs, all sharing a timestamp). Cutting there and parsing afterwards
+# silently drops the newest days whenever a history backfill uploads old data
+# late. Eight kinds were fixed 2026-07-24; water/body/menstrual/basal still cut
+# early until now. Reproduced live: get_weight_trend(limit=10, owner="dce9")
+# hid the real 2026-07-21 weigh-in (83.0 kg) while keeping an older 07-10 one.
+
+
+def _basal_payload(sample_id: str, sample_start: str, kcal: float) -> bytes:
+    return json.dumps(
+        {
+            "sampleID": sample_id,
+            "sampleStartDate": sample_start,
+            "basalEnergyKcal": kcal,
+        }
+    ).encode()
+
+
+# Upload order (== the fake's created_at order) deliberately disagrees with the
+# payloads' own days, exactly like a backfill batch.
+_UPLOAD_ORDER_DAYS = [
+    "2026-04-24T16:00:00Z",
+    "2026-03-02T16:00:00Z",
+    "2026-07-20T16:00:00Z",
+]
+_NEWEST_TWO_DAYS = ["2026-07-20T16:00:00Z", "2026-04-24T16:00:00Z"]
+_TEST_OWNER = "dce9b9cf-0000-0000-0000-000000000000"
+
+
+@pytest.mark.parametrize(
+    ("metric_type", "build_payload", "call", "read_days"),
+    [
+        (
+            "water",
+            lambda i, day: _water_payload(f"w-{i}", day, 0.5, 4),
+            lambda svc: svc.water_intake_summary(limit=2, owner="dce9"),
+            lambda summary: [d["day_start_date"] for d in summary["days"]],
+        ),
+        (
+            "body",
+            lambda i, day: _body_payload(f"b-{i}", day, 80.0 + i),
+            lambda svc: svc.weight_trend_summary(limit=2, owner="dce9"),
+            lambda summary: [d["day_start_date"] for d in summary["days"]],
+        ),
+        (
+            "menstrual",
+            lambda i, day: _menstrual_payload(f"mc-{i}", day, "medium"),
+            lambda svc: svc.menstrual_cycle_summary(limit=2, owner="dce9"),
+            lambda summary: [d["day_start_date"] for d in summary["days"]],
+        ),
+    ],
+)
+def test_limit_cuts_on_business_day_not_upload_order(
+    tmp_path: Path,
+    metric_type: str,
+    build_payload: Any,
+    call: Any,
+    read_days: Any,
+) -> None:
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            build_payload(i, day),
+            metric_type=metric_type,
+            envelope_id=f"env-{metric_type}-{i}",
+            blob_id=f"blob-{metric_type}-{i}",
+            owner_user_id=_TEST_OWNER,
+        )
+        for i, day in enumerate(_UPLOAD_ORDER_DAYS)
+    ]
+
+    summary = asyncio.run(call(service))
+
+    # The July record must survive the cut even though it was uploaded LAST,
+    # and the result must be newest-first.
+    assert read_days(summary) == _NEWEST_TWO_DAYS
+
+
+def test_basal_energy_limit_cuts_on_business_day_not_upload_order(tmp_path: Path) -> None:
+    """Same bug, asserted on kcal because the daily `day` key is timezone-local.
+
+    The three sample days are months apart, so no timezone can reorder them.
+    """
+    service, cloud, public_key = _bound_service(tmp_path)
+    kcal_by_day = {
+        "2026-04-24T16:00:00Z": 200.0,
+        "2026-03-02T16:00:00Z": 100.0,
+        "2026-07-20T16:00:00Z": 300.0,
+    }
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _basal_payload(f"be-{i}", day, kcal_by_day[day]),
+            metric_type="basal_energy",
+            envelope_id=f"env-be-{i}",
+            blob_id=f"blob-be-{i}",
+            owner_user_id=_TEST_OWNER,
+        )
+        for i, day in enumerate(_UPLOAD_ORDER_DAYS)
+    ]
+
+    summary = asyncio.run(service.basal_energy_records(limit=2, owner="dce9"))
+
+    assert summary["sample_count"] == 2
+    # July (uploaded last) survives and leads; March (oldest) is the one cut.
+    assert [d["basal_kcal"] for d in summary["daily"]] == [300.0, 200.0]
+
+
+# ── sleep: "0h00m" was a lie on Watch-less nights (2026-07-27) ────────────────
+
+
+def _sleep_payload(
+    session_date: str,
+    bedtime: str,
+    wake_time: str,
+    samples: list[dict[str, str]],
+) -> bytes:
+    return json.dumps(
+        {
+            "session": {
+                "sessionDate": session_date,
+                "bedtime": bedtime,
+                "wakeTime": wake_time,
+                "provenance": "healthkitSleep",
+                "samples": samples,
+            },
+            "heartRateSamples": [],
+            "respiratoryRateSamples": [],
+        }
+    ).encode()
+
+
+def _sleep_envelopes(public_key: str) -> list[dict[str, Any]]:
+    """Two nights: the newer one in-bed-only (Watch off), the older one staged."""
+    in_bed_only = _sleep_payload(
+        "2026-07-25T16:00:00Z",
+        "2026-07-25T15:00:00Z",
+        "2026-07-25T22:00:00Z",
+        [
+            {
+                "stage": "inBed",
+                "startDate": "2026-07-25T15:00:00Z",
+                "endDate": "2026-07-25T22:00:00Z",
+            }
+        ],
+    )
+    staged = _sleep_payload(
+        "2026-07-20T16:00:00Z",
+        "2026-07-20T15:00:00Z",
+        "2026-07-20T22:00:00Z",
+        [
+            {
+                "stage": "asleepCore",
+                "startDate": "2026-07-20T15:00:00Z",
+                "endDate": "2026-07-20T19:00:00Z",
+            },
+            {
+                "stage": "asleepDeep",
+                "startDate": "2026-07-20T19:00:00Z",
+                "endDate": "2026-07-20T22:00:00Z",
+            },
+        ],
+    )
+    return [
+        _make_envelope(
+            public_key,
+            in_bed_only,
+            metric_type="sleep",
+            envelope_id="env-sleep-inbed",
+            blob_id="blob-sleep-inbed",
+            owner_user_id=_TEST_OWNER,
+        ),
+        _make_envelope(
+            public_key,
+            staged,
+            metric_type="sleep",
+            envelope_id="env-sleep-staged",
+            blob_id="blob-sleep-staged",
+            owner_user_id=_TEST_OWNER,
+        ),
+    ]
+
+
+def test_in_bed_only_night_is_labelled_no_sleep_data_not_zero(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = _sleep_envelopes(public_key)
+
+    summary = asyncio.run(service.sleep_records(limit=5, owner="dce9"))
+    newest, older = summary["daily_summary"][0], summary["daily_summary"][1]
+
+    # The honest zero stays — sleep genuinely was not measured that night —
+    # but nothing in the output may read as "slept 0 hours".
+    assert newest["total_sleep_minutes"] == 0
+    assert newest["is_in_bed_only"] is True
+    assert newest["duration_label"] == "no sleep data"
+    assert newest["in_bed_minutes"] == 420
+
+    # A normal staged night is untouched.
+    assert older["is_in_bed_only"] is False
+    assert older["duration_label"] == "7h00m"
+    assert older["in_bed_minutes"] == 0
+
+
+def test_sleep_detail_in_bed_only_night_carries_the_same_labels(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = _sleep_envelopes(public_key)
+
+    summary = asyncio.run(service.sleep_detail_records(limit=5, owner="dce9"))
+    newest, older = summary["nights"][0], summary["nights"][1]
+
+    assert newest["is_in_bed_only"] is True
+    assert newest["duration_label"] == "no sleep data"
+    assert newest["in_bed_minutes"] == 420
+    assert newest["total_sleep_minutes"] == 0
+
+    assert older["duration_label"] == "7h00m"
+    assert older["total_sleep_minutes"] == 420
+
+
+def _short_samples_payload() -> bytes:
+    """Three 90-second core-sleep samples = 4.5 min of real sleep."""
+    windows = [("15:00:00", "15:01:30"), ("15:02:00", "15:03:30"), ("15:04:00", "15:05:30")]
+    return _sleep_payload(
+        "2026-07-25T16:00:00Z",
+        "2026-07-25T15:00:00Z",
+        "2026-07-25T15:06:00Z",
+        [
+            {
+                "stage": "asleepCore",
+                "startDate": f"2026-07-25T{start}Z",
+                "endDate": f"2026-07-25T{end}Z",
+            }
+            for start, end in windows
+        ],
+    )
+
+
+def test_stage_minutes_truncate_once_per_stage_not_once_per_sample(tmp_path: Path) -> None:
+    """Per-sample int(seconds/60) threw away up to 59s per sample.
+
+    Three 90-second samples are 4.5 min of sleep; the old code reported 3
+    (1+1+1). Across 315 real nights the loss averaged 6.8 min, worst case 17.
+    """
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _short_samples_payload(),
+            metric_type="sleep",
+            envelope_id="env-sleep-short",
+            blob_id="blob-sleep-short",
+            owner_user_id=_TEST_OWNER,
+        )
+    ]
+
+    summary = asyncio.run(service.sleep_records(limit=5, owner="dce9"))
+    night = summary["daily_summary"][0]
+    assert night["total_sleep_minutes"] == 4
+    assert night["stage_minutes"]["asleepCore"] == 4
+
+    detail = asyncio.run(service.sleep_detail_records(limit=5, owner="dce9"))
+    assert detail["nights"][0]["total_sleep_minutes"] == 4
+
+
+# ── get_sleep_detail's timeline is opt-in ────────────────────────────────────
+# 2026-07-28: the per-sample `timeline` array is ~80% of this payload (~13k
+# characters/night), so the old limit=5 default returned ~66k characters and
+# overflowed a 25k-token MCP client at limit=4. The owner's own skill passes
+# --limit 1 and never hit it; a third-party agent reading only the tool
+# description did. Derived stage_* fields must keep working without it.
+
+
+def _sleep_payload_with_vitals() -> bytes:
+    """One staged night that actually carries HR + RR samples."""
+    return json.dumps(
+        {
+            "session": {
+                "sessionDate": "2026-07-20T16:00:00Z",
+                "bedtime": "2026-07-20T15:00:00Z",
+                "wakeTime": "2026-07-20T22:00:00Z",
+                "provenance": "healthkitSleep",
+                "samples": [
+                    {
+                        "stage": "asleepCore",
+                        "startDate": "2026-07-20T15:00:00Z",
+                        "endDate": "2026-07-20T18:00:00Z",
+                    },
+                    {
+                        "stage": "asleepDeep",
+                        "startDate": "2026-07-20T18:00:00Z",
+                        "endDate": "2026-07-20T22:00:00Z",
+                    },
+                ],
+            },
+            "heartRateSamples": [
+                {"startDate": "2026-07-20T16:00:00Z", "value": 58},
+                {"startDate": "2026-07-20T19:00:00Z", "value": 51},
+            ],
+            "respiratoryRateSamples": [
+                {"startDate": "2026-07-20T16:30:00Z", "value": 14.5},
+            ],
+        }
+    ).encode()
+
+
+def _service_with_vitals_night(tmp_path: Path) -> Any:
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _sleep_payload_with_vitals(),
+            metric_type="sleep",
+            envelope_id="env-sleep-vitals",
+            blob_id="blob-sleep-vitals",
+            owner_user_id=_TEST_OWNER,
+        )
+    ]
+    return service
+
+
+def test_sleep_detail_omits_timeline_by_default(tmp_path: Path) -> None:
+    service = _service_with_vitals_night(tmp_path)
+
+    summary = asyncio.run(service.sleep_detail_records(limit=5, owner="dce9"))
+    night = summary["nights"][0]
+
+    assert summary["timeline_included"] is False
+    assert "timeline" not in night
+    # The derived fields are the whole point of dropping it — they must survive.
+    assert night["stage_intervals"]
+    assert night["stage_minutes"]["asleepCore"] == 180
+    assert night["stage_vitals"]["asleepCore"]["hr_mean"] == 58
+    assert night["stage_vitals"]["asleepDeep"]["hr_mean"] == 51
+    # Sample counts still tell the caller vitals exist and can be fetched.
+    assert night["hr_samples"] == 2
+    assert night["rr_samples"] == 1
+
+
+def test_sleep_detail_include_timeline_returns_the_samples(tmp_path: Path) -> None:
+    service = _service_with_vitals_night(tmp_path)
+
+    summary = asyncio.run(
+        service.sleep_detail_records(limit=5, owner="dce9", include_timeline=True)
+    )
+    night = summary["nights"][0]
+
+    assert summary["timeline_included"] is True
+    assert [point["hr"] for point in night["timeline"]] == [58, 58, 51]
+    assert [point["stage"] for point in night["timeline"]] == [
+        "asleepCore",
+        "asleepCore",
+        "asleepDeep",
+    ]
+    # Same aggregates either way — the flag controls payload size, not content.
+    assert night["stage_vitals"]["asleepCore"]["hr_mean"] == 58
+
+
+def test_sleep_detail_reports_malformed_samples_instead_of_swallowing(tmp_path: Path) -> None:
+    """The two `except: pass` loops dropped bad samples with no trace.
+
+    Every other decode path in this module collects failures into `errors`.
+    """
+    service, cloud, public_key = _bound_service(tmp_path)
+    payload = _sleep_payload(
+        "2026-07-25T16:00:00Z",
+        "2026-07-25T15:00:00Z",
+        "2026-07-25T22:00:00Z",
+        [
+            {
+                "stage": "asleepCore",
+                "startDate": "2026-07-25T15:00:00Z",
+                "endDate": "2026-07-25T19:00:00Z",
+            },
+            {"stage": "asleepDeep", "startDate": "2026-07-25T19:00:00Z"},  # no endDate
+        ],
+    )
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            payload,
+            metric_type="sleep",
+            envelope_id="env-sleep-bad",
+            blob_id="blob-sleep-bad",
+            owner_user_id=_TEST_OWNER,
+        )
+    ]
+
+    summary = asyncio.run(service.sleep_detail_records(limit=5, owner="dce9"))
+
+    assert len(summary["errors"]) == 1
+    assert "1 sleep sample(s) skipped" in summary["errors"][0]
+    assert "env-sleep-bad" in summary["errors"][0]
+    assert summary["errors_note"]
+    # The good sample still decodes — one bad sample must not lose the night.
+    assert summary["nights"][0]["total_sleep_minutes"] == 240
+
+
+# ── Whole-day writers must not delete what the caller never mentioned ─────────
+# 2026-07-27 lost the note '腿日 + 腹肌' off a real session: log_strength_entry
+# rewrote the day without it, because omitting `note` meant "erase" rather than
+# "leave alone". strength additionally had no merge mode at all, so a second
+# call in the same session silently dropped the exercises of the first.
+
+
+def test_log_strength_entry_merge_appends_without_dropping(tmp_path: Path) -> None:
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    first = asyncio.run(
+        service.log_strength_entry(
+            date="2026-07-20",
+            exercises=[
+                {"name": "腿弯举", "sets": [{"weightKg": 22.5, "reps": 15}]},
+                {"name": "腿伸展", "sets": [{"weightKg": 30.0, "reps": 12}]},
+            ],
+            note="腿日 + 腹肌",
+        )
+    )
+    second = asyncio.run(
+        service.log_strength_entry(
+            date="2026-07-20",
+            exercises=[
+                {"name": "腿弯举", "sets": [{"weightKg": 25.0, "reps": 12}]},
+                {"name": "小腿提踵", "sets": [{"weightKg": 40.0, "reps": 20}]},
+            ],
+            merge=True,
+        )
+    )
+
+    assert second["entry_id"] == first["entry_id"]
+    assert second["merge_mode"] is True
+    assert second["replaced_exercises"] == []
+
+    by_name = {e["name"]: e for e in second["session"]["exercises"]}
+    # Same-name exercise got the new set appended, not swapped.
+    assert [s["weightKg"] for s in by_name["腿弯举"]["sets"]] == [22.5, 25.0]
+    # An exercise the second call never mentioned survives untouched.
+    assert [s["weightKg"] for s in by_name["腿伸展"]["sets"]] == [30.0]
+    assert [s["weightKg"] for s in by_name["小腿提踵"]["sets"]] == [40.0]
+
+
+def test_log_strength_entry_omitting_note_keeps_it(tmp_path: Path) -> None:
+    """The exact 2026-07-27 loss: a follow-up write with no `note` erased it."""
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    asyncio.run(
+        service.log_strength_entry(
+            date="2026-07-20",
+            exercises=[{"name": "卧推", "sets": [{"weightKg": 40.0, "reps": 8}]}],
+            note="腿日 + 腹肌",
+        )
+    )
+    second = asyncio.run(
+        service.log_strength_entry(
+            date="2026-07-20",
+            exercises=[{"name": "卧推", "sets": [{"weightKg": 42.5, "reps": 8}]}],
+        )
+    )
+
+    assert second["session"]["note"] == "腿日 + 腹肌"
+
+
+def test_log_strength_entry_empty_note_clears_it(tmp_path: Path) -> None:
+    """`None` means leave alone, so there must still be a way to erase."""
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    asyncio.run(
+        service.log_strength_entry(
+            date="2026-07-20",
+            exercises=[{"name": "卧推", "sets": [{"weightKg": 40.0, "reps": 8}]}],
+            note="写错了",
+        )
+    )
+    second = asyncio.run(
+        service.log_strength_entry(
+            date="2026-07-20",
+            exercises=[{"name": "卧推", "sets": [{"weightKg": 40.0, "reps": 8}]}],
+            note="",
+        )
+    )
+
+    assert second["session"]["note"] is None
+
+
+def test_log_strength_entry_replace_mode_names_what_it_deleted(tmp_path: Path) -> None:
+    """Replace still replaces — but the caller is told, instead of guessing."""
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    asyncio.run(
+        service.log_strength_entry(
+            date="2026-07-20",
+            exercises=[
+                {"name": "腿弯举", "sets": [{"weightKg": 22.5, "reps": 15}]},
+                {"name": "腿伸展", "sets": [{"weightKg": 30.0, "reps": 12}]},
+            ],
+        )
+    )
+    second = asyncio.run(
+        service.log_strength_entry(
+            date="2026-07-20",
+            exercises=[{"name": "小腿提踵", "sets": [{"weightKg": 40.0, "reps": 20}]}],
+        )
+    )
+
+    assert second["merge_mode"] is False
+    assert sorted(second["replaced_exercises"]) == ["腿伸展", "腿弯举"]
+    assert [e["name"] for e in second["session"]["exercises"]] == ["小腿提踵"]
+
+
+def test_log_strength_entry_fresh_day_reports_nothing_replaced(tmp_path: Path) -> None:
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    result = asyncio.run(
+        service.log_strength_entry(
+            date="2026-07-20",
+            exercises=[{"name": "卧推", "sets": [{"weightKg": 40.0, "reps": 8}]}],
+        )
+    )
+
+    assert result["replaced_exercises"] == []
+    assert result["updated_existing_day"] is False
+
+
+def test_log_food_entry_omitting_note_keeps_it_in_replace_mode(tmp_path: Path) -> None:
+    """Note preservation used to be merge-only; replace-mode calls erased it."""
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    asyncio.run(
+        service.log_food_entry(
+            date="2026-07-20",
+            meals=[{"name": "lunch", "items": [{"food": "鸡胸肉"}]}],
+            note="减脂日",
+        )
+    )
+    second = asyncio.run(
+        service.log_food_entry(
+            date="2026-07-20",
+            meals=[{"name": "dinner", "items": [{"food": "牛腱"}]}],
+        )
+    )
+
+    assert second["merge_mode"] is False
+    assert second["day"]["note"] == "减脂日"
+    assert second["replaced_meals"] == ["lunch"]
+
+
+# ── log_note was the last whole-day writer with no merge ──────────────────────
+# 2026-07-28: food and strength got merge + replaced_* receipts on 07-28, but
+# log_note still silently overwrote its (kind, day) note and pushed
+# read-modify-write onto the caller via its docstring. Notes carry symptoms,
+# which arrive in installments across a day, so second-write-of-the-day is the
+# normal case — and an agent that had just learned `merge=True` elsewhere would
+# reasonably assume it existed here too.
+
+
+def test_log_note_merge_appends_without_dropping(tmp_path: Path) -> None:
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    first = asyncio.run(
+        service.log_note(text="中午恶心", kind="general", date="2026-07-24")
+    )
+    second = asyncio.run(
+        service.log_note(text="晚上头晕", kind="general", date="2026-07-24", merge=True)
+    )
+
+    assert second["note_id"] == first["note_id"]
+    assert second["merge_mode"] is True
+    assert second["replaced_text"] is None
+    # Morning symptom survives; evening one is appended on its own line.
+    assert second["note"]["text"] == "中午恶心\n晚上头晕"
+
+
+def test_log_note_replace_mode_reports_what_it_deleted(tmp_path: Path) -> None:
+    """Replace still replaces — but the caller is told, instead of guessing."""
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    asyncio.run(service.log_note(text="中午恶心", kind="general", date="2026-07-24"))
+    second = asyncio.run(service.log_note(text="晚上头晕", kind="general", date="2026-07-24"))
+
+    assert second["merge_mode"] is False
+    assert second["replaced_text"] == "中午恶心"
+    assert second["note"]["text"] == "晚上头晕"
+
+
+def test_log_note_fresh_day_reports_nothing_replaced(tmp_path: Path) -> None:
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    result = asyncio.run(service.log_note(text="第一条", kind="mood", date="2026-07-24"))
+
+    assert result["replaced_text"] is None
+    assert result["updated_existing_note"] is False
+
+    # merge=True on a day with no note yet is a plain create, not a leading
+    # newline glued onto empty text.
+    other = asyncio.run(
+        service.log_note(text="第一条", kind="general", date="2026-07-24", merge=True)
+    )
+    assert other["note"]["text"] == "第一条"
+    assert other["replaced_text"] is None
+
+
+def test_log_note_merge_is_scoped_to_same_kind_and_day(tmp_path: Path) -> None:
+    """Merging must not vacuum up a different kind's or day's note."""
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    asyncio.run(service.log_note(text="mood 的", kind="mood", date="2026-07-24"))
+    asyncio.run(service.log_note(text="前一天的", kind="general", date="2026-07-23"))
+    merged = asyncio.run(
+        service.log_note(text="今天的", kind="general", date="2026-07-24", merge=True)
+    )
+
+    assert merged["note"]["text"] == "今天的"
+    assert merged["replaced_text"] is None

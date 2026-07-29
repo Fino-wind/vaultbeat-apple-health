@@ -188,6 +188,13 @@ def run_mcp_server(
         Use `owner` prefix to filter by person (e.g. "dce9" for one user,
         "f835" for the other) — without it, both partners' data is mixed and
         per-day selection may pick the wrong person's session.
+
+        ⚠️ `is_in_bed_only: true` means sleep was NEVER MEASURED that night (the
+        Watch wasn't worn) — NOT that the person slept zero. On those nights
+        `total_sleep_minutes` is 0, `duration_label` reads "no sleep data", and
+        `in_bed_minutes` holds the time actually recorded in bed. Report such a
+        night as "no sleep data (in bed ~Xh)", never as "slept 0 hours".
+
         Results are served from a short-lived local cache (default 10 min);
         pass fresh=True to force a cloud round trip.
         """
@@ -273,21 +280,38 @@ def run_mcp_server(
 
     @mcp.tool()
     async def log_strength_entry(
-        date: str, exercises: list[dict[str, Any]], note: str | None = None
+        date: str,
+        exercises: list[dict[str, Any]],
+        note: str | None = None,
+        merge: bool = False,
     ) -> dict[str, Any]:
         """Log one strength-training session on the owner's behalf (agent write).
 
+        ⚠️ DEFAULT IS REPLACE-THE-WHOLE-DAY: with `merge=False`, the supplied
+        `exercises` become the day's ENTIRE session — any exercise you don't
+        re-send is silently deleted. To ADD an exercise or a forgotten set to a
+        day that already has one, pass `merge=True`: your exercises are appended
+        to the existing session (an exercise whose `name` matches an existing one
+        gets its sets appended to it), and nothing already logged can be lost.
+
+        The result carries `replaced_exercises` — the names this call deleted.
+        If that list is non-empty and you did not intend to replace the day, you
+        just destroyed those exercises; re-send them with `merge=True`.
+
+        `note=None` LEAVES THE EXISTING NOTE ALONE (pass `note=""` to clear it).
+
         `date` is the LOCAL calendar day the session happened, "YYYY-MM-DD".
         `exercises` is `[{"name": "卧推", "sets": [{"weightKg": 30, "reps": 8}, ...]}, ...]`.
-        Logging a day that already has a session (app- or agent-authored)
-        overwrites it in place rather than creating a duplicate. Encrypted
-        end-to-end before it ever leaves this machine — this server never
-        sends plaintext. Requires a bind made after this feature shipped
+        Encrypted end-to-end before it ever leaves this machine — this server
+        never sends plaintext. Requires a bind made after this feature shipped
         (carries owner_user_id/owner_public_key_base64/owner_device_id from
-        the pairing handshake); an older bind must re-pair via `bind`.
+        the pairing handshake); an older bind must re-pair by calling
+        `vaultbeat_start_binding` then `vaultbeat_poll_binding`.
         """
 
-        return await service.log_strength_entry(date=date, exercises=exercises, note=note)
+        return await service.log_strength_entry(
+            date=date, exercises=exercises, note=note, merge=merge
+        )
 
     @mcp.tool()
     async def get_food_log(
@@ -321,8 +345,14 @@ def run_mcp_server(
         silently deleted. To ADD a meal/snack to a day that already has
         entries, pass `merge=True`: your meals are appended to the existing
         day (a meal whose `name` matches an existing meal gets its items
-        appended to that meal), nothing already logged can be lost, and
-        `note=None` keeps the existing day note.
+        appended to that meal) and nothing already logged can be lost.
+
+        The result carries `replaced_meals` — the meals this call deleted. If
+        that list is non-empty and you did not intend to replace the day, you
+        just destroyed them; re-send them with `merge=True`.
+
+        `note=None` LEAVES THE EXISTING NOTE ALONE in both modes (pass
+        `note=""` to clear it).
 
         `date` is the LOCAL calendar day, "YYYY-MM-DD".
         `meals` is a list of `{name?, timeOfDay?, items: [...], note?}` where each
@@ -339,7 +369,7 @@ def run_mcp_server(
 
     @mcp.tool()
     async def log_note(
-        text: str, kind: str = "general", date: str | None = None
+        text: str, kind: str = "general", date: str | None = None, merge: bool = False
     ) -> dict[str, Any]:
         """Log a free-text note on the owner's behalf (agent write).
 
@@ -348,15 +378,26 @@ def run_mcp_server(
         `kind="general"` for day events worth joining against sleep/HRV later.
         (sleep/menstrual notes stay iOS-authored — this tool refuses them.)
 
-        `date` = LOCAL calendar day "YYYY-MM-DD" (default today). One
-        agent-authored note per (kind, day): re-logging the same kind+day
-        OVERWRITES it — to add to an existing note, `get_notes` first and
-        resend the combined text. Read back via `get_notes` (optionally
-        `target_kind="mood"`/`"general"`). Encrypted end-to-end before it
-        ever leaves this machine.
+        ⚠️ DEFAULT IS REPLACE-THE-WHOLE-NOTE: there is one note per (kind, day),
+        and with `merge=False` your `text` becomes its ENTIRE contents — anything
+        already written for that kind+day is silently deleted. To ADD to a day
+        that already has a note, pass `merge=True`: your text is appended on a
+        new line and nothing already logged can be lost.
+
+        The result carries `replaced_text` — the note this call deleted. If it is
+        non-null and you did not intend to replace, you just destroyed that text;
+        re-send it with `merge=True`.
+
+        Use `merge=True` for symptoms. Discomfort shows up in installments
+        across a day (nausea at noon, dizziness at night), so the second write
+        of the day is the normal case, not the exception.
+
+        `date` = LOCAL calendar day "YYYY-MM-DD" (default today). Read back via
+        `get_notes` (optionally `target_kind="mood"`/`"general"`). Encrypted
+        end-to-end before it ever leaves this machine.
         """
 
-        return await service.log_note(text=text, kind=kind, date=date)
+        return await service.log_note(text=text, kind=kind, date=date, merge=merge)
 
     @mcp.tool()
     async def log_weight_entry(weight_kg: float, date: str | None = None) -> dict[str, Any]:
@@ -367,12 +408,19 @@ def run_mcp_server(
         (dayID = "body-{dayStart.epoch}") — re-logging the same day overwrites.
         Encrypted end-to-end before it ever leaves this machine.
 
-        ⚠️ Written data lands in Vaultbeat cloud + MCP (visible to
-        `get_weight_trend`). It does NOT propagate to Apple Health (HealthKit
-        is iOS-only; server-triggered HealthKit write would require iOS to
-        listen for a push, out of v1 scope). If the owner wants the number in
-        Apple Health app too, they need to also record it in the Vaultbeat
-        weight card on iOS.
+        Written data always lands in Vaultbeat cloud + MCP (visible to
+        `get_weight_trend`). Whether it also reaches Apple Health depends on an
+        iOS setting: Settings → Data & AI → "Allow AI to update Apple Health"
+        (OFF by default). When it is on, weigh-ins logged here sync back into
+        Apple Health on the next app sync.
+
+        ⚠️ If the owner wants this number in the Apple Health app, tell them to
+        turn that toggle ON — do NOT tell them to re-enter it by hand in the
+        Vaultbeat weight card. Logging it in both places produces two entries
+        for the same day from different sources and corrupts the trend line.
+        (Before 2026-07-28 this docstring said propagation was impossible and
+        instructed exactly that manual double-entry; the toggle shipped
+        2026-07-22.)
         """
 
         return await service.log_weight_entry(weight_kg=weight_kg, date=date)
@@ -395,9 +443,15 @@ def run_mcp_server(
         """Initialize a binding session: generates a keypair (if needed) and returns a
         QR payload that the user scans in the Vaultbeat iOS app to authorize this AI server.
 
+        ⚠️ REQUIRES VAULTBEAT PRO on the owner's iPhone (monthly, yearly or
+        lifetime — the AI agent interface is the Pro tier). Mention this when you
+        show the QR code: without Pro, tapping MCP Server in the iOS app opens a
+        paywall instead of the scanner, so they never reach a scannable state.
+
         Returns `qr_payload_json` — a JSON string the AI should render as a QR code
         for the user to scan, plus `poll_id` to pass to `vaultbeat_poll_binding`.
         After the user scans, call `vaultbeat_poll_binding` to complete authorization.
+        The iOS path is Settings → Data & AI → MCP Server.
         """
 
         session = service.start_binding(server_name=server_name)
@@ -415,6 +469,13 @@ def run_mcp_server(
         scanned yet — wait and retry) or "bound" (success — server is now authorized
         and can decrypt health data). Polls once; call repeatedly with short delays
         until status is "bound" or you decide to time out.
+
+        ⚠️ Stuck on "pending" forever? Ask what they see when they tap MCP Server
+        in the iOS app (Settings → Data & AI). If it is a PAYWALL rather than a QR
+        scanner, that is the whole problem — binding needs Vaultbeat Pro, and the
+        iOS app creates no pending record at all until they have it. Do not send
+        them to re-scan, check the network, reinstall this server, or run
+        diagnostics; nothing on this side is broken.
         """
 
         result = await service.poll_once()
@@ -426,18 +487,37 @@ def run_mcp_server(
 
     @mcp.tool()
     async def get_sleep_detail(
-        limit: int = 5, owner: str | None = None, fresh: bool = False
+        limit: int = 2,
+        owner: str | None = None,
+        fresh: bool = False,
+        include_timeline: bool = False,
     ) -> dict[str, Any]:
-        """Per-night timeline: each HR/RR sample tagged with the concurrent sleep stage.
+        """Per-night sleep stages with per-stage HR/RR. The primary tool for detailed
+        sleep analysis — richer than vaultbeat_sync_sleep.
 
-        Returns chronological `timeline` array (hr, rr, stage, time), `stage_intervals`
-        (contiguous stage bands with start/end), `stage_minutes`, and `stage_vitals`
-        (per-stage HR/RR min/mean/max). Use `owner` prefix to filter by person
-        (e.g. "dce9" for linyou, "f835" for partner). This is the primary tool for
-        detailed sleep analysis — richer than vaultbeat_sync_sleep.
+        Returns `stage_intervals` (contiguous stage bands with start/end),
+        `stage_minutes`, and `stage_vitals` (per-stage HR/RR min/mean/max). Use
+        `owner` prefix to filter by person (e.g. "dce9" for linyou, "f835" for
+        partner).
+
+        ⚠️ SIZE: each night is ~1-2k characters as returned. Setting
+        `include_timeline=True` adds the raw per-sample array (hr, rr, stage,
+        time) — about 13k characters PER NIGHT, which will overflow a typical
+        25k-token client budget after 2-3 nights. Ask for it only when you need
+        sample-level vitals (e.g. "when exactly did HR spike"); `stage_vitals`
+        already answers per-stage questions. Raise `limit` for trends, but keep
+        it low whenever `include_timeline=True`.
+
+        ⚠️ `is_in_bed_only: true` means sleep was NEVER MEASURED that night (the
+        Watch wasn't worn) — NOT that the person slept zero. `duration_label`
+        reads "no sleep data" and `in_bed_minutes` holds the time actually
+        recorded in bed. Report it as "no sleep data (in bed ~Xh)", never as
+        "slept 0 hours".
         """
 
-        return await service.sleep_detail_records(limit=limit, owner=owner, fresh=fresh)
+        return await service.sleep_detail_records(
+            limit=limit, owner=owner, fresh=fresh, include_timeline=include_timeline
+        )
 
     @mcp.tool()
     async def get_activity(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:

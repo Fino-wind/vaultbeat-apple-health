@@ -79,6 +79,16 @@ KNOWN_METRIC_TYPES = frozenset(
 # accepted as-is so a newer app adding a kind doesn't brick older decoders.
 NOTE_TARGET_KINDS = frozenset({"sleep", "menstrual"})
 
+# Agent-authored note kinds — the only ones `log_note` will WRITE (iOS owns
+# sleep/menstrual). Reading is a different question: every kind above and here
+# can show up in a `get_notes` result, so a read-side filter must accept the
+# union (2026-07-27: the CLI's `notes --kind` offered only the iOS pair, so
+# there was no way to filter for the kinds this server itself writes).
+AGENT_NOTE_KINDS = frozenset({"mood", "general"})
+
+# Everything `notes_summary` / `notes --kind` may legitimately be asked to keep.
+READABLE_NOTE_KINDS = NOTE_TARGET_KINDS | AGENT_NOTE_KINDS
+
 # String forms of the three HK category-value enums the iOS reader maps
 # (HKCategoryValueSeverity / HKCategoryValuePresence / HKCategoryValueAppetiteChanges).
 # Keep in sync with VaultbeatSymptomHealthKitReader.mapValue.
@@ -1201,6 +1211,12 @@ def _local_date_fields(iso: str | None, *, with_time: bool = False) -> dict[str,
     return fields
 
 
+# Shown instead of "0h00m" on in-bed-only nights so a reader (an AI, usually)
+# can tell "sleep was never measured" from "measured, and it was zero"
+# (2026-07-27 — 60 owner-scoped nights were reporting a literal 0h00m while the
+# iOS app showed 5-12h of in-bed time for the same dates).
+_NO_SLEEP_DATA_LABEL = "no sleep data"
+
 _ERRORS_NOTE = (
     "Each entry in `errors` is ONE blob that failed to decrypt (`decrypt_failed`: "
     "usually a historical-backfill blob sealed with a stale envelope key — cosmetic) "
@@ -1284,6 +1300,64 @@ def _merge_food_meals(
             if key is not None:
                 by_name.setdefault(key, meal)
     return merged
+
+
+def _merge_strength_exercises(
+    existing: list[dict[str, Any]], new: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Append-merge for ``log_strength_entry(merge=True)``. Mirrors ``_merge_food_meals``.
+
+    A new exercise whose (case-insensitive) name matches an existing one has its
+    sets appended to that exercise; every other new exercise is appended whole.
+    Existing content is NEVER dropped — "log the one set I forgot" must not wipe
+    the rest of the session.
+
+    ``existing`` comes from the decoded cloud payload and is trusted as-is: it
+    was normalized when it was written, and re-normalizing would strip any field
+    a future iOS version adds that this normalizer predates.
+    """
+
+    merged: list[dict[str, Any]] = [
+        dict(exercise, sets=list(exercise.get("sets") or []))
+        for exercise in existing
+        if isinstance(exercise, dict)
+    ]
+    by_name: dict[str, dict[str, Any]] = {}
+    for exercise in merged:
+        name = exercise.get("name")
+        if isinstance(name, str) and name.strip():
+            by_name.setdefault(name.strip().casefold(), exercise)
+    for exercise in new:
+        name = exercise.get("name")
+        key = name.strip().casefold() if isinstance(name, str) and name.strip() else None
+        target = by_name.get(key) if key is not None else None
+        if target is not None:
+            target["sets"].extend(exercise.get("sets") or [])
+        else:
+            merged.append(exercise)
+            if key is not None:
+                by_name.setdefault(key, exercise)
+    return merged
+
+
+def _resolve_note(supplied: str | None, existing: Any) -> str | None:
+    """Decide the note to persist on an upsert that rewrites a whole day.
+
+    ``None`` means "leave the note alone" — an agent that omits the argument is
+    saying nothing about the note, not asking to erase it. Passing an empty or
+    whitespace-only string is the explicit way to clear it.
+
+    Before 2026-07-28 every writer did `note.strip() if isinstance(note, str)
+    and note.strip() else None`, so any call that did not re-send the note
+    silently destroyed it — 07-27's session lost `'腿日 + 腹肌'` that way. The
+    surrounding writes are whole-day replacements, which makes the omission
+    especially easy: you resend the data you care about and the note evaporates.
+    """
+
+    if supplied is None:
+        return existing if isinstance(existing, str) and existing.strip() else None
+    stripped = supplied.strip()
+    return stripped or None
 
 
 def summarize_water_intake(days: list[WaterDay]) -> dict[str, Any]:
@@ -1776,6 +1850,15 @@ def _select_primary_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, A
       2. hasStageDetail beats non-hasStageDetail (Watch beats iPhone)
       3. longer totalSleepMinutes beats shorter
       4. earlier bedtime wins (tie-break)
+
+    In-bed-only nights (Watch not worn — no actual-sleep stage anywhere in the
+    night) keep the honest `total_sleep_minutes: 0`, but must NOT read as "slept
+    0 hours": `is_in_bed_only` is surfaced, `duration_label` says
+    `"no sleep data"` instead of `"0h00m"`, and `in_bed_minutes` carries what
+    was actually measured. Mirrors the iOS assembler's F2 rule that the in-bed
+    number "MUST be labelled 'in bed', never as sleep" — iOS substitutes it into
+    its duration, this layer reports it as a separate field so an AI reading the
+    output can tell "not measured" from "measured zero" (2026-07-27).
     """
 
     by_date: dict[str, list[dict[str, Any]]] = {}
@@ -1795,14 +1878,20 @@ def _select_primary_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, A
               if s.get("bedtime") else 0),
         ))
         h, m = divmod(best["total_sleep_minutes"], 60)
+        in_bed_only = bool(best.get("is_in_bed_only", False))
+        stage_minutes = best.get("stage_minutes") or {}
         daily.append({
             "date": day_key,
             "total_sleep_minutes": best["total_sleep_minutes"],
-            "duration_label": f"{h}h{m:02d}m",
+            "duration_label": _NO_SLEEP_DATA_LABEL if in_bed_only else f"{h}h{m:02d}m",
+            "is_in_bed_only": in_bed_only,
+            # Same source iOS uses for its F2 fallback: the `inBed` stage only
+            # (an `awake`-only night measures no in-bed time, there as here).
+            "in_bed_minutes": int(stage_minutes.get("inBed", 0)),
             "bedtime": best.get("bedtime"),
             "wake_time": best.get("wake_time"),
             "has_stage_detail": best.get("has_stage_detail"),
-            "stage_minutes": best.get("stage_minutes"),
+            "stage_minutes": stage_minutes,
         })
 
     return daily
@@ -1860,7 +1949,10 @@ class VaultbeatLocalService:
     async def poll_once(self) -> PollBindingResult:
         config = self.store.load()
         if not config or not config.poll_id:
-            raise RuntimeError("No active binding session; run `vaultbeat-mcp-local bind` first")
+            raise RuntimeError(
+                "No active binding session; call `vaultbeat_start_binding` first, then "
+                "`vaultbeat_poll_binding` (CLI equivalent: `vaultbeat-mcp bind`)"
+            )
 
         result = await self._client(config).poll_binding(config.poll_id)
         if result.status == "bound":
@@ -1918,7 +2010,10 @@ class VaultbeatLocalService:
         server_token = config.server_token
         server_id = config.server_id or ""
         if not server_token:
-            raise RuntimeError("Local MCP server is not bound; run `vaultbeat-mcp-local bind` first")
+            raise RuntimeError(
+                "Local MCP server is not bound; call `vaultbeat_start_binding` then "
+                "`vaultbeat_poll_binding` (CLI equivalent: `vaultbeat-mcp bind`)"
+            )
 
         if not fresh:
             cached = self.cache.load(server_id=server_id, metric_type=metric_type)
@@ -2052,21 +2147,31 @@ class VaultbeatLocalService:
                 payload = record.payload
                 session = payload.get("session", payload)
                 samples = session.get("samples", [])
-                stage_minutes: dict[str, int] = {}
+                # Accumulate SECONDS, truncate once per stage. The old code ran
+                # int(seconds / 60) on EVERY sample and summed the truncated
+                # minutes, throwing away up to 59s per sample — across 315
+                # nights that came out ~6.8 min short on average, 17 min at
+                # worst (2026-07-27). Per-stage (not per-total) truncation keeps
+                # the invariant total_sleep_minutes == Σ asleep* stage_minutes,
+                # which matters more here than the last ~2 min: both numbers sit
+                # in the same object and an AI reading them compares them.
+                stage_seconds: dict[str, float] = {}
                 for sample in samples:
                     stage = sample.get("stage", "unknown")
                     start = sample.get("startDate", "")
                     end = sample.get("endDate", "")
+                    secs = 0.0
                     if start and end:
                         try:
                             t0 = datetime.fromisoformat(start.replace("Z", "+00:00"))
                             t1 = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                            mins = max(int((t1 - t0).total_seconds() / 60), 0)
+                            secs = max((t1 - t0).total_seconds(), 0.0)
                         except (ValueError, TypeError):
-                            mins = 0
-                    else:
-                        mins = 0
-                    stage_minutes[stage] = stage_minutes.get(stage, 0) + mins
+                            secs = 0.0
+                    stage_seconds[stage] = stage_seconds.get(stage, 0.0) + secs
+                stage_minutes: dict[str, int] = {
+                    stage: int(secs / 60) for stage, secs in stage_seconds.items()
+                }
 
                 actual_sleep_stages = {
                     "asleepCore", "asleepDeep", "asleepREM", "asleepUnspecified"
@@ -2140,16 +2245,25 @@ class VaultbeatLocalService:
 
     async def sleep_detail_records(
         self, *, limit: int | None = None, fresh: bool = False,
-        owner: str | None = None,
+        owner: str | None = None, include_timeline: bool = False,
     ) -> dict[str, Any]:
         """Return per-night time-aligned HR + RR + sleep stage data.
 
         Each vital-sign sample is tagged with the sleep stage active at that
         moment.  Output is one object per night (primary session only), sorted
-        newest-first, each containing a chronological ``timeline`` array.
+        newest-first.
 
         *owner*: if given, only include records whose ``owner_user_id`` starts
         with this prefix (e.g. ``"dce9b9cf"`` or ``"f8350dfc"``).
+
+        *include_timeline*: the per-sample ``timeline`` array is ~80% of this
+        payload — roughly 13k characters PER NIGHT, so the old ``limit=5``
+        default returned ~66k characters and blew past a 25k-token MCP client
+        budget at ``limit=4`` (2026-07-28). It is off by default: the derived
+        ``stage_intervals`` / ``stage_minutes`` / ``stage_vitals`` answer most
+        sleep questions without it. Turn it on only when you actually need
+        sample-level HR/RR, and keep ``limit`` small when you do. The timeline
+        is still computed either way — ``stage_vitals`` is aggregated from it.
         """
 
         records, errors = await self._records_for_metric(METRIC_SLEEP, limit=None, fresh=fresh)
@@ -2210,29 +2324,43 @@ class VaultbeatLocalService:
                 except (ValueError, TypeError):
                     local_date = sd_raw[:10] if sd_raw else ""
 
-                total_sleep_min = 0
-                for s in samples:
-                    stage = s.get("stage", "")
-                    if stage in actual_sleep_stages:
-                        try:
-                            t0 = datetime.fromisoformat(s["startDate"].replace("Z", "+00:00"))
-                            t1 = datetime.fromisoformat(s["endDate"].replace("Z", "+00:00"))
-                            total_sleep_min += max(int((t1 - t0).total_seconds() / 60), 0)
-                        except (ValueError, TypeError, KeyError):
-                            pass
-
+                # One pass over the samples building intervals AND durations.
+                # Was two near-identical loops, each swallowing malformed
+                # samples with a bare `pass` — the only place in this file that
+                # dropped bad data without telling anyone. Malformed samples now
+                # land in `errors` like everywhere else, collapsed to one line
+                # per night so a single bad blob can't flood the list
+                # (2026-07-27).
+                # Durations accumulate in SECONDS and truncate once per stage;
+                # the old per-sample int(seconds / 60) ran ~6.8 min short per
+                # night on average (same fix as sleep_records above).
                 stage_intervals: list[tuple[float, float, str]] = []
-                stage_minutes: dict[str, int] = {}
+                stage_seconds: dict[str, float] = {}
+                malformed_samples = 0
+                last_sample_error: Exception | None = None
                 for s in samples:
                     try:
                         t0 = datetime.fromisoformat(s["startDate"].replace("Z", "+00:00"))
                         t1 = datetime.fromisoformat(s["endDate"].replace("Z", "+00:00"))
                         stg = s.get("stage", "unknown")
                         stage_intervals.append((t0.timestamp(), t1.timestamp(), stg))
-                        mins = max(int((t1 - t0).total_seconds() / 60), 0)
-                        stage_minutes[stg] = stage_minutes.get(stg, 0) + mins
-                    except (ValueError, TypeError, KeyError):
-                        pass
+                        secs = max((t1 - t0).total_seconds(), 0.0)
+                        stage_seconds[stg] = stage_seconds.get(stg, 0.0) + secs
+                    except (ValueError, TypeError, KeyError, AttributeError) as sample_error:
+                        malformed_samples += 1
+                        last_sample_error = sample_error
+                if last_sample_error is not None:
+                    errors.append(
+                        f"{record.envelope_id}: parse_failed "
+                        f"({malformed_samples} sleep sample(s) skipped; last: "
+                        f"{type(last_sample_error).__name__}: {last_sample_error})"
+                    )
+                stage_minutes = {
+                    stage: int(secs / 60) for stage, secs in stage_seconds.items()
+                }
+                total_sleep_min = sum(
+                    v for k, v in stage_minutes.items() if k in actual_sleep_stages
+                )
                 stage_intervals.sort(key=lambda x: x[0])
 
                 stage_intervals_out: list[dict[str, str]] = []
@@ -2293,6 +2421,14 @@ class VaultbeatLocalService:
                     "bedtime": _to_local_short(session.get("bedtime", "")),
                     "wake_time": _to_local_short(session.get("wakeTime", "")),
                     "total_sleep_minutes": total_sleep_min,
+                    # Same "0h00m is a lie on a Watch-less night" fix as
+                    # _select_primary_sessions — see its docstring.
+                    "duration_label": (
+                        _NO_SLEEP_DATA_LABEL
+                        if is_in_bed_only
+                        else "{}h{:02d}m".format(*divmod(total_sleep_min, 60))
+                    ),
+                    "in_bed_minutes": int(stage_minutes.get("inBed", 0)),
                     "has_stage_detail": has_stage_detail,
                     "is_in_bed_only": is_in_bed_only,
                     "stage_minutes": stage_minutes,
@@ -2325,9 +2461,20 @@ class VaultbeatLocalService:
         if limit is not None:
             result_nights = result_nights[:limit]
 
+        if not include_timeline:
+            # Drop after primary-session selection so the choice still sees every
+            # field it ranks on. Safe to mutate: these dicts are rebuilt per call
+            # (the cache holds decrypted records, not this summary).
+            for night in result_nights:
+                night.pop("timeline", None)
+
         summary = {
             "nights": result_nights,
             "count": len(result_nights),
+            # Say so explicitly — otherwise a caller that read about `timeline`
+            # in the tool description sees it missing and re-queries with
+            # fresh=True chasing a sync problem that does not exist.
+            "timeline_included": include_timeline,
         }
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
@@ -2338,14 +2485,19 @@ class VaultbeatLocalService:
         records, errors = await self._records_for_metric(METRIC_WATER, limit=None, fresh=fresh)
         if owner:
             records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
-        if limit is not None:
-            records = records[:limit]
         days: list[WaterDay] = []
         for record in records:
             try:
                 days.append(parse_water_day(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        # Business-time sort before the cut (see activity_summary's comment).
+        # 2026-07-27: this kind still cut `records` by created_at BEFORE parsing,
+        # so a backfill batch could drop the newest days — same bug the other
+        # eight kinds had fixed on 2026-07-24.
+        days.sort(key=lambda d: d.day_start_date, reverse=True)
+        if limit is not None:
+            days = days[:limit]
         summary = summarize_water_intake(days)
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
@@ -2364,14 +2516,20 @@ class VaultbeatLocalService:
         records, errors = await self._records_for_metric(METRIC_BODY, limit=None, fresh=fresh)
         if owner:
             records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
-        if limit is not None:
-            records = records[:limit]
         days: list[BodyDay] = []
         for record in records:
             try:
                 days.append(parse_body_day(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        # Business-time sort before the cut (see activity_summary's comment).
+        # 2026-07-27: reproduced on live data — get_weight_trend(limit=10,
+        # owner="dce9") silently dropped the real 2026-07-21 weigh-in (83.0 kg)
+        # while keeping the older 07-10 one, because the created_at cut landed
+        # before the parse.
+        days.sort(key=lambda d: d.day_start_date, reverse=True)
+        if limit is not None:
+            days = days[:limit]
         summary = summarize_weight_trend(days, goal_kg=goal_kg)
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
@@ -2387,21 +2545,26 @@ class VaultbeatLocalService:
         records, errors = await self._records_for_metric(METRIC_MENSTRUAL, limit=None, fresh=fresh)
         if owner:
             records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
-        if limit is not None:
-            records = records[:limit]
         if not records:
             _LOG.info("no menstrual envelopes present (likely not opted in on iOS)")
         else:
             _LOG.info("decoding %d menstrual envelope(s); sensitive, kept local", len(records))
         days: list[MenstrualDay] = []
-        menstrual_owners: set[str] = set()
         for record in records:
             try:
                 days.append(parse_menstrual_day(record.payload, owner_user_id=record.owner_user_id))
-                if record.owner_user_id:
-                    menstrual_owners.add(record.owner_user_id)
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        # Business-time sort before the cut (see activity_summary's comment).
+        # 2026-07-27: this kind still cut `records` by created_at BEFORE parsing,
+        # so a backfill batch could hide the most recent cycle days — and the
+        # prediction is only as good as the newest bleeding day it can see.
+        days.sort(key=lambda d: d.day_start_date, reverse=True)
+        if limit is not None:
+            days = days[:limit]
+        # Owners come from the days that survived the cut, so the wrist-temp
+        # calibration guard below judges the same window it is calibrating.
+        menstrual_owners = {d.owner_user_id for d in days if d.owner_user_id}
         wrist_readings = await self._wrist_readings_for_owner(menstrual_owners, errors, fresh=fresh)
         summary = summarize_menstrual_cycle(days, wrist_readings=wrist_readings)
         _attach_errors(summary, errors)
@@ -2642,17 +2805,17 @@ class VaultbeatLocalService:
     async def basal_energy_records(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent basal-energy-burned samples (Watch BMR estimate, kcal).
 
-        Watch typically emits hourly samples, so a `limit` of ~168 covers a week.
-        Groups by local calendar day for a daily-BMR view (usually 1500-2000
-        kcal for an active young adult). Combine with `get_activity`'s
-        `active_energy_kcal` for a proper TDEE (see `total_energy_burned`).
+        Watch emits many samples per day, so `limit` caps SAMPLES, not days —
+        leave it None (the MCP tool's default) and let the daily aggregation
+        below do the summarising. Groups by local calendar day for a daily-BMR
+        view (usually 1500-2000 kcal for an active young adult). Combine with
+        `get_activity`'s `active_energy_kcal` for a proper TDEE (see
+        `total_energy_burned`).
         """
 
         records, errors = await self._records_for_metric(METRIC_BASAL_ENERGY, limit=None, fresh=fresh)
         if owner:
             records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
-        if limit is not None:
-            records = records[:limit]
 
         parsed: list[BasalEnergyRecord] = []
         for record in records:
@@ -2660,6 +2823,14 @@ class VaultbeatLocalService:
                 parsed.append(parse_basal_energy_record(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+
+        # Business-time sort before the cut (see activity_summary's comment).
+        # 2026-07-27: this kind still cut `records` by created_at BEFORE parsing,
+        # which on a backfill batch throws away the newest samples and makes the
+        # per-day sums below silently short.
+        parsed.sort(key=lambda r: r.date, reverse=True)
+        if limit is not None:
+            parsed = parsed[:limit]
 
         # Group by LOCAL calendar day. The old `r.date[:10]` cut took the UTC
         # date prefix, which for a UTC+8 user mis-filed every sample between
@@ -2843,11 +3014,12 @@ class VaultbeatLocalService:
     async def notes_summary(
         self, *, limit: int | None = None, target_kind: str | None = None, fresh: bool = False
     ) -> dict[str, Any]:
-        """Return recent free-text notes grouped by target kind (sleep/menstrual).
+        """Return recent free-text notes grouped by target kind.
 
-        Notes are written manually in Vaultbeat by either partner; each carries its
-        writer (owner_user_id). Sensitive free text — decoded locally, never
-        re-exported.
+        Kinds: "sleep"/"menstrual" are written manually in Vaultbeat by either
+        partner; "mood"/"general" are agent-authored via `log_note`. Each note
+        carries its writer (owner_user_id). Sensitive free text — decoded
+        locally, never re-exported.
         """
 
         records, errors = await self._records_for_metric(METRIC_NOTE, limit=limit, fresh=fresh)
@@ -2891,6 +3063,7 @@ class VaultbeatLocalService:
         date: str,
         exercises: list[dict[str, Any]],
         note: str | None = None,
+        merge: bool = False,
     ) -> dict[str, Any]:
         """Encrypt and upsert one strength-training session on the owner's behalf.
 
@@ -2903,6 +3076,20 @@ class VaultbeatLocalService:
         — see StrengthOwnBlobPullClient) and for this MCP server (so a later
         `get_strength_log` sees it immediately).
 
+        Two write modes, mirroring `log_food_entry` (2026-07-28):
+        - `merge=False` (default, back-compat): the supplied exercises REPLACE
+          the day's exercises. `replaced_exercises` in the result names every
+          exercise this call removed, so a caller that did not mean to replace
+          can see the damage instead of guessing.
+        - `merge=True`: the supplied exercises are APPENDED to the day's existing
+          ones; an exercise whose name matches an existing one gets its sets
+          appended to it (see `_merge_strength_exercises`). Nothing already
+          logged can be lost.
+
+        `note=None` LEAVES THE EXISTING NOTE ALONE — pass `note=""` to clear it.
+        Until 2026-07-28 omitting the note erased it, which is how 07-27's
+        session silently lost `'腿日 + 腹肌'`.
+
         Requires a bind that carried owner identity through the handshake
         (owner_user_id / owner_public_key_base64 / owner_device_id) — a bind
         from before this feature shipped predates that and must re-bind.
@@ -2912,7 +3099,6 @@ class VaultbeatLocalService:
 
         requested_day = _date_type.fromisoformat(date)
         normalized_exercises = _normalize_strength_exercises(exercises)
-        cleaned_note = note.strip() if isinstance(note, str) and note.strip() else None
 
         config = self.store.require_bound()
         server_token = config.server_token
@@ -2925,12 +3111,19 @@ class VaultbeatLocalService:
         ):
             raise RuntimeError(
                 "This bind predates the agent write path (missing owner identity/device). "
-                "Run `vaultbeat-mcp-local bind` again to re-pair."
+                # Name the MCP tools first: the caller is usually a pure MCP client
+                # that cannot run a shell command at all, and until 2026-07-28 this
+                # only offered the CLI, sending agents off to debug an install that
+                # was never broken. `vaultbeat-mcp-local` is the back-compat alias;
+                # `vaultbeat-mcp` is the real console script (see pyproject.toml).
+                "Re-pair with `vaultbeat_start_binding`, then `vaultbeat_poll_binding` "
+                "(CLI equivalent: `vaultbeat-mcp bind`)."
             )
 
         existing_summary = await self.strength_summary(fresh=True)
         existing_entry_id: str | None = None
         existing_created_at: str | None = None
+        existing_session: dict[str, Any] | None = None
         for session in existing_summary.get("sessions", []):
             session_date_raw = session.get("date")
             if not isinstance(session_date_raw, str):
@@ -2942,7 +3135,30 @@ class VaultbeatLocalService:
             if session_day == requested_day:
                 existing_entry_id = session.get("entry_id")
                 existing_created_at = session.get("created_at")
+                existing_session = session
                 break
+
+        replaced_exercises: list[str] = []
+        if merge and existing_session is not None:
+            existing_exercises = existing_session.get("exercises")
+            normalized_exercises = _merge_strength_exercises(
+                existing_exercises if isinstance(existing_exercises, list) else [],
+                normalized_exercises,
+            )
+        elif existing_session is not None:
+            # Replace mode on a day that already has data: report exactly what is
+            # about to disappear. The caller is an LLM that cannot see the day it
+            # is overwriting, and a silent whole-day replace is how 07-27's
+            # session lost exercises (see `merge`'s docstring).
+            replaced_exercises = [
+                str(exercise.get("name"))
+                for exercise in (existing_session.get("exercises") or [])
+                if isinstance(exercise, dict) and exercise.get("name")
+            ]
+
+        cleaned_note = _resolve_note(
+            note, existing_session.get("note") if existing_session else None
+        )
 
         now_iso_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         entry_id = existing_entry_id or ("strength-" + secrets.token_hex(16))
@@ -3001,6 +3217,11 @@ class VaultbeatLocalService:
             "entry_id": entry_id,
             "date": requested_day.isoformat(),
             "updated_existing_day": existing_entry_id is not None,
+            "merge_mode": merge,
+            # Names this call deleted (replace mode over a day that had data).
+            # Empty in merge mode and on a fresh day. Surfaced because the caller
+            # is an LLM with no view of the day it just overwrote.
+            "replaced_exercises": replaced_exercises,
             "server_response": server_response,
             "session": session,
         }
@@ -3048,7 +3269,11 @@ class VaultbeatLocalService:
           whole day.
         - ``merge=True``: the supplied meals are APPENDED to the day's existing
           meals (same-name meals get their items appended; see
-          ``_merge_food_meals``). ``note=None`` keeps the existing day note.
+          ``_merge_food_meals``).
+
+        ``note=None`` keeps the existing day note in BOTH modes (2026-07-28; it
+        used to be preserved only under ``merge=True``, so a replace-mode call
+        that omitted the note erased it silently). Pass ``note=""`` to clear it.
 
         Requires a bind that carried owner identity through the handshake — a
         bind from before this feature shipped predates that and must re-bind.
@@ -3058,7 +3283,6 @@ class VaultbeatLocalService:
 
         requested_day = _date_type.fromisoformat(date)
         normalized_meals = _normalize_food_meals(meals)
-        cleaned_note = note.strip() if isinstance(note, str) and note.strip() else None
 
         config = self.store.require_bound()
         server_token = config.server_token
@@ -3071,7 +3295,13 @@ class VaultbeatLocalService:
         ):
             raise RuntimeError(
                 "This bind predates the agent write path (missing owner identity/device). "
-                "Run `vaultbeat-mcp-local bind` again to re-pair."
+                # Name the MCP tools first: the caller is usually a pure MCP client
+                # that cannot run a shell command at all, and until 2026-07-28 this
+                # only offered the CLI, sending agents off to debug an install that
+                # was never broken. `vaultbeat-mcp-local` is the back-compat alias;
+                # `vaultbeat-mcp` is the real console script (see pyproject.toml).
+                "Re-pair with `vaultbeat_start_binding`, then `vaultbeat_poll_binding` "
+                "(CLI equivalent: `vaultbeat-mcp bind`)."
             )
 
         existing_summary = await self.food_summary(fresh=True)
@@ -3092,15 +3322,25 @@ class VaultbeatLocalService:
                 existing_day = day
                 break
 
+        replaced_meals: list[str] = []
         if merge and existing_day is not None:
             existing_meals = existing_day.get("meals")
             normalized_meals = _merge_food_meals(
                 existing_meals if isinstance(existing_meals, list) else [], normalized_meals
             )
-            if cleaned_note is None:
-                existing_note = existing_day.get("note")
-                if isinstance(existing_note, str) and existing_note.strip():
-                    cleaned_note = existing_note
+        elif existing_day is not None:
+            # Replace mode over a day that already has meals: name what is about
+            # to be deleted. Same reasoning as log_strength_entry — the caller
+            # cannot see the day it is overwriting.
+            replaced_meals = [
+                str(meal.get("name") or "(unnamed)")
+                for meal in (existing_day.get("meals") or [])
+                if isinstance(meal, dict)
+            ]
+
+        # Note preservation is NOT merge-only (2026-07-28): omitting the note in
+        # replace mode used to erase it too, which is the same silent-loss bug.
+        cleaned_note = _resolve_note(note, existing_day.get("note") if existing_day else None)
 
         now_iso_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         entry_id = existing_entry_id or ("food-" + secrets.token_hex(16))
@@ -3160,6 +3400,9 @@ class VaultbeatLocalService:
             "date": requested_day.isoformat(),
             "updated_existing_day": existing_entry_id is not None,
             "merge_mode": merge,
+            # Meals this call deleted (replace mode over a day that had data).
+            # Empty in merge mode and on a fresh day.
+            "replaced_meals": replaced_meals,
             "server_response": server_response,
             "day": day,
         }
@@ -3204,7 +3447,13 @@ class VaultbeatLocalService:
         ):
             raise RuntimeError(
                 "This bind predates the agent write path (missing owner identity/device). "
-                "Run `vaultbeat-mcp-local bind` again to re-pair."
+                # Name the MCP tools first: the caller is usually a pure MCP client
+                # that cannot run a shell command at all, and until 2026-07-28 this
+                # only offered the CLI, sending agents off to debug an install that
+                # was never broken. `vaultbeat-mcp-local` is the back-compat alias;
+                # `vaultbeat-mcp` is the real console script (see pyproject.toml).
+                "Re-pair with `vaultbeat_start_binding`, then `vaultbeat_poll_binding` "
+                "(CLI equivalent: `vaultbeat-mcp bind`)."
             )
 
         if weight_kg <= 0 or weight_kg > 500:
@@ -3281,6 +3530,7 @@ class VaultbeatLocalService:
         text: str,
         kind: str = "general",
         date: str | None = None,
+        merge: bool = False,
     ) -> dict[str, Any]:
         """Encrypt and upsert one agent-authored note on the owner's behalf.
 
@@ -3295,18 +3545,32 @@ class VaultbeatLocalService:
         with an app-authored note for the same day and confuse dedup).
 
         `date` = LOCAL calendar day "YYYY-MM-DD" (default today). One
-        agent-authored note per (kind, local day): logging the same kind+day
-        again reuses the noteID and overwrites in place — to APPEND to an
-        existing note, `get_notes` first and resend the combined text.
+        agent-authored note per (kind, local day), so the same kind+day reuses
+        the noteID and rewrites that one note. Two write modes, mirroring
+        `log_food_entry` / `log_strength_entry` (2026-07-28):
+        - `merge=False` (default, back-compat): `text` REPLACES the day's note.
+          `replaced_text` in the result carries whatever this call destroyed, so
+          a caller that did not mean to replace can see it instead of guessing.
+        - `merge=True`: `text` is APPENDED to the existing note for that
+          (kind, day), newline-separated. Nothing already logged can be lost.
+
+        Merge matters most for `kind="general"`, which is where symptoms land
+        (CLAUDE.md rule: log any symptom the owner mentions). Discomfort arrives
+        in installments across a day — 恶心 at noon, 头晕 at night — so the
+        second write of the day is the norm, not the exception. Until
+        2026-07-28 this tool had no merge and the docstring pushed
+        read-modify-write onto the caller; an agent that had just learned
+        `merge=True` from the food/strength tools would reasonably assume the
+        same here and silently erase the morning's symptoms.
+
         Sealed for owner + this MCP server (own AI only, no partner fan-out).
         """
 
         from datetime import date as _date_type
 
-        allowed_kinds = {"mood", "general"}
-        if kind not in allowed_kinds:
+        if kind not in AGENT_NOTE_KINDS:
             raise ValueError(
-                f"unsupported note kind {kind!r}; expected one of {sorted(allowed_kinds)} "
+                f"unsupported note kind {kind!r}; expected one of {sorted(AGENT_NOTE_KINDS)} "
                 "(sleep/menstrual notes are iOS-authored)"
             )
         cleaned_text = text.strip() if isinstance(text, str) else ""
@@ -3325,12 +3589,19 @@ class VaultbeatLocalService:
         ):
             raise RuntimeError(
                 "This bind predates the agent write path (missing owner identity/device). "
-                "Run `vaultbeat-mcp-local bind` again to re-pair."
+                # Name the MCP tools first: the caller is usually a pure MCP client
+                # that cannot run a shell command at all, and until 2026-07-28 this
+                # only offered the CLI, sending agents off to debug an install that
+                # was never broken. `vaultbeat-mcp-local` is the back-compat alias;
+                # `vaultbeat-mcp` is the real console script (see pyproject.toml).
+                "Re-pair with `vaultbeat_start_binding`, then `vaultbeat_poll_binding` "
+                "(CLI equivalent: `vaultbeat-mcp bind`)."
             )
 
         # Upsert key: an existing agent-authored note for the same (kind, day).
         existing_note_id: str | None = None
         existing_created_at: str | None = None
+        existing_text: str | None = None
         existing_summary = await self.notes_summary(target_kind=kind, fresh=True)
         for kind_group in existing_summary.get("kinds", []):
             for note_row in kind_group.get("notes", []):
@@ -3344,9 +3615,25 @@ class VaultbeatLocalService:
                 if parsed_day == requested_day:
                     existing_note_id = note_row.get("note_id")
                     existing_created_at = note_row.get("created_at")
+                    row_text = note_row.get("text")
+                    existing_text = (
+                        row_text if isinstance(row_text, str) and row_text.strip() else None
+                    )
                     break
             if existing_note_id:
                 break
+
+        replaced_text: str | None = None
+        if merge and existing_text is not None:
+            # Append, newline-separated. `parse_note` rejects an empty text, so a
+            # decoded existing note always has real content to keep.
+            cleaned_text = f"{existing_text}\n{cleaned_text}"
+        elif existing_text is not None:
+            # Replace mode over a day that already had a note: hand back exactly
+            # what is being destroyed. The caller is an LLM that cannot see the
+            # note it is overwriting, and silence is why this class of loss stays
+            # invisible for weeks (see log_strength_entry's `replaced_exercises`).
+            replaced_text = existing_text
 
         now_iso_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         note_id = existing_note_id or ("note-" + secrets.token_hex(16))
@@ -3409,6 +3696,11 @@ class VaultbeatLocalService:
             "kind": kind,
             "date": requested_day.isoformat(),
             "updated_existing_note": existing_note_id is not None,
+            "merge_mode": merge,
+            # The note text this call deleted (replace mode over a day that had
+            # one). None in merge mode and on a fresh day. Surfaced because the
+            # caller is an LLM with no view of the note it just overwrote.
+            "replaced_text": replaced_text,
             "server_response": server_response,
             "note": written,
         }

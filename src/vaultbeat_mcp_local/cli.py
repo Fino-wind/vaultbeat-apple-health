@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from vaultbeat_mcp_local import __version__
-from vaultbeat_mcp_local.service import KNOWN_METRIC_TYPES, VaultbeatLocalService
+from vaultbeat_mcp_local.service import (
+    KNOWN_METRIC_TYPES,
+    READABLE_NOTE_KINDS,
+    VaultbeatLocalService,
+)
 from vaultbeat_mcp_local.store import DEFAULT_API_BASE_URL, ConfigStore, write_secret_file
 
 
@@ -169,6 +173,11 @@ def handle_sleep_detail(args: argparse.Namespace) -> int:
     result = asyncio.run(_service(args).sleep_detail_records(
         limit=args.limit, fresh=args.fresh,
         owner=getattr(args, "owner", None),
+        # CLI keeps the timeline (2026-07-28): it defaults to off for MCP callers
+        # because the array is ~13k characters/night and overflows an LLM context,
+        # but this output goes to a file or a terminal where size is not a budget.
+        # This subcommand's own help text promises the timeline.
+        include_timeline=True,
     ))
     _emit_decrypted(result, args, label="sleep detail (HR+RR+stage timeline)")
     return 0 if not result.get("errors") else 3
@@ -355,7 +364,7 @@ def handle_serve(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="vaultbeat-mcp-local")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    parser.add_argument("--config", help="Path to config JSON. Defaults to ~/.vaultbeat/mcp-local/config.json.")
+    parser.add_argument("--config", help="Path to config JSON. Defaults to ~/.tether/mcp-local/config.json.")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -600,7 +609,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     notes_parser = subparsers.add_parser(
         "notes",
-        help="Decrypt recent free-text notes (sleep/menstrual annotations, sensitive).",
+        help=(
+            "Decrypt recent free-text notes (iOS sleep/menstrual annotations and "
+            "agent-authored mood/general notes, sensitive)."
+        ),
     )
     notes_parser.add_argument("--limit", type=int)
     notes_parser.add_argument(
@@ -609,7 +621,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bypass the local record cache and force a cloud fetch.",
     )
     notes_parser.add_argument(
-        "--kind", choices=["sleep", "menstrual"], help="Keep only one target kind."
+        # 2026-07-27: was choices=["sleep", "menstrual"] — the iOS-authored pair
+        # only, so the mood/general notes this server writes itself were
+        # unfilterable. Read side takes the union of both sets.
+        "--kind", choices=sorted(READABLE_NOTE_KINDS), help="Keep only one target kind."
     )
     notes_parser.add_argument("--output")
     notes_parser.set_defaults(func=handle_notes)
@@ -691,7 +706,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except Exception as error:
-        parser.exit(1, f"error: {error}\n")
+        # Always name the exception type. Several failures this CLI actually hits
+        # stringify to nothing — `httpx.ReadTimeout` is the worst of them, and it
+        # is also the most common (Supabase edge cold starts). Printing only
+        # `str(error)` turned three consecutive cold-backup failures on
+        # 2026-07-27 into a bare `error:` with zero diagnostic content; finding
+        # the cause meant bypassing this handler and calling `args.func(args)` by
+        # hand to see the traceback.
+        detail = str(error)
+        kind = type(error).__name__
+        parser.exit(1, f"error: {kind}: {detail}\n" if detail else f"error: {kind}\n")
 
 
 if __name__ == "__main__":
