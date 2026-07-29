@@ -25,7 +25,16 @@ import json
 from pathlib import Path
 from typing import Any
 
-from tests.test_service import (  # type: ignore[import-not-found]
+# `from test_service import`, NOT `from tests.test_service import`.
+#
+# tests/ has no __init__.py, so it is not a package; pytest makes sibling
+# modules importable by inserting THIS directory into sys.path. The dotted form
+# additionally needs the project root on sys.path, which is true under
+# `python -m pytest` (it adds the cwd) and false under `uv run pytest` — the
+# command CI actually uses. So the dotted import passed locally 218/218 and
+# failed every CI run from the first push, for four commits, until the owner
+# noticed the GitHub email. Verify test changes with `uv run --frozen pytest`.
+from test_service import (  # type: ignore[import-not-found]
     FakeCloudClient,
     _bound_service,
     _make_envelope,
@@ -299,3 +308,56 @@ def test_local_digest_matches_the_servers_arithmetic(tmp_path: Path) -> None:
     )
 
     assert local == server_digest
+
+
+# ── doctor: client version freshness ─────────────────────────────────────────
+#
+# Why this lives here rather than in a server-side test: the upgrade prompt is
+# generated ENTIRELY on the client. PyPI hands over one version string; every
+# word the user's agent reads is hardcoded in service.py. The rejected design
+# was a server-supplied `notice` string — that would write arbitrary text into
+# the agent's context, and this server exposes write tools while the agent
+# usually has filesystem/shell MCPs attached too. These tests pin the safe
+# shape: a comparison of two version numbers, nothing more.
+
+
+def _doctor_version_check(service: object) -> dict:
+    report = asyncio.run(service.doctor())  # type: ignore[attr-defined]
+    return next(c for c in report["checks"] if c["name"] == "client_version")
+
+
+def test_doctor_flags_an_outdated_client(tmp_path: Path, monkeypatch) -> None:
+    service, _, _ = _catalog_service(tmp_path)
+    monkeypatch.setenv("VAULTBEAT_MCP_FAKE_LATEST", "999.0.0")
+
+    check = _doctor_version_check(service)
+
+    assert check["ok"] is False
+    assert "999.0.0 available" in check["detail"]
+    # The remedy must be in the hint — a user told "you are behind" with no
+    # command to run learns nothing actionable.
+    assert "uvx --refresh vaultbeat-mcp" in check["hint"]
+
+
+def test_doctor_passes_when_client_is_current(tmp_path: Path, monkeypatch) -> None:
+    from vaultbeat_mcp_local import __version__ as installed
+
+    service, _, _ = _catalog_service(tmp_path)
+    monkeypatch.setenv("VAULTBEAT_MCP_FAKE_LATEST", installed)
+
+    check = _doctor_version_check(service)
+
+    assert check["ok"] is True
+    assert "latest" in check["detail"]
+
+
+def test_doctor_does_not_fail_when_pypi_is_unreachable(tmp_path: Path, monkeypatch) -> None:
+    """An offline machine still has a working install. A diagnostic that cries
+    wolf about the network is one people learn to ignore."""
+    service, _, _ = _catalog_service(tmp_path)
+    monkeypatch.setenv("VAULTBEAT_MCP_FAKE_LATEST", "")
+
+    check = _doctor_version_check(service)
+
+    assert check["ok"] is True
+    assert "could not reach PyPI" in check["detail"]
