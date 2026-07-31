@@ -70,7 +70,11 @@ Debugging: `npx @modelcontextprotocol/inspector uvx vaultbeat-mcp serve --transp
 
 Then just ask your agent: *“How did we sleep last night?”*
 
-## MCP tools (16)
+<!-- Keep this count in step with the table below: 19 read + 4 write + 2 bind + doctor = 26.
+     The get_hrv_hourly row is a granularity argument to get_hrv, not a 27th registered tool.
+     This said (16) until 2026-07-31 while the table already listed all 26 — directory listings
+     render the heading, not the table, so the stale number was the public-facing one. -->
+## MCP tools (26)
 
 | Tool | Returns |
 |---|---|

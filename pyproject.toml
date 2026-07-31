@@ -9,10 +9,23 @@ description = "Local MCP server for Vaultbeat — AI Health Sync: your AI agent 
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "cryptography>=42.0.0,<47.0.0",
+  # Lower bounds are SECURITY floors, not "oldest version that imports". Directory
+  # listings run dependency scanners against this range and publish the verdict next
+  # to the product name — mcp-marketplace showed "Use Caution / High Risk, 8 known
+  # CVEs" on 2026-07-31, which for an E2EE health product is the worst possible
+  # badge to wear. Both floors below were raised that day after confirming each
+  # advisory against osv.dev directly (the scanner's claim was accurate).
+  #
+  # cryptography: the old ceiling was <47.0.0, which excluded 48.0.1 — the fix for
+  # the vulnerable OpenSSL shipped inside the wheels. The range could not resolve to
+  # a clean version at all, so raising the floor REQUIRED raising the ceiling too.
+  "cryptography>=48.0.1,<50.0.0",
   "httpx>=0.28.0,<1.0.0",
   "keyring>=24",
-  "mcp>=1.13.0,<2.0.0",
+  # mcp: 1.27.2 fixes "HTTP transports serve session requests without validation"
+  # and 1.28.1 the WebSocket transport. Not academic here — `serve --transport http`
+  # is a supported mode of this very server. Ceiling stays <2.0.0 (2.x is a major).
+  "mcp>=1.28.1,<2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +44,16 @@ dev = [
 qr = [
   "qrcode>=8.0.0,<9.0.0",
 ]
+
+# Without these, PyPI shows no link back to the source — which a directory scanner
+# flags outright ("PyPI package has no GitHub URL", mcp-marketplace 2026-07-31).
+# For a server whose entire pitch is "audit the crypto yourself", a listing with no
+# route to the code undercuts the claim.
+[project.urls]
+Homepage = "https://vaultbeat.app"
+Repository = "https://github.com/Fino-wind/vaultbeat-mcp"
+Issues = "https://github.com/Fino-wind/vaultbeat-community/issues"
+Documentation = "https://vaultbeat.app/mcp"
 
 [project.scripts]
 vaultbeat-mcp = "vaultbeat_mcp_local.cli:main"
