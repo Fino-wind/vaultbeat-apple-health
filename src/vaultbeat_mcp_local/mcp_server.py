@@ -362,6 +362,16 @@ def run_mcp_server(
         when you DO estimate nutrition at logging time, put the numbers in the
         structured fields (snake_case aliases like `protein_g` are accepted) —
         they persist for later sessions instead of being re-guessed each read.
+
+        ESTIMATING FROM A PHOTO: look for something of known size in the frame
+        first — a utensil, a hand, a coin, the rim of a standard plate — and
+        calibrate the portion against it. With no such reference an image cannot
+        settle portion size, and portion size is what the whole estimate rests
+        on. In that case say so in your reply and give a range rather than a
+        precise-looking number. These values are persisted and summed into daily
+        totals later, so a confident "650 kcal" that is wrong does more damage
+        than "roughly 500-700, nothing in frame to judge size by" — the first
+        silently poisons a week of trends, the second invites a correction.
         Encrypted end-to-end before it ever leaves this machine.
         """
 
