@@ -104,7 +104,33 @@ def handle_bind(args: argparse.Namespace) -> int:
         )
     )
     if result.status != "bound":
-        print("Binding is still pending. Re-run `vaultbeat-mcp-local poll` to continue.")
+        # Until 0.2.8 this said only "still pending, re-run poll", which tells a
+        # first-time reader nothing. `uvx vaultbeat-mcp` installs cleanly for
+        # anyone, so the people who reach this line are usually the ones who
+        # never read the README — and the reason no scan arrived is almost
+        # always that the phone side is not ready.
+        #
+        # Naming the Pro requirement is the part that matters: it is the one
+        # prerequisite that cannot be discovered by poking at the app, because
+        # the MCP screen is visible on every tier (the explainer is deliberately
+        # free — only the connect action is gated).
+        #
+        # The App Store link deliberately carries the numeric id and NO slug.
+        # The slug follows the app's display name, so the ones written across
+        # the site, the public README and research-facts.json all still say
+        # `tether-ai-health-sync` and will break on the rename; id-only never
+        # does.
+        print("Binding is still pending — nothing scanned this within the timeout.")
+        print()
+        print("What the phone side needs:")
+        print("  1. Vaultbeat for iOS, with a PRO subscription. The MCP connection")
+        print("     is Pro-only — Free and Plus accounts cannot complete a pairing.")
+        print("     https://apps.apple.com/app/id6759241985")
+        print("  2. In the app: Settings -> Data & AI -> MCP Server")
+        print("  3. Scan the QR above from that screen.")
+        print()
+        print("Already did all of that? Re-run `vaultbeat-mcp-local poll` to resume")
+        print("this pairing — it does not need a fresh QR.")
         return 2
 
     print(f"Bound local MCP server: {result.server_id}")
