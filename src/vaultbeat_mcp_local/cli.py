@@ -32,7 +32,12 @@ def _print_qr(payload: str) -> None:
     try:
         import qrcode  # type: ignore[import-untyped]
     except ModuleNotFoundError:
-        print("Install with `pip install 'vaultbeat-mcp-local[qr]'` to render an ASCII QR code.")
+        # The PACKAGE is `vaultbeat-mcp`; `vaultbeat-mcp-local` is only a console
+        # script alias kept for pre-rename installs. `pip install
+        # 'vaultbeat-mcp-local[qr]'` therefore cannot resolve at all — it names a
+        # distribution that has never existed on PyPI.
+        print("To render an ASCII QR code here, install the qr extra:")
+        print("  uvx --from 'vaultbeat-mcp[qr]' vaultbeat-mcp bind    (or: pip install 'vaultbeat-mcp[qr]')")
         return
 
     qr = qrcode.QRCode(border=2)
@@ -129,8 +134,27 @@ def handle_bind(args: argparse.Namespace) -> int:
         print("  2. In the app: Settings -> Data & AI -> MCP Server")
         print("  3. Scan the QR above from that screen.")
         print()
-        print("Already did all of that? Re-run `vaultbeat-mcp-local poll` to resume")
-        print("this pairing — it does not need a fresh QR.")
+        # The resume window is NOT open-ended, and saying so matters more than it
+        # looks. `bind` gives up at --timeout (300s), but the server row lives for
+        # 600s (mcp-bind-local sets expires_at = now + 600000), so resuming works
+        # for about five more minutes and then stops working — silently, because
+        # mcp-poll-binding deletes the expired row and still answers
+        # `status: "pending"`. A user who followed the three steps above (install,
+        # subscribe, scan) has almost certainly burned those five minutes, so the
+        # unqualified "it does not need a fresh QR" that used to be here sent
+        # exactly the wrong person into re-running poll forever.
+        #
+        # The command is `vaultbeat-mcp`, not `vaultbeat-mcp-local`. That alias
+        # exists for pre-rename installs, but the documented install path
+        # everywhere (site, skill.md, README) is `uvx vaultbeat-mcp` — and uvx
+        # resolves entry points by PACKAGE name, so `uvx vaultbeat-mcp-local poll`
+        # fails outright with "not found in the package registry". Printing it to
+        # the one reader who by definition has not read the README was the worst
+        # possible place to get this wrong.
+        print("Already scanned it? For the next ~5 minutes you can resume this")
+        print("pairing without a new QR:")
+        print("  uvx vaultbeat-mcp poll")
+        print("After that it expires — just run `uvx vaultbeat-mcp bind` again.")
         return 2
 
     print(f"Bound local MCP server: {result.server_id}")
@@ -359,7 +383,7 @@ def handle_serve(args: argparse.Namespace) -> int:
         config = store.load()
         stored = config.http_token if config else None
         if not stored:
-            print("No HTTP token set. Run `vaultbeat-mcp-local serve --generate-token` first.")
+            print("No HTTP token set. Run `vaultbeat-mcp serve --generate-token` first.")
             return 1
         print(stored)
         return 0
@@ -388,7 +412,10 @@ def handle_serve(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="vaultbeat-mcp-local")
+    # `--help` is where a stuck user checks what this thing is called. Reporting
+    # the deprecated alias there sent them toward a name that `uvx` — the only
+    # install path the docs give — cannot resolve.
+    parser = argparse.ArgumentParser(prog="vaultbeat-mcp")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--config", help="Path to config JSON. Defaults to ~/.tether/mcp-local/config.json.")
 
