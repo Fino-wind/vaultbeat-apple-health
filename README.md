@@ -85,7 +85,7 @@ Then just ask your agent: *“How did we sleep last night?”*
 | `vaultbeat_sync_sleep` | Recent sleep sessions incl. heart-rate samples, per-day primary-session selection matching the iOS app |
 | `get_sleep_detail` | Per-night heart-rate + respiratory-rate + sleep-stage timeline |
 | `get_water_intake` | Daily water intake + computed daily average |
-| `get_weight_trend` | Daily weights + latest/avg/min/max + weekly trend rate |
+| `get_weight_trend` | Daily weights + latest/avg/min/max + weekly trend rate, plus body composition (`body_fat_percent` 0–100, `bmi`, `lean_body_mass_kg`) when a smart scale wrote it into Apple Health |
 | `get_menstrual_cycle` | Cycle samples + next-period prediction *(sensitive — explicit iOS opt-in required)* |
 | `get_symptoms` | HealthKit symptom days grouped by data owner *(sensitive)* |
 | `get_notes` | Free-text day annotations with their writer *(sensitive)* |
@@ -101,7 +101,7 @@ Then just ask your agent: *“How did we sleep last night?”*
 | `get_total_energy_burned` | **TDEE** — basal + active per day, measured rather than estimated, with today flagged partial and excluded from the average |
 | `get_strength_log` | Structured strength training: exercise, sets, reps, weight per day |
 | `get_food_log` | Meals as free text with optional portions and timing |
-| `log_weight_entry` | **Write** a weight entry (optionally mirrored into Apple Health when the user opts in) |
+| `log_weight_entry` | **Write** a weight entry (optionally mirrored into Apple Health when the user opts in). Carries over that day's existing body composition instead of erasing it — an agent cannot supply fat/BMI/lean mass, so a bare weight log must not wipe what the scale recorded |
 | `log_strength_entry` | **Write** a strength-training entry for a given day (`merge=True` to append) |
 | `log_food_entry` | **Write** a meal entry for a given day (`merge=True` to append) |
 | `log_note` | **Write** a mood or general note for a given day (`merge=True` to append) |

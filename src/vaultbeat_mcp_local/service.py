@@ -235,8 +235,13 @@ class BodyDay:
 
     Body weight is shared bidirectionally by default (like sleep, unlike menstrual's
     explicit opt-in). Storage is always kilograms; unit conversion (jin/lb) happens
-    only in presentation layers. bodyFatPercent and bmi are reserved fields the iOS
-    payload (VaultbeatBodySharedCloudPayload) currently always sends as null.
+    only in presentation layers.
+
+    Composition (fat / BMI / lean mass) is populated only when a smart scale wrote
+    those samples into Apple Health and iOS read them. They were null on every blob
+    until 2026-08-05 — not by design, but because no iOS reader asked HealthKit for
+    them while this decoder had parsed them since day one. `body_fat_percent` is
+    0–100, converted once on the iOS read edge from HealthKit's native 0–1.
     """
 
     day_id: str
@@ -244,6 +249,7 @@ class BodyDay:
     weight_kg: float
     body_fat_percent: float | None
     bmi: float | None
+    lean_body_mass_kg: float | None = None
     owner_user_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -254,6 +260,7 @@ class BodyDay:
             "weight_kg": self.weight_kg,
             "body_fat_percent": self.body_fat_percent,
             "bmi": self.bmi,
+            "lean_body_mass_kg": self.lean_body_mass_kg,
             "owner_user_id": self.owner_user_id,
         }
 
@@ -725,8 +732,9 @@ def parse_body_day(payload: Any, *, owner_user_id: str | None = None) -> BodyDay
     """Decode a decrypted body blob into a typed BodyDay (no aggregation).
 
     Wire contract mirrors iOS VaultbeatBodySharedCloudPayload:
-    {dayID, dayStartDate, weightKg, bodyFatPercent, bmi} — weightKg required (kg),
-    bodyFatPercent/bmi nullable reserved fields (currently always null from iOS).
+    {dayID, dayStartDate, weightKg, bodyFatPercent, bmi, leanBodyMassKg} —
+    weightKg required (kg); the three composition fields are nullable and absent
+    on any blob written before the field existed (add-only, 2026-08-05).
     """
 
     data = _require_mapping(payload, METRIC_BODY)
@@ -739,6 +747,7 @@ def parse_body_day(payload: Any, *, owner_user_id: str | None = None) -> BodyDay
         weight_kg=float(weight),
         body_fat_percent=_optional_number(data, "bodyFatPercent", METRIC_BODY),
         bmi=_optional_number(data, "bmi", METRIC_BODY),
+        lean_body_mass_kg=_optional_number(data, "leanBodyMassKg", METRIC_BODY),
         owner_user_id=owner_user_id,
     )
 
@@ -3691,12 +3700,35 @@ class VaultbeatLocalService:
         day_start_epoch = int(day_start_local.timestamp())
         day_id = f"body-{day_start_epoch}"
 
+        # Invariant 41 (no-silent-day-erasure): this rewrites the day's WHOLE blob,
+        # so anything the caller did not mention has to be carried over. Body
+        # composition arrives from a smart scale via HealthKit and an agent has no
+        # way to supply it — while those fields were always null (before iOS began
+        # reading them on 2026-08-05) overwriting them was free; now a bare weight
+        # log would silently wipe that day's scale reading.
+        # Not wrapped in try/except on purpose, matching log_food_entry: failing
+        # loudly beats writing a blob that quietly drops data.
+        preserved: dict[str, float | None] = {
+            "bodyFatPercent": None,
+            "bmi": None,
+            "leanBodyMassKg": None,
+        }
+        existing_summary = await self.weight_trend_summary(fresh=True, owner=config.owner_user_id)
+        for day in existing_summary.get("days", []):
+            if day.get("day_id") != day_id:
+                continue
+            preserved = {
+                "bodyFatPercent": day.get("body_fat_percent"),
+                "bmi": day.get("bmi"),
+                "leanBodyMassKg": day.get("lean_body_mass_kg"),
+            }
+            break
+
         plaintext_obj = {
             "dayID": day_id,
             "dayStartDate": day_start_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
             "weightKg": float(weight_kg),
-            "bodyFatPercent": None,
-            "bmi": None,
+            **preserved,
         }
         plaintext_bytes = json.dumps(plaintext_obj, ensure_ascii=False).encode("utf-8")
 
@@ -3744,6 +3776,9 @@ class VaultbeatLocalService:
             "day_id": day_id,
             "date": requested_day.isoformat(),
             "weight_kg": weight_kg,
+            # Says what this write carried over rather than overwrote, so a caller
+            # can see that the day's scale composition survived (Invariant 41).
+            "preserved_composition": preserved,
             "server_response": server_response,
             "latest_after_write": latest,
         }
