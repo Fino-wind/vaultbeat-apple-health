@@ -425,7 +425,9 @@ def test_summarize_water_intake_dedups_by_day_id() -> None:
     assert summary["average_daily_intake_liters"] == 8.0  # 4 refills * 2.0 L
 
 
-def test_parse_body_day_decodes_weight_and_reserved_nulls() -> None:
+def test_parse_body_day_decodes_weight_when_composition_is_absent() -> None:
+    """A pre-2026-08-05 blob has no composition at all — not even the keys."""
+
     day = parse_body_day(
         {
             "dayID": "body-1",
@@ -438,6 +440,33 @@ def test_parse_body_day_decodes_weight_and_reserved_nulls() -> None:
     assert day.weight_kg == 82.5
     assert day.body_fat_percent is None
     assert day.bmi is None
+    # add-only: the field the payload never carried decodes as None, not a crash
+    assert day.lean_body_mass_kg is None
+
+
+def test_parse_body_day_decodes_full_scale_composition() -> None:
+    """What a smart scale actually produces once iOS reads all four types.
+
+    body_fat_percent is 0–100 here because iOS converts HealthKit's native 0–1
+    fraction once, at the read edge — this asserts the decoder does NOT convert
+    a second time.
+    """
+
+    day = parse_body_day(
+        {
+            "dayID": "body-1",
+            "dayStartDate": "2026-08-05T00:00:00Z",
+            "weightKg": 83.1,
+            "bodyFatPercent": 22.4,
+            "bmi": 24.9,
+            "leanBodyMassKg": 64.5,
+        }
+    )
+    assert day.weight_kg == 83.1
+    assert day.body_fat_percent == 22.4
+    assert day.bmi == 24.9
+    assert day.lean_body_mass_kg == 64.5
+    assert day.to_dict()["lean_body_mass_kg"] == 64.5
 
 
 def test_parse_body_day_requires_numeric_weight() -> None:
@@ -1898,6 +1927,79 @@ def test_log_food_entry_rejects_bad_nutrition_values(tmp_path: Path) -> None:
         raise AssertionError("non-numeric protein should raise")
     except ValueError as error:
         assert "non-numeric" in str(error)
+
+
+def _body_day_id_for(year: int, month: int, day: int) -> str:
+    """The dayID log_weight_entry will compute for that LOCAL calendar day."""
+
+    local_tz = datetime.now().astimezone().tzinfo
+    return f"body-{int(datetime(year, month, day, tzinfo=local_tz).timestamp())}"
+
+
+def test_log_weight_entry_preserves_scale_composition(tmp_path: Path, monkeypatch: Any) -> None:
+    """Invariant 41: a bare weight log must not wipe that day's scale reading.
+
+    Before iOS read body-composition samples (2026-08-05) these fields were
+    always null, so this whole-day overwrite was free. The moment a scale starts
+    populating them, `log_weight_entry` becomes a silent eraser unless it carries
+    them over — an agent has no way to supply fat/BMI/lean mass itself.
+    """
+
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+    day_id = _body_day_id_for(2026, 8, 5)
+
+    # Only the FIRST read (the carry-over lookup) is faked; the verification read
+    # afterwards runs for real, so the assertion below decrypts what was actually
+    # sealed. Asserting the returned `preserved_composition` instead does NOT
+    # work — it is a value this method computes, so it stays correct even if the
+    # plaintext drops it (verified: breaking the spread left that test green).
+    real_summary = service.weight_trend_summary
+    reads = {"n": 0}
+
+    async def _summary(**kwargs: Any) -> dict[str, Any]:
+        reads["n"] += 1
+        if reads["n"] == 1:
+            return {
+                "days": [
+                    {
+                        "day_id": day_id,
+                        "weight_kg": 83.1,
+                        "body_fat_percent": 22.4,
+                        "bmi": 24.9,
+                        "lean_body_mass_kg": 64.5,
+                    }
+                ]
+            }
+        return await real_summary(**kwargs)
+
+    monkeypatch.setattr(service, "weight_trend_summary", _summary)
+
+    asyncio.run(service.log_weight_entry(weight_kg=82.6, date="2026-08-05"))
+    assert cloud.write_calls[-1]["blob"]["metric_type"] == "body"
+
+    # Round-trip: read the blob back through real decryption.
+    written = asyncio.run(real_summary(fresh=True))
+    same_day = [d for d in written["days"] if d["day_id"] == day_id]
+    assert same_day, "the weight blob just written should read back"
+    assert same_day[0]["weight_kg"] == 82.6, "the new weight must land"
+    assert same_day[0]["body_fat_percent"] == 22.4, "scale body fat was erased by a bare weight log"
+    assert same_day[0]["bmi"] == 24.9
+    assert same_day[0]["lean_body_mass_kg"] == 64.5
+
+
+def test_log_weight_entry_writes_null_composition_when_the_day_is_new(tmp_path: Path) -> None:
+    """The other half: nothing to carry over must not invent values."""
+
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    result = asyncio.run(service.log_weight_entry(weight_kg=82.6, date="2026-08-05"))
+
+    assert result["preserved_composition"] == {
+        "bodyFatPercent": None,
+        "bmi": None,
+        "leanBodyMassKg": None,
+    }
+    assert cloud.write_calls[-1]["blob"]["metric_type"] == "body"
 
 
 def test_log_note_creates_and_round_trips(tmp_path: Path) -> None:
