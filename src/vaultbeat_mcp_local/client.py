@@ -11,6 +11,41 @@ class VaultbeatCloudError(RuntimeError):
     pass
 
 
+class VaultbeatRecordNotAgentWritableError(VaultbeatCloudError):
+    """This day is sealed for a recipient this MCP server cannot re-seal for.
+
+    Happens to users with a bound partner: iOS seals `.allVisible` kinds (body,
+    water, sleep, menstrual) for the PARTNER's MCP server too, and a write
+    endpoint only ever holds the public key of the server that authenticated it
+    — so rewriting the row here would leave the partner's AI permanently unable
+    to read it. The server refuses (409) rather than damage it, which is
+    correct; what was missing until 2026-08-07 is that the refusal reached the
+    agent as a bare `HTTP 409 error=…` with no action attached.
+
+    The wording is generated HERE, never echoed from the server: a server-chosen
+    sentence reaching an agent's context is a prompt-injection channel by
+    construction (Anti-pattern 23). The server sends facts (an error code, a
+    list of recipient kinds); the client turns them into instructions.
+    """
+
+    def __init__(self, uncoverable_kinds: list[str] | None = None) -> None:
+        self.uncoverable_kinds = uncoverable_kinds or []
+        who = {
+            "partner_user": "your partner",
+            "mcp_server": "another AI server (likely your partner's)",
+        }
+        named = [who.get(k, k) for k in self.uncoverable_kinds]
+        audience = f" ({', '.join(named)})" if named else ""
+        super().__init__(
+            "This day is already shared with a recipient this server cannot "
+            f"re-encrypt for{audience}, so it cannot be rewritten from here — "
+            "doing so would leave them unable to read it. "
+            "Edit this day in the Vaultbeat iOS app instead; the app can seal "
+            "for every recipient. Days that only you can see (strength, food, "
+            "notes) are unaffected."
+        )
+
+
 class VaultbeatUnsupportedMetricError(VaultbeatCloudError):
     """The server does not recognise a metric type this client knows about.
 
@@ -76,12 +111,30 @@ class VaultbeatCloudClient:
     MAX_TRANSIENT_RETRIES = 2
     RETRY_BACKOFF_SECONDS = 0.5
 
-    # Platform-layer statuses worth one more try. These come from the gateway
-    # in FRONT of the edge function (cold start, brief unavailability), not
-    # from our code — our functions answer errors as JSON with an `error`
-    # field. Every endpoint this client talks to is idempotent (reads, or
-    # upserts keyed by blob id), so retrying a POST is safe.
+    # Platform-layer statuses worth one more try. Mostly the gateway in FRONT
+    # of the edge function (cold start, brief unavailability) — though not
+    # exclusively: `mcpWrite.ts` itself answers 503 when its auth backend is
+    # unreachable, so "503 means our code never ran" is an assumption, not a
+    # guarantee. Retrying is still right for those: they are transient by
+    # construction and the write is an idempotent upsert keyed by blob id.
     RETRYABLE_STATUS_CODES = frozenset({502, 503, 504})
+
+    # 🔴 Endpoints that MUST NOT be retried, whatever the failure looks like.
+    #
+    # `mcp-poll-binding` is consume-on-read: it deletes the pending row with a
+    # DELETE ... RETURNING and hands back the ONLY plaintext copy of the
+    # serverToken (the database keeps a PBKDF2 hash). If the response is lost
+    # in transit — precisely the ProxyError/ReadError class this retry exists
+    # for — a replay finds the row gone and gets `status: "expired"`. That
+    # turns a binding that ACTUALLY SUCCEEDED into a permanent failure: the
+    # token is unrecoverable, and the server row created before the poll is
+    # left orphaned. The retry is the difference between "re-scan the QR" and
+    # "the token no longer exists anywhere".
+    #
+    # Found 2026-08-07 by an adversarial audit of the commit that introduced
+    # retries — whose own comment claimed every endpoint here was idempotent.
+    # Verify that claim against each endpoint's semantics, not its HTTP verb.
+    NON_IDEMPOTENT_PATHS = frozenset({"/mcp-poll-binding"})
 
     def __init__(
         self,
@@ -144,11 +197,15 @@ class VaultbeatCloudClient:
             httpx.RemoteProtocolError,
         )
 
+        # A consume-on-read endpoint gets exactly one attempt: replaying it
+        # after a lost response destroys state the first attempt consumed.
+        max_attempts = 1 if path in self.NON_IDEMPOTENT_PATHS else 1 + self.MAX_TRANSIENT_RETRIES
+
         last_error: Exception | None = None
         async with httpx.AsyncClient(
             timeout=self._timeout(), transport=self._transport
         ) as client:
-            for attempt in range(1 + self.MAX_TRANSIENT_RETRIES):
+            for attempt in range(max_attempts):
                 if attempt > 0:
                     await asyncio.sleep(self.RETRY_BACKOFF_SECONDS * attempt)
                 try:
@@ -164,13 +221,17 @@ class VaultbeatCloudClient:
                     continue
                 if (
                     response.status_code in self.RETRYABLE_STATUS_CODES
-                    and attempt < self.MAX_TRANSIENT_RETRIES
+                    and attempt < max_attempts - 1
                 ):
-                    last_error = None
+                    # Not cleared: if the NEXT attempt dies with a transport
+                    # error, the raise below should still be able to name the
+                    # 5xx that preceded it rather than reporting only the last
+                    # symptom of a mixed sequence.
+                    last_error = VaultbeatCloudError(f"HTTP {response.status_code}")
                     continue
                 return response
         raise VaultbeatCloudError(
-            f"Cloud request failed after {1 + self.MAX_TRANSIENT_RETRIES} attempts: "
+            f"Cloud request failed after {max_attempts} attempt(s): "
             f"{type(last_error).__name__ if last_error else 'transient error'}: {last_error}"
         ) from last_error
 
@@ -440,6 +501,15 @@ class VaultbeatCloudClient:
             # instead of failing the whole read. The edge echoes back both the
             # rejected value and its allowlist, so carry them for a precise
             # message.
+            # Same shape as below: a code the client can act on gets its own
+            # type and its own LOCALLY-generated wording. `uncoverable_recipient_kinds`
+            # is an enum list, not prose — safe to read.
+            if error_code == "envelope_recipients_not_coverable" and isinstance(payload, dict):
+                kinds = payload.get("uncoverable_recipient_kinds")
+                raise VaultbeatRecordNotAgentWritableError(
+                    [str(k) for k in kinds] if isinstance(kinds, list) else None
+                )
+
             if error_code == "invalid_metric_type" and isinstance(payload, dict):
                 allowed = payload.get("allowed")
                 raise VaultbeatUnsupportedMetricError(
