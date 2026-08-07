@@ -2,7 +2,7 @@
 
 **Let your own AI agent read your health data — without the cloud ever seeing it.**
 
-This is the official local [MCP](https://modelcontextprotocol.io) server for [Vaultbeat — AI Health Sync](https://apps.apple.com/us/app/tether-ai-health-sync/id6759241985) (formerly named *Tether*), the iOS app that syncs Apple Health data (sleep, heart rate, menstrual cycle, weight, water, symptoms) between partners and to your own AI — end-to-end encrypted.
+This is the official local [MCP](https://modelcontextprotocol.io) server for [Vaultbeat — AI Health Sync](https://apps.apple.com/app/id6759241985) (formerly named *Tether*), the iOS app that syncs Apple Health data (sleep, heart rate, menstrual cycle, weight, water, symptoms) between partners and to your own AI — end-to-end encrypted.
 
 Vaultbeat embeds no AI and runs no model on your phone. Intelligence lives where you control it: Claude Code, Claude Desktop, or any MCP-capable agent running on your own machine. This server is the bridge — it holds a private key that never leaves your computer, pulls ciphertext from the cloud, and decrypts **only locally**.
 
@@ -12,7 +12,7 @@ iPhone (Apple Health) ──E2EE──▶ cloud (ciphertext only) ──E2EE─�
 
 ## Requirements
 
-- [Vaultbeat — AI Health Sync](https://apps.apple.com/us/app/tether-ai-health-sync/id6759241985) on iOS, with a **Pro** subscription (the AI-agent interface is the Pro tier)
+- [Vaultbeat — AI Health Sync](https://apps.apple.com/app/id6759241985) on iOS, with a **Pro** subscription (the AI-agent interface is the Pro tier)
 - Python 3.11+ on the machine where your agent runs (macOS / Linux / Windows)
 
 ## Quick start
@@ -140,6 +140,6 @@ pytest
 
 ---
 
-*Website: [vaultbeat.app](https://vaultbeat.app) · App Store: [Vaultbeat — AI Health Sync](https://apps.apple.com/us/app/tether-ai-health-sync/id6759241985) · Bugs & feedback: [vaultbeat-community](https://github.com/Fino-wind/vaultbeat-community/issues)*
+*Website: [vaultbeat.app](https://vaultbeat.app) · App Store: [Vaultbeat — AI Health Sync](https://apps.apple.com/app/id6759241985) · Bugs & feedback: [vaultbeat-community](https://github.com/Fino-wind/vaultbeat-community/issues)*
 
 <!-- mcp-name: io.github.Fino-wind/vaultbeat -->
