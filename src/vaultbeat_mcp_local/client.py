@@ -67,9 +67,34 @@ class VaultbeatCloudClient:
     # slow server, fail fast on a broken path.
     CONNECT_TIMEOUT_SECONDS = 10.0
 
-    def __init__(self, api_base_url: str, *, timeout: float = DEFAULT_TIMEOUT_SECONDS):
+    # Transient-failure retry budget. This box's uplink goes through a proxy
+    # that intermittently answers large responses with a bare 503 (logged as a
+    # Known Bug since 2026-07-29: `curl` on the same endpoint succeeds while
+    # httpx's proxied request dies with ProxyError) — catalog mode shrank the
+    # responses that trip it, but nothing retried. 2 retries × short backoff
+    # covers a flap without turning a real outage into a 3× wait.
+    MAX_TRANSIENT_RETRIES = 2
+    RETRY_BACKOFF_SECONDS = 0.5
+
+    # Platform-layer statuses worth one more try. These come from the gateway
+    # in FRONT of the edge function (cold start, brief unavailability), not
+    # from our code — our functions answer errors as JSON with an `error`
+    # field. Every endpoint this client talks to is idempotent (reads, or
+    # upserts keyed by blob id), so retrying a POST is safe.
+    RETRYABLE_STATUS_CODES = frozenset({502, 503, 504})
+
+    def __init__(
+        self,
+        api_base_url: str,
+        *,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        transport: Any | None = None,
+    ):
         self.api_base_url = api_base_url.rstrip("/")
         self.timeout = timeout
+        # Test seam only: lets the retry tests drive httpx.MockTransport
+        # through the real request path. Production callers never pass it.
+        self._transport = transport
 
     def _timeout(self) -> httpx.Timeout:
         """httpx timeout with a short connect and a long read.
@@ -85,16 +110,74 @@ class VaultbeatCloudClient:
             self.timeout, connect=min(self.CONNECT_TIMEOUT_SECONDS, self.timeout)
         )
 
-    async def poll_binding(self, poll_id: str) -> PollBindingResult:
-        # httpx is imported lazily so the CLI's cache-hit path (no network)
-        # never pays its import cost.
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, str] | None = None,
+        json: Any | None = None,
+    ) -> "httpx.Response":
+        """One HTTP call with transient-failure retries.
+
+        Retries (up to MAX_TRANSIENT_RETRIES, linear backoff):
+        - `httpx.ProxyError` / `ConnectError` / `ReadError` /
+          `RemoteProtocolError` — the connection-layer flaps a proxied uplink
+          produces. NOT timeouts: `ReadTimeout` means the 90s read budget was
+          genuinely spent, and paying it again on an edge cold-start would turn
+          one slow call into three.
+        - HTTP 502/503/504 — gateway-layer, before our code ran.
+
+        Anything else (4xx, our own JSON errors, timeouts) surfaces exactly as
+        before — `_decode_response` stays the single interpreter.
+        """
+
+        import asyncio
+
         import httpx
 
-        async with httpx.AsyncClient(timeout=self._timeout()) as client:
-            response = await client.post(
-                f"{self.api_base_url}/mcp-poll-binding",
-                params={"pollID": poll_id},
-            )
+        transient_exceptions = (
+            httpx.ProxyError,
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.RemoteProtocolError,
+        )
+
+        last_error: Exception | None = None
+        async with httpx.AsyncClient(
+            timeout=self._timeout(), transport=self._transport
+        ) as client:
+            for attempt in range(1 + self.MAX_TRANSIENT_RETRIES):
+                if attempt > 0:
+                    await asyncio.sleep(self.RETRY_BACKOFF_SECONDS * attempt)
+                try:
+                    response = await client.request(
+                        method,
+                        f"{self.api_base_url}{path}",
+                        headers=headers,
+                        params=params,
+                        json=json,
+                    )
+                except transient_exceptions as error:
+                    last_error = error
+                    continue
+                if (
+                    response.status_code in self.RETRYABLE_STATUS_CODES
+                    and attempt < self.MAX_TRANSIENT_RETRIES
+                ):
+                    last_error = None
+                    continue
+                return response
+        raise VaultbeatCloudError(
+            f"Cloud request failed after {1 + self.MAX_TRANSIENT_RETRIES} attempts: "
+            f"{type(last_error).__name__ if last_error else 'transient error'}: {last_error}"
+        ) from last_error
+
+    async def poll_binding(self, poll_id: str) -> PollBindingResult:
+        response = await self._request(
+            "POST", "/mcp-poll-binding", params={"pollID": poll_id}
+        )
         payload = self._decode_response(response)
         status = str(payload.get("status", "pending"))
         return PollBindingResult(
@@ -117,17 +200,15 @@ class VaultbeatCloudClient:
         always safe (an optimization, never a correctness dependency).
         """
 
-        import httpx
-
         params: dict[str, str] = {}
         if metric_type:
             params["metric_type"] = metric_type
-        async with httpx.AsyncClient(timeout=self._timeout()) as client:
-            response = await client.get(
-                f"{self.api_base_url}/mcp-sync",
-                headers={"Authorization": f"Bearer {server_token}"},
-                params=params,
-            )
+        response = await self._request(
+            "GET",
+            "/mcp-sync",
+            headers={"Authorization": f"Bearer {server_token}"},
+            params=params,
+        )
         payload = self._decode_response(response)
         envelopes = payload.get("envelopes", [])
         if not isinstance(envelopes, list):
@@ -153,17 +234,15 @@ class VaultbeatCloudClient:
         legacy path rather than failing a read.
         """
 
-        import httpx
-
         params: dict[str, str] = {"fields": "digest"}
         if metric_type:
             params["metric_type"] = metric_type
-        async with httpx.AsyncClient(timeout=self._timeout()) as client:
-            response = await client.get(
-                f"{self.api_base_url}/mcp-sync",
-                headers={"Authorization": f"Bearer {server_token}"},
-                params=params,
-            )
+        response = await self._request(
+            "GET",
+            "/mcp-sync",
+            headers={"Authorization": f"Bearer {server_token}"},
+            params=params,
+        )
         payload = self._decode_response(response)
         digest = payload.get("digest")
         if isinstance(digest, dict):
@@ -182,17 +261,15 @@ class VaultbeatCloudClient:
         a full fetch.
         """
 
-        import httpx
-
         params: dict[str, str] = {"fields": "meta"}
         if metric_type:
             params["metric_type"] = metric_type
-        async with httpx.AsyncClient(timeout=self._timeout()) as client:
-            response = await client.get(
-                f"{self.api_base_url}/mcp-sync",
-                headers={"Authorization": f"Bearer {server_token}"},
-                params=params,
-            )
+        response = await self._request(
+            "GET",
+            "/mcp-sync",
+            headers={"Authorization": f"Bearer {server_token}"},
+            params=params,
+        )
         payload = self._decode_response(response)
         catalog = payload.get("catalog")
         if not isinstance(catalog, list):
@@ -212,27 +289,25 @@ class VaultbeatCloudClient:
         about URL limits.
         """
 
-        import httpx
-
         if not blob_ids:
             return []
         collected: list[dict[str, Any]] = []
-        async with httpx.AsyncClient(timeout=self._timeout()) as client:
-            for start in range(0, len(blob_ids), self.MAX_BLOB_IDS_PER_REQUEST):
-                chunk = blob_ids[start : start + self.MAX_BLOB_IDS_PER_REQUEST]
-                params: dict[str, str] = {"blob_ids": ",".join(chunk)}
-                if metric_type:
-                    params["metric_type"] = metric_type
-                response = await client.get(
-                    f"{self.api_base_url}/mcp-sync",
-                    headers={"Authorization": f"Bearer {server_token}"},
-                    params=params,
-                )
-                payload = self._decode_response(response)
-                envelopes = payload.get("envelopes", [])
-                if not isinstance(envelopes, list):
-                    raise VaultbeatCloudError("Cloud response has invalid envelopes shape")
-                collected.extend(row for row in envelopes if isinstance(row, dict))
+        for start in range(0, len(blob_ids), self.MAX_BLOB_IDS_PER_REQUEST):
+            chunk = blob_ids[start : start + self.MAX_BLOB_IDS_PER_REQUEST]
+            params: dict[str, str] = {"blob_ids": ",".join(chunk)}
+            if metric_type:
+                params["metric_type"] = metric_type
+            response = await self._request(
+                "GET",
+                "/mcp-sync",
+                headers={"Authorization": f"Bearer {server_token}"},
+                params=params,
+            )
+            payload = self._decode_response(response)
+            envelopes = payload.get("envelopes", [])
+            if not isinstance(envelopes, list):
+                raise VaultbeatCloudError("Cloud response has invalid envelopes shape")
+            collected.extend(row for row in envelopes if isinstance(row, dict))
         return collected
 
     async def write_strength_blob(
@@ -250,14 +325,12 @@ class VaultbeatCloudClient:
         server-side, this client is a thin transport.
         """
 
-        import httpx
-
-        async with httpx.AsyncClient(timeout=self._timeout()) as client:
-            response = await client.post(
-                f"{self.api_base_url}/mcp-write-strength",
-                headers={"Authorization": f"Bearer {server_token}"},
-                json={"blob": blob, "envelopes": envelopes},
-            )
+        response = await self._request(
+            "POST",
+            "/mcp-write-strength",
+            headers={"Authorization": f"Bearer {server_token}"},
+            json={"blob": blob, "envelopes": envelopes},
+        )
         return self._decode_response(response)
 
     async def write_food_blob(
@@ -273,14 +346,12 @@ class VaultbeatCloudClient:
         widen its blast radius into strength/sleep/etc.
         """
 
-        import httpx
-
-        async with httpx.AsyncClient(timeout=self._timeout()) as client:
-            response = await client.post(
-                f"{self.api_base_url}/mcp-write-food",
-                headers={"Authorization": f"Bearer {server_token}"},
-                json={"blob": blob, "envelopes": envelopes},
-            )
+        response = await self._request(
+            "POST",
+            "/mcp-write-food",
+            headers={"Authorization": f"Bearer {server_token}"},
+            json={"blob": blob, "envelopes": envelopes},
+        )
         return self._decode_response(response)
 
     async def write_body_blob(
@@ -293,14 +364,12 @@ class VaultbeatCloudClient:
         """Agent-write path for metric_type="body" (weight). Same shape as
         strength/food; edge fn narrows to body-only allow-list."""
 
-        import httpx
-
-        async with httpx.AsyncClient(timeout=self._timeout()) as client:
-            response = await client.post(
-                f"{self.api_base_url}/mcp-write-body",
-                headers={"Authorization": f"Bearer {server_token}"},
-                json={"blob": blob, "envelopes": envelopes},
-            )
+        response = await self._request(
+            "POST",
+            "/mcp-write-body",
+            headers={"Authorization": f"Bearer {server_token}"},
+            json={"blob": blob, "envelopes": envelopes},
+        )
         return self._decode_response(response)
 
     async def write_note_blob(
@@ -313,14 +382,12 @@ class VaultbeatCloudClient:
         """Agent-write path for metric_type="note" (mood/general annotations).
         Same shape as strength/food/body; edge fn narrows to note-only."""
 
-        import httpx
-
-        async with httpx.AsyncClient(timeout=self._timeout()) as client:
-            response = await client.post(
-                f"{self.api_base_url}/mcp-write-note",
-                headers={"Authorization": f"Bearer {server_token}"},
-                json={"blob": blob, "envelopes": envelopes},
-            )
+        response = await self._request(
+            "POST",
+            "/mcp-write-note",
+            headers={"Authorization": f"Bearer {server_token}"},
+            json={"blob": blob, "envelopes": envelopes},
+        )
         return self._decode_response(response)
 
     async def report_decrypt_failures(
@@ -351,14 +418,12 @@ class VaultbeatCloudClient:
         if not items:
             return
 
-        import httpx
-
-        async with httpx.AsyncClient(timeout=self._timeout()) as client:
-            await client.post(
-                f"{self.api_base_url}/mcp-report-decrypt-failures",
-                headers={"Authorization": f"Bearer {server_token}"},
-                json={"items": items},
-            )
+        await self._request(
+            "POST",
+            "/mcp-report-decrypt-failures",
+            headers={"Authorization": f"Bearer {server_token}"},
+            json={"items": items},
+        )
 
     @staticmethod
     def _decode_response(response: "httpx.Response") -> dict[str, Any]:
