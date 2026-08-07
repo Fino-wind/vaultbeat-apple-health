@@ -3728,6 +3728,25 @@ class VaultbeatLocalService:
             "dayID": day_id,
             "dayStartDate": day_start_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
             "weightKg": float(weight_kg),
+            # ── Two fields iOS's merge needs, both added 2026-08-07 ──────────
+            #
+            # `declaredAt` is the merge AXIS. It has to live inside the sealed
+            # payload: iOS previously ordered declarations by the blob's
+            # plaintext `created_at`, which any service_role holder can bump —
+            # letting a server-side actor replay an old authentic weight into
+            # the owner's Apple Health and have the app re-upload it as that
+            # day's canonical value. Values were never forgeable; the ordering
+            # was.
+            #
+            # `localDate` is the DAY, as the writer meant it. `dayStartDate` is
+            # local midnight in THIS machine's timezone, and this machine is
+            # wherever the owner put their agent — a UTC VPS logging "today"
+            # for a Denver owner produces an instant that is the PREVIOUS day
+            # on their phone, so the merge looked for that day's samples under
+            # the wrong key and wrote past every conflict guard. A date string
+            # has no timezone to disagree about.
+            "declaredAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "localDate": requested_day.isoformat(),
             **preserved,
         }
         plaintext_bytes = json.dumps(plaintext_obj, ensure_ascii=False).encode("utf-8")
