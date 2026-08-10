@@ -49,8 +49,13 @@ pip install 'vaultbeat-mcp[qr]'
 ### 2. Bind your phone
 
 ```bash
-uvx vaultbeat-mcp@latest bind
+uvx --from 'vaultbeat-mcp[qr]@latest' vaultbeat-mcp bind
 ```
+
+The `[qr]` here is not optional cosmetics — `bind` needs it to actually draw the
+QR code. Skip it (or run the plain `uvx vaultbeat-mcp@latest bind` from step 1)
+and this step prints a one-line reminder to add `[qr]` instead of anything you
+can scan.
 
 This generates a keypair on your machine and prints a QR code. In the Vaultbeat iOS app, open **Settings → Data & AI → MCP Server** and scan it (or import a QR screenshot from Photos). The app authorizes this machine and starts sealing your health envelopes to its public key. The private key stays in `~/.tether/mcp-local/` (owner-only `0600` permissions, OS keychain where available) — it is never uploaded anywhere. (The directory keeps its original pre-rename path so existing bindings survive upgrades.)
 
