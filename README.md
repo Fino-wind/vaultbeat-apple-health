@@ -2,6 +2,13 @@
 
 **Let your own AI agent read your health data — without the cloud ever seeing it.**
 
+> ⚠️ **Skip the `pip install vaultbeat-mcp` box PyPI puts at the top of this
+> page.** Every PyPI package page gets one automatically — it isn't a
+> recommendation. Use `uvx` from Quick Start below: no separate install step,
+> and with `@latest` it always runs the current release. A bare `pip
+> install` (or a bare `uvx` without `@latest`) gets pinned to whatever was
+> current the moment you ran it and will not update itself.
+
 This is the official local [MCP](https://modelcontextprotocol.io) server for [Vaultbeat — AI Health Sync](https://apps.apple.com/app/id6759241985) (formerly named *Tether*), the iOS app that syncs Apple Health data (sleep, heart rate, menstrual cycle, weight, water, symptoms) between partners and to your own AI — end-to-end encrypted.
 
 Vaultbeat embeds no AI and runs no model on your phone. Intelligence lives where you control it: Claude Code, Claude Desktop, or any MCP-capable agent running on your own machine. This server is the bridge — it holds a private key that never leaves your computer, pulls ciphertext from the cloud, and decrypts **only locally**.
@@ -22,10 +29,16 @@ iPhone (Apple Health) ──E2EE──▶ cloud (ciphertext only) ──E2EE─�
 With [uv](https://docs.astral.sh/uv/) (recommended — no clone needed):
 
 ```bash
-uvx vaultbeat-mcp status
+uvx vaultbeat-mcp@latest status
 ```
 
-Or with pip:
+The `@latest` matters: without it, `uvx` only fetches the newest version the
+*first* time you run the tool on a machine, then reuses its local cache on
+every run after that — same as `pip`, which never updates once installed.
+Keep `@latest` on every command below.
+
+Or with pip (installs once, at whatever version is current right now — run
+`pip install --upgrade vaultbeat-mcp` yourself to pick up new releases):
 
 ```bash
 pip install 'vaultbeat-mcp[qr]'
@@ -46,7 +59,7 @@ This generates a keypair on your machine and prints a QR code. In the Vaultbeat 
 **Claude Code** (one line):
 
 ```bash
-claude mcp add vaultbeat-health -- uvx vaultbeat-mcp serve --transport stdio
+claude mcp add vaultbeat-health -- uvx vaultbeat-mcp@latest serve --transport stdio
 ```
 
 **Claude Desktop** (`claude_desktop_config.json`):
@@ -56,7 +69,7 @@ claude mcp add vaultbeat-health -- uvx vaultbeat-mcp serve --transport stdio
   "mcpServers": {
     "vaultbeat-health": {
       "command": "uvx",
-      "args": ["vaultbeat-mcp", "serve", "--transport", "stdio"]
+      "args": ["vaultbeat-mcp@latest", "serve", "--transport", "stdio"]
     }
   }
 }
@@ -66,7 +79,7 @@ Any other MCP client: run `vaultbeat-mcp serve --transport stdio`, or `serve --t
 
 > **Claude Desktop note**: it does not inherit your shell `PATH`. If `uvx` isn't found, use the absolute path (`which uvx`) as `command`.
 
-Debugging: `npx @modelcontextprotocol/inspector uvx vaultbeat-mcp serve --transport stdio`
+Debugging: `npx @modelcontextprotocol/inspector uvx vaultbeat-mcp@latest serve --transport stdio`
 
 Then just ask your agent: *“How did we sleep last night?”*
 
