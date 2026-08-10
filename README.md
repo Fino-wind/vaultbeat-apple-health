@@ -49,7 +49,7 @@ pip install 'vaultbeat-mcp[qr]'
 ### 2. Bind your phone
 
 ```bash
-vaultbeat-mcp bind
+uvx vaultbeat-mcp@latest bind
 ```
 
 This generates a keypair on your machine and prints a QR code. In the Vaultbeat iOS app, open **Settings → Data & AI → MCP Server** and scan it (or import a QR screenshot from Photos). The app authorizes this machine and starts sealing your health envelopes to its public key. The private key stays in `~/.tether/mcp-local/` (owner-only `0600` permissions, OS keychain where available) — it is never uploaded anywhere. (The directory keeps its original pre-rename path so existing bindings survive upgrades.)
@@ -75,7 +75,7 @@ claude mcp add vaultbeat-health -- uvx vaultbeat-mcp@latest serve --transport st
 }
 ```
 
-Any other MCP client: run `vaultbeat-mcp serve --transport stdio`, or `serve --transport http` for a loopback streamable-HTTP endpoint with bearer-token auth.
+Any other MCP client: run `uvx vaultbeat-mcp@latest serve --transport stdio`, or `--transport http` for a loopback streamable-HTTP endpoint with bearer-token auth.
 
 > **Claude Desktop note**: it does not inherit your shell `PATH`. If `uvx` isn't found, use the absolute path (`which uvx`) as `command`.
 
@@ -128,7 +128,7 @@ Then just ask your agent: *“How did we sleep last night?”*
 
 Every data tool accepts `owner` (a user-ID prefix) to filter to one person — the server may hold both your and your partner's shared records, and omitting `owner` mixes them into one pool, so per-person questions should always pass it. (Earlier releases named some tools `get_partner_*` / `tether_*`; they were renamed in the 16-tool and Vaultbeat releases.)
 
-Reads are cache-first: decrypted records are cached locally (owner-only files, 600 s TTL, `VAULTBEAT_MCP_CACHE_TTL` to override — the pre-rename `TETHER_MCP_*` spellings still work) so repeat queries answer in ~0.2 s with zero network; pass `fresh=true` to force a cloud round trip. The same service layer backs a full CLI (`vaultbeat-mcp sleep / water / weight / …` — every data subcommand takes `--owner` too) if you prefer scripts over MCP.
+Reads are cache-first: decrypted records are cached locally (owner-only files, 600 s TTL, `VAULTBEAT_MCP_CACHE_TTL` to override — the pre-rename `TETHER_MCP_*` spellings still work) so repeat queries answer in ~0.2 s with zero network; pass `fresh=true` to force a cloud round trip. The same service layer backs a full CLI (`uvx vaultbeat-mcp@latest sleep / water / weight / …` — every data subcommand takes `--owner` too) if you prefer scripts over MCP.
 
 ## Privacy & security model
 
