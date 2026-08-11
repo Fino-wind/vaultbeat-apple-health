@@ -1052,13 +1052,14 @@ wheels = [
 
 [[package]]
 name = "vaultbeat-mcp"
-version = "0.3.7"
+version = "0.3.10"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
     { name = "httpx" },
     { name = "keyring" },
     { name = "mcp" },
+    { name = "qrcode" },
 ]
 
 [package.optional-dependencies]
@@ -1067,9 +1068,6 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
     { name = "uvicorn" },
-]
-qr = [
-    { name = "qrcode" },
 ]
 
 [package.metadata]
@@ -1080,7 +1078,7 @@ requires-dist = [
     { name = "mcp", specifier = ">=1.28.1,<2.0.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.13.0,<2.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.0,<9.0.0" },
-    { name = "qrcode", marker = "extra == 'qr'", specifier = ">=8.0.0,<9.0.0" },
+    { name = "qrcode", specifier = ">=8.0.0,<9.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.11.0,<1.0.0" },
     { name = "uvicorn", marker = "extra == 'dev'", specifier = ">=0.30.0" },
 ]
