@@ -435,13 +435,58 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.set_defaults(func=handle_init)
 
     bind_parser = subparsers.add_parser("bind", help="Show a QR payload and wait for iOS authorization.")
-    bind_parser.add_argument("--server-name", default="Local AI Server")
-    bind_parser.add_argument("--api-base-url", default=DEFAULT_API_BASE_URL)
-    bind_parser.add_argument("--timeout", type=int, default=300)
+    # Every option carries help text because `bind` is the first command a new user
+    # runs, and until 2026-08-11 `bind --help` printed the flag names and nothing
+    # else — not even the units on --timeout. --server-name matters most: it defaults
+    # to a generic label, so a user with several machines ends up with a list of
+    # identically-named servers and no way to tell which is which.
+    bind_parser.add_argument(
+        "--server-name",
+        default="Local AI Server",
+        help=(
+            "Label shown in the iOS app's authorized-server list. Give each machine "
+            "its own name (e.g. 'work laptop') — otherwise every server you bind "
+            "carries the same default and you cannot tell them apart later, "
+            "including when deciding which one is safe to remove. "
+            "(default: %(default)s)"
+        ),
+    )
+    bind_parser.add_argument(
+        "--api-base-url",
+        default=DEFAULT_API_BASE_URL,
+        help="Vaultbeat cloud endpoint. Change only for self-hosting. (default: %(default)s)",
+    )
+    bind_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help=(
+            "SECONDS to keep the QR code valid while waiting for the phone scan. "
+            "Raise it if you need time to install the app or subscribe first. "
+            "(default: %(default)s)"
+        ),
+    )
     # 7.0s keeps polling under the cloud's 10/min IP rate limit (60/7 ≈ 8.6/min);
     # the old 3.0s default (20/min) self-tripped a 429 on first bind.
-    bind_parser.add_argument("--interval", type=float, default=7.0)
-    bind_parser.add_argument("--no-qr", action="store_true")
+    bind_parser.add_argument(
+        "--interval",
+        type=float,
+        default=7.0,
+        help=(
+            "SECONDS between checks for the scan. Lowering this is not faster — "
+            "below ~6s it trips the server's rate limit and the bind fails. "
+            "(default: %(default)s)"
+        ),
+    )
+    bind_parser.add_argument(
+        "--no-qr",
+        action="store_true",
+        help=(
+            "Print the pairing payload as text only, without the QR block. For "
+            "terminals that mangle block characters — scan it from another device "
+            "or paste it manually."
+        ),
+    )
     bind_parser.set_defaults(func=handle_bind)
 
     poll_parser = subparsers.add_parser("poll", help="Poll once for a pending iOS authorization.")

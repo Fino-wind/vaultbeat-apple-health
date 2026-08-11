@@ -5,6 +5,7 @@ import ipaddress
 import json
 from typing import Any
 
+from vaultbeat_mcp_local import __version__
 from vaultbeat_mcp_local.service import VaultbeatLocalService
 from vaultbeat_mcp_local.store import ConfigStore
 
@@ -138,14 +139,30 @@ def run_mcp_server(
 
     service = VaultbeatLocalService(store or ConfigStore())
     selected_transport = _normalize_transport(transport)
+    # This name and version are what a user SEES: every MCP client lists the server
+    # by its serverInfo. It said "Vaultbeat Local Sleep" until 2026-08-11 — a name
+    # from when sleep was the only kind — while actually serving 26 tools across 18
+    # kinds, so the listing undersold the product to the one audience already looking
+    # at it.
     mcp = FastMCP(
-        "Vaultbeat Local Sleep",
+        "Vaultbeat Health",
         host=host,
         port=port,
         streamable_http_path=_normalize_http_path(path),
         json_response=json_response,
         stateless_http=stateless_http,
     )
+
+    # FastMCP takes no `version`, and when the inner server's is None the SDK falls
+    # back to reporting ITS OWN package version — so clients showed "1.29.0" (the mcp
+    # SDK) for a user who had just installed vaultbeat-mcp 0.3.x. Wrong version numbers
+    # are worse than absent ones: they make a stale install indistinguishable from a
+    # current one, which is exactly the question `doctor` exists to answer.
+    # Guarded because it reaches past the public API — a future SDK that renames this
+    # attribute costs a cosmetic version string, never a working server.
+    inner_server = getattr(mcp, "_mcp_server", None)
+    if inner_server is not None and hasattr(inner_server, "version"):
+        inner_server.version = __version__
 
     @mcp.tool()
     def vaultbeat_status() -> dict[str, Any]:

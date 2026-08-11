@@ -2357,13 +2357,21 @@ def test_doctor_reports_capability_gap_for_an_older_app(tmp_path: Path) -> None:
     assert "possibly_needs_newer_app" in caps
 
     # The note must not present "your app is old" as THE explanation: an empty
-    # kind has three indistinguishable causes from the server's side, and the
-    # permission one is the least obvious because a HealthKit read denial is
-    # invisible to the app — it reports success and simply delivers nothing.
+    # kind has FOUR indistinguishable causes from the server's side, and the two
+    # least obvious are the ones that actually bite. A HealthKit read denial is
+    # invisible to the app — it reports success and simply delivers nothing. And a
+    # freshly bound server starts empty by design, because each server gets its own
+    # encrypted copy; that one was missing entirely until 2026-08-11, so a brand-new
+    # user — the likeliest reader of this report — was handed three dead ends.
     # Naming the recovery path matters: the paying customer who prompted this
     # had 7 kinds empty from authorization, not app age.
     note = caps["note"]
-    assert "build from the stated date or later" in note
+    assert "Re-sync" in note, "a newly bound server's history must be named as a cause"
+    assert note.index("Re-sync") < note.index("Apple Health access"), (
+        "the newly-bound cause must come FIRST — it is the one a new user hits, "
+        "and the only one fixable in seconds"
+    )
+    assert "older than the stated date" in note
     assert "Apple Health access" in note
     assert "not been recorded yet" in note
 
