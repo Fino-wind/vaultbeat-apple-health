@@ -253,7 +253,43 @@ class ConfigStore:
         if existing:
             return existing
 
-        private_key_base64, public_key_base64 = generate_x25519_keypair()
+        # config.json is gone. Before minting anything, look for THIS config
+        # path's private key in the Keychain — because `save()` below would
+        # overwrite it, and that write is the single most destructive thing in
+        # this codebase.
+        #
+        # 🔴 What it costs when it goes wrong, measured: on 2026-08-10 this
+        # function ran on fino with the Keychain still holding the key behind
+        # `a3c145ff9279`. It minted `2be19c3d72d0`, saved, and the old private
+        # key ceased to exist anywhere on earth. The 8721 envelopes sealed to
+        # the old one are unreadable by anyone, permanently — and her phone kept
+        # adding to them for a day afterwards. Invariant 54 (a) is about
+        # destroying a TOKEN (a re-bind gets it back); this destroys the KEY.
+        #
+        # A missing config with a surviving Keychain entry is not an
+        # uninitialised install — it is an install that lost one file, and the
+        # thing that actually defines its identity is still here. So recover it.
+        # The alternative that was considered and rejected: warn and refuse.
+        # Refusing leaves a user stuck behind an error they cannot action, while
+        # recovery is what they would have asked for in every case — the private
+        # key IS the identity, and re-deriving the public key from it is exact.
+        #
+        # ⚠️ This is deliberately keyed on the config PATH (`_keychain_username`
+        # embeds it), so a `--config` pointing somewhere new still gets a fresh
+        # identity. Only the path that owned the key can reclaim it.
+        recovered_private_key = _keychain_load(self.path)
+        if recovered_private_key:
+            logger.warning(
+                "Config %s is missing but its private key is still in the Keychain — "
+                "recovering the existing identity instead of generating a new one. "
+                "Minting a new keypair here would permanently orphan every envelope "
+                "already sealed to the old public key.",
+                self.path,
+            )
+            private_key_base64 = recovered_private_key
+            public_key_base64 = public_key_from_private(recovered_private_key)
+        else:
+            private_key_base64, public_key_base64 = generate_x25519_keypair()
         now = now_iso()
         config = LocalServerConfig(
             server_name=server_name.strip() or "Local AI Server",

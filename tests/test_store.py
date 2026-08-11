@@ -175,3 +175,76 @@ def test_redacted_masks_private_key(
 
     assert redacted["private_key_base64"] == "<redacted>"
     assert config.private_key_base64 not in str(redacted)
+
+
+# ---------------------------------------------------------------------------
+# ensure_initialized — the private key is the identity, so losing it is the
+# one unrecoverable failure in this codebase (P0-g)
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_initialized_recovers_the_identity_when_only_the_config_is_missing(
+    tmp_path: Path, fake_keychain: dict[tuple[str, str], str]
+) -> None:
+    """Losing config.json must NOT mint a new keypair while the old private key
+    is still in the Keychain.
+
+    This happened on fino on 2026-08-10: a new key was minted, `save()`
+    overwrote the Keychain entry, and the 8721 envelopes sealed to the previous
+    public key became unreadable by anyone, permanently — while the phone kept
+    adding to them. Invariant 54 (a) covers destroying a TOKEN, which a re-bind
+    recovers; this destroys the KEY, which nothing recovers.
+    """
+
+    config_path = tmp_path / "config.json"
+    store = ConfigStore(config_path)
+    original = store.ensure_initialized(server_name="fino")
+
+    config_path.unlink()
+    assert _keychain_username(config_path) is not None
+    assert (_KEYCHAIN_SERVICE, _keychain_username(config_path)) in fake_keychain
+
+    recovered = ConfigStore(config_path).ensure_initialized(server_name="fino")
+
+    assert recovered.private_key_base64 == original.private_key_base64
+    assert recovered.public_key_base64 == original.public_key_base64, (
+        "a new public key here orphans every envelope already sealed to the old one"
+    )
+    assert (
+        fake_keychain[(_KEYCHAIN_SERVICE, _keychain_username(config_path))]
+        == original.private_key_base64
+    )
+
+
+def test_ensure_initialized_still_mints_when_the_key_is_gone_too(
+    tmp_path: Path, fake_keychain: dict[tuple[str, str], str]
+) -> None:
+    """The opposite direction: recovery must not become "never mint a new key".
+
+    A genuinely fresh install — no config, no Keychain entry — still has to get
+    an identity, otherwise the fix for the case above would brick first-run.
+    """
+
+    config_path = tmp_path / "config.json"
+    original = ConfigStore(config_path).ensure_initialized()
+
+    config_path.unlink()
+    fake_keychain.clear()
+
+    fresh = ConfigStore(config_path).ensure_initialized()
+
+    assert fresh.public_key_base64 != original.public_key_base64
+    assert fresh.private_key_base64
+
+
+def test_ensure_initialized_gives_a_different_config_path_its_own_identity(
+    tmp_path: Path, fake_keychain: dict[tuple[str, str], str]
+) -> None:
+    """Recovery is keyed on the config PATH, which is what makes a second
+    binding profile (e.g. the status probe) possible at all — it must not
+    inherit the default install's key just because one exists."""
+
+    first = ConfigStore(tmp_path / "a" / "config.json").ensure_initialized()
+    second = ConfigStore(tmp_path / "b" / "config.json").ensure_initialized()
+
+    assert first.public_key_base64 != second.public_key_base64

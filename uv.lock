@@ -1052,7 +1052,7 @@ wheels = [
 
 [[package]]
 name = "vaultbeat-mcp"
-version = "0.2.9"
+version = "0.3.7"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

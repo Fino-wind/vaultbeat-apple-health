@@ -1978,18 +1978,25 @@ class VaultbeatLocalService:
     ) -> BindingSession:
         config = self.store.ensure_initialized(server_name=server_name, api_base_url=api_base_url)
         poll_id = secrets.token_urlsafe(24)
+        # Starting a binding session must NOT touch the existing credentials.
+        # It used to null out server_id/server_token/bound_at/last_sync_at and
+        # clear the cache right here, before anyone had scanned anything — so a
+        # session nobody completed (the common case: the phone is in the other
+        # room, the QR expires, the link blips) destroyed a working binding and
+        # said nothing about it. The cloud's token_hash was never touched, so
+        # the credential was only ever destroyed on THIS side, by the very
+        # command a user runs to repair things. That is Invariant 54 (a), and it
+        # is how fino ended up holding an all-NULL config while the server still
+        # had four live rows for it.
+        #
+        # Replacement now happens in poll_once, at the one moment a REPLACEMENT
+        # actually exists. Until then the old binding keeps working: reads
+        # served, agent writes accepted, nothing lost if the scan never comes.
         config = self.store.update(
             server_name=server_name.strip() or config.server_name,
             api_base_url=api_base_url.rstrip("/") or config.api_base_url,
             poll_id=poll_id,
-            server_id=None,
-            server_token=None,
-            bound_at=None,
-            last_sync_at=None,
         )
-        # A (re)bind may land on a different server identity; cached plaintext
-        # from the previous binding must not answer for the new one.
-        self.cache.clear()
         qr_payload = {
             "pollID": poll_id,
             "publicKeyBase64": config.public_key_base64,
@@ -2014,6 +2021,9 @@ class VaultbeatLocalService:
         if result.status == "bound":
             if not result.server_id or not result.server_token:
                 raise RuntimeError("Cloud returned bound without server credentials")
+            # This is the swap point: the old credentials are only overwritten
+            # now that a replacement is in hand (see start_binding's comment).
+            landed_on_new_identity = config.server_id != result.server_id
             self.store.update(
                 server_id=result.server_id,
                 server_token=result.server_token,
@@ -2022,17 +2032,87 @@ class VaultbeatLocalService:
                 owner_device_id=result.owner_device_id,
                 poll_id=None,
                 bound_at=now_iso(),
+                # A different identity's sync history says nothing about this
+                # one; the same identity's still does.
+                **({"last_sync_at": None} if landed_on_new_identity else {}),
             )
+            if landed_on_new_identity:
+                # Cached plaintext is keyed by server_id, but a stale file for
+                # an identity this machine no longer holds is plaintext health
+                # data with no reader — clear it. Re-binding to the SAME id
+                # (what the planned upsert makes the normal outcome) keeps its
+                # cache: same key, same private key, same records.
+                self.cache.clear()
         return result
 
+    #: Consecutive failed polls tolerated before giving up. Five ≈ 35s of an
+    #: uninterrupted outage — long enough to ride out the link's measured 2–3%
+    #: blips, short enough that a genuinely dead uplink does not make the user
+    #: watch a spinner for the full five minutes before being told.
+    POLL_CONSECUTIVE_FAILURE_LIMIT = 5
+
     async def poll_until_bound(self, *, timeout_sec: int = 300, interval_sec: float = 7.0) -> PollBindingResult:
+        """Poll until bound, surviving the blips this link actually has.
+
+        A single failed poll used to end the whole bind: the exception went
+        straight up, the user re-ran `bind`, and that produced a NEW pollID —
+        invalidating the QR they had just scanned. On a loop that runs 5–10
+        minutes at one request every 7 seconds over a link measured at ~97.3%
+        (7-day `tw`), hitting at least one blip is close to certain, so the
+        common path was failing for a reason that has nothing to do with
+        binding.
+
+        ⚠️ Note what this deliberately does NOT do: retry the request itself.
+        `/mcp-poll-binding` is consume-on-read and lives in the client's
+        NON_IDEMPOTENT_PATHS for that reason — a replay after a lost response
+        would destroy the state the first attempt consumed. This retries the
+        NEXT poll on the next tick, which is a different thing: if the request
+        never reached the server the pending row is still there to be claimed,
+        and if it did reach the server the token is gone either way and no
+        amount of retrying inside one tick would have helped. (That case is now
+        self-healing anyway — since the bind upsert, re-scanning lands on the
+        same row instead of minting an orphan.)
+        """
+
+        import httpx
+
         deadline = asyncio.get_running_loop().time() + timeout_sec
+        consecutive_failures = 0
+        last_error: Exception | None = None
+        last_result: PollBindingResult | None = None
+
         while True:
-            result = await self.poll_once()
-            if result.status == "bound":
-                return result
+            try:
+                result = await self.poll_once()
+            except (httpx.TransportError, VaultbeatCloudError) as error:
+                consecutive_failures += 1
+                last_error = error
+                _LOG.warning(
+                    "Poll attempt failed (%d/%d consecutive): %s: %s",
+                    consecutive_failures,
+                    self.POLL_CONSECUTIVE_FAILURE_LIMIT,
+                    type(error).__name__,
+                    error,
+                )
+                if consecutive_failures >= self.POLL_CONSECUTIVE_FAILURE_LIMIT:
+                    raise
+            else:
+                consecutive_failures = 0
+                last_error = None
+                last_result = result
+                if result.status == "bound":
+                    return result
+
             if asyncio.get_running_loop().time() >= deadline:
-                return result
+                if last_result is not None:
+                    return last_result
+                # Every single poll failed, so there is no status to report.
+                # Returning a synthetic "pending" here would tell the user to
+                # keep waiting for a scan when the truth is that this machine
+                # never reached the server.
+                raise last_error or RuntimeError(
+                    "Binding timed out without a single successful poll"
+                )
             await asyncio.sleep(interval_sec)
 
     async def sync_decrypted_records(
@@ -4035,7 +4115,7 @@ class VaultbeatLocalService:
             "bound", config.is_bound,
             f"server_id={config.server_id}" if config.is_bound else "not bound to an iOS app",
             hint="Run `vaultbeat-mcp bind`, then scan the QR with Vaultbeat on iOS "
-            "(Settings → Data & AI → MCP Server). Codes expire after 10 minutes — "
+            "(Settings → Data & AI → Connect an AI server). Codes expire after 10 minutes — "
             "if the phone scanned but this side stayed pending, re-run bind for a fresh code.",
         )
         # Informational only: legacy bindings predate the owner-identity
@@ -4056,16 +4136,42 @@ class VaultbeatLocalService:
                     add(
                         "data_roundtrip", False,
                         f"fetch ok but decrypt failed ({errors[0]})",
-                        hint="The stored key can no longer decrypt your data — "
-                        "delete this server in the iOS app and bind again.",
+                        # ⚠️ This used to open with "delete this server in the
+                        # iOS app and bind again", which is the one instruction
+                        # that makes the situation unrecoverable: deleting the
+                        # row fires a BEFORE DELETE trigger that takes every
+                        # envelope addressed to it (20k+ on a two-month-old
+                        # binding), and only ≤365 days of SLEEP can ever be
+                        # re-sealed by the backfill coordinator. Re-binding
+                        # alone now lands on the same row and keeps them, so
+                        # deletion buys nothing and costs the history.
+                        hint="The stored key can no longer decrypt your data. Re-run "
+                        "`vaultbeat-mcp bind` first — it re-binds this machine in place "
+                        "and keeps its history. Only delete the server in the iOS app if "
+                        "that fails: deleting also discards every record already encrypted "
+                        "for it, and that cannot be undone.",
                     )
                 else:
                     add("data_roundtrip", True, f"decrypted {len(records)} sleep record(s)")
             except Exception as error:  # noqa: BLE001 — diagnostic surface, report everything
                 add(
                     "data_roundtrip", False, f"{type(error).__name__}: {error}",
-                    hint="The server token may have been revoked — check the server "
-                    "still exists in the iOS app (Settings → Data & AI), or bind again.",
+                    # The old wording sent the user to verify the row still
+                    # exists, on the assumption that a deleted row is the only
+                    # way a token dies. That stopped being true when binding
+                    # became an upsert: re-binding this same machine now
+                    # ROTATES the token in place, so a second bind (or an old
+                    # QR still on screen being scanned again) invalidates the
+                    # token this config holds while the row sits there looking
+                    # perfectly healthy. A user who checks and finds the server
+                    # present concludes the diagnosis is wrong — so lead with
+                    # the fix that covers both causes.
+                    hint="The server token is no longer accepted. Re-run "
+                    "`vaultbeat-mcp bind` — this is expected if you bound this machine "
+                    "again since, which replaces the old token. The server still being "
+                    "listed in the iOS app does not rule this out. If binding does not "
+                    "fix it, check the server is still listed (Settings → Data & AI → "
+                    "Authorized AI Servers).",
                 )
 
         installed, latest, version_note = self._client_version_status()
