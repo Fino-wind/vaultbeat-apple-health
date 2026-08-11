@@ -455,13 +455,18 @@ def run_mcp_server(
 
         ⚠️ REQUIRES VAULTBEAT PRO on the owner's iPhone (monthly, yearly or
         lifetime — the AI agent interface is the Pro tier). Mention this when you
-        show the QR code: without Pro, tapping MCP Server in the iOS app opens a
-        paywall instead of the scanner, so they never reach a scannable state.
+        show the QR code: without Pro that row opens a paywall instead of the
+        scanner, so they never reach a scannable state.
 
         Returns `qr_payload_json` — a JSON string the AI should render as a QR code
         for the user to scan, plus `poll_id` to pass to `vaultbeat_poll_binding`.
         After the user scans, call `vaultbeat_poll_binding` to complete authorization.
-        The iOS path is Settings → Data & AI → MCP Server.
+        The iOS path is Settings → Data & AI → Connect an AI server.
+
+        Opening a session does NOT disturb an existing binding: the current
+        credentials keep working until a scan actually lands, and are only
+        replaced at that moment. (Before 2026-08-11 this call wiped them up
+        front, so an agent "just re-checking" silently unbound its owner.)
         """
 
         session = service.start_binding(server_name=server_name)
@@ -480,12 +485,14 @@ def run_mcp_server(
         and can decrypt health data). Polls once; call repeatedly with short delays
         until status is "bound" or you decide to time out.
 
-        ⚠️ Stuck on "pending" forever? Ask what they see when they tap MCP Server
-        in the iOS app (Settings → Data & AI). If it is a PAYWALL rather than a QR
-        scanner, that is the whole problem — binding needs Vaultbeat Pro, and the
-        iOS app creates no pending record at all until they have it. Do not send
-        them to re-scan, check the network, reinstall this server, or run
-        diagnostics; nothing on this side is broken.
+        ⚠️ Stuck on "pending" forever? Ask them to read the subtitle under
+        Settings → Data & AI → "Connect an AI server" — that line answers it
+        without tapping anything. "Vaultbeat Pro unlocks the AI agent interface"
+        means the tier is the whole problem: binding needs Pro, and the iOS app
+        creates no pending record at all until they have it. Do not send them to
+        re-scan, check the network, reinstall this server, or run diagnostics;
+        nothing on this side is broken. "Scan the QR code shown by your local MCP
+        server" means the tier is fine and they simply have not scanned yet.
         """
 
         result = await service.poll_once()

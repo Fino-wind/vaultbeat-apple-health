@@ -48,6 +48,11 @@ class FakeCloudClient:
         # When True the fake ignores metric_type (an old edge deployment),
         # proving the service's defensive local filter stays authoritative.
         self.ignores_metric_type = False
+        # Identity the bind handshake resolves to. Mutable so a test can model
+        # re-binding onto a DIFFERENT server row (the only case that may throw
+        # away cached plaintext) versus back onto the same one.
+        self.bound_server_id = "server-1"
+        self.bound_server_token = "token-1"
         # Owner identity the bind handshake would carry.
         self.owner_user_id: str | None = None
         self.owner_public_key_base64: str | None = None
@@ -70,8 +75,8 @@ class FakeCloudClient:
         self.poll_id = poll_id
         return PollBindingResult(
             status="bound",
-            server_id="server-1",
-            server_token="token-1",
+            server_id=self.bound_server_id,
+            server_token=self.bound_server_token,
             owner_user_id=self.owner_user_id,
             owner_public_key_base64=self.owner_public_key_base64,
             owner_device_id=self.owner_device_id,
@@ -223,6 +228,75 @@ def test_binding_session_persists_credentials_and_secure_file(tmp_path: Path) ->
     assert saved.server_token == "token-1"
     assert saved.poll_id is None
     assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+
+def test_start_binding_does_not_destroy_a_working_binding(tmp_path: Path) -> None:
+    """Invariant 54 (a): a binding session nobody completes must leave the
+    existing credentials intact.
+
+    The old code nulled server_id/server_token/bound_at right here, before any
+    scan — so running `bind` to *diagnose* a problem unbound the user, silently,
+    while the cloud kept the row. That is the single reachable path to fino's
+    all-NULL config of 2026-08-10, and via the `vaultbeat_start_binding` tool it
+    means any agent that "just re-checks its binding" unbinds its owner.
+    """
+
+    config_path = tmp_path / "config.json"
+    service = VaultbeatLocalService(ConfigStore(config_path), FakeCloudClient())
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+
+    pending = ConfigStore(config_path).load()
+    assert pending is not None
+    assert pending.poll_id is not None, "a session should be open"
+    # Still fully usable while waiting for a scan that may never come.
+    assert pending.server_id == "server-1"
+    assert pending.server_token == "token-1"
+    assert pending.bound_at is not None
+    assert pending.is_bound
+    ConfigStore(config_path).require_bound()
+
+
+def test_completing_a_binding_swaps_credentials_at_that_moment(tmp_path: Path) -> None:
+    """The other direction: deferring the wipe must not defer the SWAP. When a
+    scan does land on a new identity, the new credentials take over."""
+
+    config_path = tmp_path / "config.json"
+    cloud = FakeCloudClient()
+    service = VaultbeatLocalService(ConfigStore(config_path), cloud)
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+    ConfigStore(config_path).update(last_sync_at="2026-08-10T00:00:00Z")
+
+    cloud.bound_server_id = "server-2"
+    cloud.bound_server_token = "token-2"
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+
+    saved = ConfigStore(config_path).load()
+    assert saved is not None
+    assert saved.server_id == "server-2"
+    assert saved.server_token == "token-2"
+    assert saved.poll_id is None
+    # A different identity's sync history says nothing about this one.
+    assert saved.last_sync_at is None
+
+
+def test_rebinding_to_the_same_identity_keeps_its_sync_history(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    service = VaultbeatLocalService(ConfigStore(config_path), FakeCloudClient())
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+    ConfigStore(config_path).update(last_sync_at="2026-08-10T00:00:00Z")
+
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+
+    saved = ConfigStore(config_path).load()
+    assert saved is not None
+    assert saved.last_sync_at == "2026-08-10T00:00:00Z"
 
 
 def test_sync_decrypts_cloud_envelopes(tmp_path: Path) -> None:
@@ -1047,7 +1121,19 @@ def test_doctor_flags_decrypt_failure_with_rebind_hint(tmp_path: Path) -> None:
     assert report["ok"] is False
     roundtrip = next(check for check in report["checks"] if check["name"] == "data_roundtrip")
     assert roundtrip["ok"] is False
-    assert "bind again" in roundtrip["hint"]
+    hint = roundtrip["hint"]
+    # Re-binding must be the FIRST instruction, and deletion must not read like
+    # a step. This hint used to open with "delete this server in the iOS app and
+    # bind again" — the one action that makes the situation unrecoverable, since
+    # deleting the row fires a BEFORE DELETE trigger that takes every envelope
+    # addressed to it (20k+ on a two-month-old binding) and only ≤365 days of
+    # sleep can ever be re-sealed. Since binding became an upsert, re-binding
+    # alone lands on the same row and keeps them.
+    assert "bind" in hint
+    assert hint.index("bind") < hint.index("delete"), (
+        "re-binding must come before deletion, not after it"
+    )
+    assert "cannot be undone" in hint, "deletion has to be named as irreversible"
 
 
 def test_doctor_unreachable_cloud_skips_data_roundtrip(tmp_path: Path) -> None:
@@ -2969,3 +3055,110 @@ def test_log_note_merge_is_scoped_to_same_kind_and_day(tmp_path: Path) -> None:
 
     assert merged["note"]["text"] == "今天的"
     assert merged["replaced_text"] is None
+
+
+# ---------------------------------------------------------------------------
+# poll_until_bound — the link blips, and a blip must not cost the user their QR
+# ---------------------------------------------------------------------------
+
+
+class FlakyPollClient(FakeCloudClient):
+    """A cloud client whose polls fail on a scripted schedule.
+
+    `failures` is consumed one entry per poll: an exception is raised, None
+    means answer normally. `bind_after` polls (successful or not) the binding
+    completes.
+    """
+
+    def __init__(self, failures: list[BaseException | None], *, bind_after: int = 10_000) -> None:
+        super().__init__()
+        self.failures = list(failures)
+        self.bind_after = bind_after
+        self.attempts = 0
+
+    async def poll_binding(self, poll_id: str) -> PollBindingResult:
+        self.poll_id = poll_id
+        self.attempts += 1
+        if self.failures:
+            failure = self.failures.pop(0)
+            if failure is not None:
+                raise failure
+        if self.attempts >= self.bind_after:
+            return PollBindingResult(
+                status="bound",
+                server_id=self.bound_server_id,
+                server_token=self.bound_server_token,
+            )
+        return PollBindingResult(status="pending")
+
+
+def test_poll_until_bound_survives_a_transient_failure(tmp_path: Path) -> None:
+    """A single blip used to end the whole bind.
+
+    The exception went straight up, the user re-ran `bind`, and that minted a
+    NEW pollID — invalidating the QR they had just scanned. On a loop that runs
+    5-10 minutes at one request every 7s over a link measured at ~97.3%, at
+    least one blip is close to certain, so the common path was failing for a
+    reason unrelated to binding.
+    """
+
+    import httpx
+
+    cloud = FlakyPollClient([httpx.ReadTimeout("blip"), None], bind_after=2)
+    service = VaultbeatLocalService(ConfigStore(tmp_path / "config.json"), cloud)
+    service.start_binding(api_base_url="https://api.test")
+
+    result = asyncio.run(service.poll_until_bound(timeout_sec=60, interval_sec=0))
+
+    assert result.status == "bound"
+    assert cloud.attempts == 2
+
+
+def test_poll_until_bound_gives_up_on_a_sustained_outage(tmp_path: Path) -> None:
+    """Tolerating blips must not become waiting out the full timeout on a dead
+    uplink — the user would watch a spinner for five minutes to be told nothing."""
+
+    import httpx
+
+    limit = VaultbeatLocalService.POLL_CONSECUTIVE_FAILURE_LIMIT
+    cloud = FlakyPollClient([httpx.ConnectError("down")] * (limit + 3))
+    service = VaultbeatLocalService(ConfigStore(tmp_path / "config.json"), cloud)
+    service.start_binding(api_base_url="https://api.test")
+
+    with pytest.raises(httpx.ConnectError):
+        asyncio.run(service.poll_until_bound(timeout_sec=600, interval_sec=0))
+
+    assert cloud.attempts == limit
+
+
+def test_poll_until_bound_counts_failures_consecutively_not_cumulatively(tmp_path: Path) -> None:
+    """Blips spread across a long poll are the NORMAL case at 2-3% loss; only an
+    unbroken run of them means the link is actually gone."""
+
+    import httpx
+
+    limit = VaultbeatLocalService.POLL_CONSECUTIVE_FAILURE_LIMIT
+    schedule: list[BaseException | None] = []
+    for _ in range(limit + 2):
+        schedule.extend([httpx.ReadTimeout("blip"), None])
+    cloud = FlakyPollClient(schedule, bind_after=len(schedule))
+    service = VaultbeatLocalService(ConfigStore(tmp_path / "config.json"), cloud)
+    service.start_binding(api_base_url="https://api.test")
+
+    result = asyncio.run(service.poll_until_bound(timeout_sec=600, interval_sec=0))
+
+    assert result.status == "bound"
+
+
+def test_poll_until_bound_never_reports_pending_when_every_poll_failed(tmp_path: Path) -> None:
+    """"Still waiting for a scan" and "this machine never reached the server"
+    are opposite diagnoses, and the second must not be reported as the first."""
+
+    import httpx
+
+    cloud = FlakyPollClient([httpx.ReadTimeout("blip")])
+    service = VaultbeatLocalService(ConfigStore(tmp_path / "config.json"), cloud)
+    service.start_binding(api_base_url="https://api.test")
+
+    with pytest.raises(httpx.ReadTimeout):
+        asyncio.run(service.poll_until_bound(timeout_sec=0, interval_sec=0))

@@ -131,7 +131,7 @@ def handle_bind(args: argparse.Namespace) -> int:
         print("  1. Vaultbeat for iOS, with a PRO subscription. The MCP connection")
         print("     is Pro-only — Free and Plus accounts cannot complete a pairing.")
         print("     https://apps.apple.com/app/id6759241985")
-        print("  2. In the app: Settings -> Data & AI -> MCP Server")
+        print("  2. In the app: Settings -> Data & AI -> Connect an AI server")
         print("  3. Scan the QR above from that screen.")
         print()
         # The resume window is NOT open-ended, and saying so matters more than it

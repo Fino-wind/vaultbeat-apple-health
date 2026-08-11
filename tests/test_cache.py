@@ -155,7 +155,28 @@ def test_ttl_zero_disables_cache_entirely(tmp_path: Path) -> None:
     assert not (tmp_path / "cache").exists()  # disabled cache writes nothing
 
 
-def test_rebinding_clears_cached_plaintext(tmp_path: Path) -> None:
+def test_landing_on_a_different_identity_clears_cached_plaintext(tmp_path: Path) -> None:
+    """Cached plaintext belongs to one server identity. Binding onto a
+    DIFFERENT one leaves it unreadable-by-anyone health data on disk."""
+
+    service, cloud, public_key = _bound(tmp_path, ttl_seconds=3600)
+    cloud.envelopes = [_make_envelope(public_key, b'{"stage":"asleep"}')]
+    asyncio.run(service.sync_decrypted_records())
+    assert list((tmp_path / "cache").glob("records-*.json"))
+
+    cloud.bound_server_id = "server-2"
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+
+    assert not list((tmp_path / "cache").glob("records-*.json"))
+
+
+def test_starting_a_binding_nobody_completes_keeps_the_cache(tmp_path: Path) -> None:
+    """The mirror of the test above, and the one that matters more: the cache
+    must survive a session that never gets scanned. Clearing it at
+    start_binding time was half of Invariant 54 (a) — the other half being the
+    credentials themselves (see test_service)."""
+
     service, cloud, public_key = _bound(tmp_path, ttl_seconds=3600)
     cloud.envelopes = [_make_envelope(public_key, b'{"stage":"asleep"}')]
     asyncio.run(service.sync_decrypted_records())
@@ -163,7 +184,23 @@ def test_rebinding_clears_cached_plaintext(tmp_path: Path) -> None:
 
     service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
 
-    assert not list((tmp_path / "cache").glob("records-*.json"))
+    assert list((tmp_path / "cache").glob("records-*.json"))
+
+
+def test_rebinding_to_the_same_identity_keeps_the_cache(tmp_path: Path) -> None:
+    """Once the server-side upsert lands, re-binding resolves to the SAME row —
+    same private key, same records. Dropping the cache there would make the
+    common recovery path needlessly expensive."""
+
+    service, cloud, public_key = _bound(tmp_path, ttl_seconds=3600)
+    cloud.envelopes = [_make_envelope(public_key, b'{"stage":"asleep"}')]
+    asyncio.run(service.sync_decrypted_records())
+    assert list((tmp_path / "cache").glob("records-*.json"))
+
+    service.start_binding(server_name="Mac Studio", api_base_url="https://api.test")
+    asyncio.run(service.poll_once())
+
+    assert list((tmp_path / "cache").glob("records-*.json"))
 
 
 def test_cache_files_are_owner_only(tmp_path: Path) -> None:
