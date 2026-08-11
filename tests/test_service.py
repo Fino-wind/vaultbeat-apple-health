@@ -1130,10 +1130,16 @@ def test_doctor_flags_decrypt_failure_with_rebind_hint(tmp_path: Path) -> None:
     # sleep can ever be re-sealed. Since binding became an upsert, re-binding
     # alone lands on the same row and keeps them.
     assert "bind" in hint
-    assert hint.index("bind") < hint.index("delete"), (
+    assert hint.index("bind") < hint.index("Deleting"), (
         "re-binding must come before deletion, not after it"
     )
-    assert "cannot be undone" in hint, "deletion has to be named as irreversible"
+    # Deletion must be named as costing history — but NOT as irreversible, which
+    # is what a first draft of this said. A re-bind afterwards does re-seal most
+    # of it (agent-written kinds in full, from the local JSON store); what it
+    # cannot reach is history outside each kind's window. Overstating that is its
+    # own failure: a user told the loss is total has no reason to re-bind at all.
+    assert "costs history" in hint
+    assert "older than those windows" in hint
 
 
 def test_doctor_unreachable_cloud_skips_data_roundtrip(tmp_path: Path) -> None:

@@ -4137,19 +4137,33 @@ class VaultbeatLocalService:
                         "data_roundtrip", False,
                         f"fetch ok but decrypt failed ({errors[0]})",
                         # ⚠️ This used to open with "delete this server in the
-                        # iOS app and bind again", which is the one instruction
-                        # that makes the situation unrecoverable: deleting the
-                        # row fires a BEFORE DELETE trigger that takes every
-                        # envelope addressed to it (20k+ on a two-month-old
-                        # binding), and only ≤365 days of SLEEP can ever be
-                        # re-sealed by the backfill coordinator. Re-binding
-                        # alone now lands on the same row and keeps them, so
-                        # deletion buys nothing and costs the history.
+                        # iOS app and bind again" — the most expensive of the
+                        # available actions, recommended first. Deleting the row
+                        # fires a BEFORE DELETE trigger that takes every envelope
+                        # addressed to it (20k+ on a two-month-old binding).
+                        # Re-binding alone now lands on the same row and keeps
+                        # them, so deletion buys nothing.
+                        #
+                        # ⚠️ On how much a delete really costs — do NOT reason
+                        # about this from Invariant 34. That invariant says the
+                        # self-healing GC cannot repair agent-written kinds
+                        # (strength/food/note) because iOS holds no fingerprint
+                        # for blobs it did not write. TRUE, and irrelevant here:
+                        # `VaultbeatNewServerBackfillCoordinator` does not work
+                        # through fingerprints at all, it re-seals from the local
+                        # JSON store — into which pull-and-merge has already
+                        # folded the agent's writes. So those kinds come back in
+                        # FULL after a re-bind; what does not is anything outside
+                        # a kind's window (sleep/body ≤365d re-read from
+                        # HealthKit, symptoms ≤120d) or already deleted from
+                        # HealthKit. Two different mechanisms, opposite answers.
                         hint="The stored key can no longer decrypt your data. Re-run "
-                        "`vaultbeat-mcp bind` first — it re-binds this machine in place "
-                        "and keeps its history. Only delete the server in the iOS app if "
-                        "that fails: deleting also discards every record already encrypted "
-                        "for it, and that cannot be undone.",
+                        "`vaultbeat-mcp bind` first — it re-binds this machine in place and "
+                        "keeps everything already encrypted for it. Deleting the server in "
+                        "the iOS app also works, but costs history: it destroys those keys, "
+                        "and re-binding afterwards only re-seals what the phone can still "
+                        "reproduce — recent Apple Health data plus your full strength / food "
+                        "/ note log. Anything older than those windows is gone.",
                     )
                 else:
                     add("data_roundtrip", True, f"decrypted {len(records)} sleep record(s)")
