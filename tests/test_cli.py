@@ -296,3 +296,27 @@ def test_cli_error_keeps_the_message_when_there_is_one(
     err = capsys.readouterr().err
     assert "ValueError" in err
     assert "config is unreadable" in err
+
+
+def test_bind_can_always_render_a_qr_code(capsys: pytest.CaptureFixture[str]) -> None:
+    """`bind` must produce something scannable without extra installs.
+
+    qrcode was an optional `[qr]` extra until 0.3.10, so `bind` normally printed a
+    raw JSON payload plus "install the extra and run me again" — at the exact
+    moment the user has a phone in their hand and nothing to point it at. Worse,
+    running `bind` again mints a NEW pollID, so following that advice invalidates
+    anything already scanned. The owner walked into it on 2026-08-11 while
+    testing the first-time bind path as a user would.
+
+    This asserts the import is reachable and the renderer actually emits a QR,
+    which is what stops the dependency from being "tidied" back into an extra.
+    """
+
+    from vaultbeat_mcp_local.cli import _print_qr
+
+    _print_qr('{"pollID":"abc","publicKeyBase64":"k","serverName":"n"}')
+
+    out = capsys.readouterr().out
+    assert "install the qr extra" not in out
+    # print_ascii uses half-block glyphs; any of them means a real code was drawn.
+    assert any(ch in out for ch in "▀▄█"), "no QR was rendered"

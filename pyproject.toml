@@ -10,7 +10,7 @@ name = "vaultbeat-mcp"
 # reaches PyPI with no marker and the Registry 403s it. Version 0.3.1 was burned
 # exactly this way on 2026-08-07 (installs fine via uvx, useless to the
 # Registry). Flow: sync src → bump BOTH pyprojects → build+publish over there.
-version = "0.3.9"
+version = "0.3.10"
 description = "Local MCP server for Vaultbeat — AI Health Sync: your AI agent reads your end-to-end-encrypted Apple Health data (sleep, cycle, weight, water), decrypted only on your machine"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -32,6 +32,17 @@ dependencies = [
   # and 1.28.1 the WebSocket transport. Not academic here — `serve --transport http`
   # is a supported mode of this very server. Ceiling stays <2.0.0 (2.x is a major).
   "mcp>=1.28.1,<2.0.0",
+  # Not optional, and it used to be. `bind` prints a QR for the phone to scan —
+  # that scan IS the first mile of this product, and without qrcode the command
+  # printed a raw JSON blob plus "install the qr extra and run me again". The
+  # owner hit it on 2026-08-11 while walking the first-time-bind path as a user:
+  # he had a payload on screen, a phone in his hand, and nothing to point it at.
+  # Anyone who reaches `bind` from `--help` rather than from the website's
+  # copy-paste command lands in the same gap.
+  #
+  # Pure Python, no build step, ~90 KB. Making the single unavoidable action of
+  # onboarding opt-in was the design error, not the dependency.
+  "qrcode>=8.0.0,<9.0.0",
 ]
 
 [project.optional-dependencies]
@@ -47,9 +58,12 @@ dev = [
   # httpx needs no entry — it is already a runtime dependency above.
   "uvicorn>=0.30.0",
 ]
-qr = [
-  "qrcode>=8.0.0,<9.0.0",
-]
+# Kept as an empty-but-valid extra so `uvx --from 'vaultbeat-mcp[qr]' …` — the
+# command printed on the website, in the README and in every older doc — keeps
+# resolving instead of erroring on an unknown extra. qrcode is a hard dependency
+# now, so this asks for nothing; it exists purely so already-published
+# instructions do not break.
+qr = []
 
 # Without these, PyPI shows no link back to the source — which a directory scanner
 # flags outright ("PyPI package has no GitHub URL", mcp-marketplace 2026-07-31).

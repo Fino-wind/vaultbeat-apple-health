@@ -32,12 +32,20 @@ def _print_qr(payload: str) -> None:
     try:
         import qrcode  # type: ignore[import-untyped]
     except ModuleNotFoundError:
-        # The PACKAGE is `vaultbeat-mcp`; `vaultbeat-mcp-local` is only a console
-        # script alias kept for pre-rename installs. `pip install
-        # 'vaultbeat-mcp-local[qr]'` therefore cannot resolve at all — it names a
-        # distribution that has never existed on PyPI.
-        print("To render an ASCII QR code here, install the qr extra:")
-        print("  uvx --from 'vaultbeat-mcp[qr]' vaultbeat-mcp bind    (or: pip install 'vaultbeat-mcp[qr]')")
+        # Unreachable on a normal install since 0.3.10 — qrcode is a hard
+        # dependency now. It stays as a fallback for the one case that can still
+        # produce it: an environment assembled by hand, or a very old install
+        # still on the era when this was the `[qr]` extra.
+        #
+        # ⚠️ Before that change this branch WAS the common path, and it was a
+        # dead end at the worst possible moment: the user has a payload on
+        # screen and a phone in hand, and is told to install something and run
+        # the command again — which also mints a new pollID, invalidating
+        # anything already scanned. Print the payload-only fallback rather than
+        # sending them away empty-handed.
+        print("Could not render a QR code (the `qrcode` package is missing).")
+        print("Scan the payload above with the Vaultbeat app, or reinstall with:")
+        print("  uvx --refresh vaultbeat-mcp bind")
         return
 
     qr = qrcode.QRCode(border=2)
