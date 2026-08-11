@@ -135,7 +135,13 @@ def test_run_mcp_server_configures_http_transport_on_fastmcp_init(
         stateless_http=False,
     )
 
-    assert captured["init_args"] == ("Vaultbeat Local Sleep",)
+    # Pins the INTENT, not the string: this name is what every MCP client shows in
+    # its server list, and it must not claim the server is sleep-only (it serves 18
+    # kinds). Renamed 2026-08-11 from "Vaultbeat Local Sleep" — asserting the exact
+    # new label would just re-freeze the copy and block the next honest rename.
+    server_name = captured["init_args"][0]
+    assert "Vaultbeat" in server_name
+    assert "Sleep" not in server_name, "the name must not describe this as a sleep-only server"
     assert captured["init_kwargs"]["host"] == "127.0.0.1"
     assert captured["init_kwargs"]["port"] == 9000
     assert captured["init_kwargs"]["streamable_http_path"] == "/custom-mcp"

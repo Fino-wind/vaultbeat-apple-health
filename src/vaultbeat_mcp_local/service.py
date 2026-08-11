@@ -4327,13 +4327,25 @@ class VaultbeatLocalService:
             "kinds_with_data": present,
             "kinds_without_data": absent,
             "possibly_needs_newer_app": gated,
+            # 🔴 Cause (1) is FIRST because it is the one a brand-new user actually
+            # hits, and the only one they can act on in seconds. Until 2026-08-11 this
+            # note listed the other three only, so someone who had just finished
+            # binding — the exact moment this report is most often read — was sent to
+            # check their iOS version and their Health permissions, both dead ends,
+            # while the real answer was "your history hasn't been sealed for this
+            # server yet". Measured that day: a freshly bound server held 4 of 18
+            # kinds and stayed there until the owner tapped Re-sync by hand.
             "note": (
-                "Empty kinds listed under possibly_needs_newer_app require an iOS "
-                "build from the stated date or later. If the app is already newer "
-                "than that, the two remaining causes are that Apple Health access "
-                "for the kind was never granted — a read denial is invisible to the "
-                "app, so it looks identical to having no data; recover via the app's "
-                "Settings → Data & AI → 'Apple Health access' row — or that it "
+                "Empty kinds listed under possibly_needs_newer_app have four possible "
+                "causes, in the order worth checking: (1) this MCP server was bound "
+                "recently and your history has not finished sealing for it — each "
+                "server gets its own encrypted copy, so a new one starts empty and "
+                "fills in; open the app and tap Settings → Data & AI → 'Re-sync all "
+                "health data to AI', then re-run this check in a few minutes. "
+                "(2) the app is older than the stated date for that kind. (3) Apple "
+                "Health access for the kind was never granted — a read denial is "
+                "invisible to the app, so it looks identical to having no data; "
+                "recover via Settings → Data & AI → 'Apple Health access'. (4) it "
                 "genuinely has not been recorded yet."
             )
             if gated
@@ -4343,11 +4355,36 @@ class VaultbeatLocalService:
     def status(self) -> dict[str, Any]:
         config = self.store.load()
         if not config:
-            return {"initialized": False, "bound": False}
+            # `next_step` added 2026-08-11. The website tells first-time users to run
+            # `status` to "verify the server", and the honest answer at that point was
+            # two bare falses — which reads like a failure to someone who has just
+            # installed the thing, and says nothing about what to do next. It is
+            # ADD-ONLY: agents keying off `bound` / `initialized` are unaffected.
+            return {
+                "initialized": False,
+                "bound": False,
+                "next_step": (
+                    "Not paired yet — this is the expected state before first use. "
+                    "Run: uvx --from 'vaultbeat-mcp[qr]@latest' vaultbeat-mcp bind "
+                    "then scan the QR code in the iOS app under "
+                    "Settings → Data & AI → Connect an AI server. "
+                    "Requires the Vaultbeat iOS app with a Pro subscription."
+                ),
+            }
 
         return {
             "initialized": True,
             "bound": config.is_bound,
+            **(
+                {}
+                if config.is_bound
+                else {
+                    "next_step": (
+                        "Keys exist but no phone has authorized this server yet. "
+                        "Re-run `bind` and scan the QR code in the iOS app."
+                    )
+                }
+            ),
             "server_name": config.server_name,
             "server_id": config.server_id,
             "api_base_url": config.api_base_url,
