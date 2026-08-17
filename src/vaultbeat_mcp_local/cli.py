@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,42 @@ def _service(args: argparse.Namespace) -> VaultbeatLocalService:
 
 def _print_json(payload: Any) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+_QR_RELAY_WARNING = """\
+NOTE FOR AI AGENTS RELAYING THIS OUTPUT — read before you answer the user.
+
+You are about to receive a QR code drawn with block characters. Receiving it
+does NOT mean the user can see it. Many agent front-ends (Hermes' TUI, chat
+clients, log viewers, anything that re-renders tool output) drop those
+characters, leaving the user a blank gap while you read a perfectly good QR
+code. You cannot detect this from your side.
+
+So do not tell the user the QR code appeared, and do not ask them to scan
+"the code above". Tell them to run this in a real terminal themselves:
+
+    uvx vaultbeat-mcp@latest bind
+
+If they say they see nothing, that is the expected outcome — it is your
+rendering layer, not their mistake, and not a bug in Vaultbeat."""
+
+
+def _tty_hint() -> str:
+    """Extra line when nothing is attached to a terminal at all.
+
+    `isatty()` false means the output is being piped or captured — so there is
+    certainly no human watching this stream, and drawing a QR code into it is
+    decoration for a log file. It is a STRUCTURAL signal, unlike the warning
+    above, which has to cover the case where a pty exists but a renderer eats
+    the output anyway (Hermes). Neither check subsumes the other, which is why
+    both are here.
+    """
+    if sys.stdout.isatty():
+        return ""
+    return (
+        "\n(stdout is not a terminal — nobody is watching this stream directly, "
+        "so the QR code below is almost certainly not reaching a human.)"
+    )
 
 
 def _print_qr(payload: str) -> None:
@@ -102,6 +139,13 @@ def handle_doctor(args: argparse.Namespace) -> int:
         scope = report.get("scope") or {}
         if scope:
             print()
+            # Printed before the scope caveat because it is the more actionable of
+            # the two: it tells the operator where their decryption key physically
+            # is, which on a headless box is a plaintext file they may not know
+            # exists.
+            if scope.get("private_key_location"):
+                print(f"[KEY]  Private key: {scope['private_key_location']}")
+                print()
             print(f"[NOTE] Not checked: {scope['does_not_cover']}")
             received = [
                 name for name, present in (scope.get("env_overrides_received") or {}).items()
@@ -122,6 +166,27 @@ def handle_bind(args: argparse.Namespace) -> int:
         server_name=args.server_name,
         api_base_url=args.api_base_url,
     )
+    # 🔴 Say this BEFORE the QR, and say it to the agent rather than to the human.
+    #
+    # An agent relaying this command CANNOT know whether the person can see the
+    # QR code: it receives bytes, not a screen. Hermes' TUI drops the block
+    # characters the code is drawn with, so the user gets a blank gap — and the
+    # agent, reading a tool result that plainly contains a QR code, told them
+    # "QR 码已经弹出来了！" (observed 2026-08-17). That is worse than a plain
+    # failure: the user is being pointed confidently at nothing, and concludes
+    # they did something wrong.
+    #
+    # The fix has to come from here, because the agent has no way to check. It
+    # cannot see its own rendering layer, and there is no signal in the protocol
+    # that says "your output survived". So the CLI states the uncertainty and
+    # names the one action that always works.
+    #
+    # ⚠️ Written for a machine reader on purpose — imperative, and about what NOT
+    # to claim. "Some terminals may not display this correctly" is the polite
+    # phrasing and it does not work: an agent reads it as a caveat and proceeds
+    # to assert the code appeared anyway.
+    print(_QR_RELAY_WARNING + _tty_hint())
+    print()
     print("Scan this payload with Vaultbeat on iOS:")
     print(session.qr_payload_json)
     if not args.no_qr:

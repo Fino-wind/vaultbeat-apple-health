@@ -112,48 +112,132 @@ def _keychain_username(config_path: Path) -> str:
     return f"private_key:{config_path.resolve()}"
 
 
-def _keychain_store(config_path: Path, private_key_base64: str) -> None:
-    """Write *private_key_base64* into the macOS login Keychain.
+PRIVATE_KEY_ENV = "VAULTBEAT_PRIVATE_KEY"
 
-    Raises :class:`ConfigError` (never swallows) on any Keychain failure so
-    callers always know whether the key was persisted.
+
+def identity_file_path(config_path: Path) -> Path:
+    """Where the private key lands when no system keyring is available.
+
+    🔴 A SEPARATE file, never a field inside config.json, and that separation is
+    a real security boundary rather than tidiness:
+
+        server_token alone  → can download this user's ciphertext, cannot read it
+        private key alone   → can decrypt, but has nothing to decrypt
+        both together       → plaintext health data
+
+    config.json already holds `server_token` and `http_token`, and it is the file
+    people cat when something breaks, paste into a bug report, and copy when they
+    migrate a machine. Putting the decryption key in it collapses two independent
+    secrets into one, so a single careless `cat` becomes total exposure.
+    """
+    return config_path.parent / "identity.key"
+
+
+def _keyring_unavailable(exc: BaseException) -> bool:
+    """True only when the platform has NO usable keyring backend at all.
+
+    🔴 The distinction is the whole safety of the fallback. "No backend exists"
+    is a fact about the machine and warrants writing a file; anything else — a
+    locked keychain, a denied prompt, a D-Bus hiccup — is a transient or
+    permission failure, and silently downgrading THOSE to a plaintext file on a
+    Mac would be a security incident dressed as fault tolerance.
+
+    Matched by name rather than by import because the exception moved modules
+    across keyring versions and a wrong import path would make every failure
+    look downgradeable — the dangerous direction.
+    """
+    return type(exc).__name__ == "NoKeyringError"
+
+
+def _keyring_env_hint() -> str:
+    """What an AGENT should do about a missing keyring, in words it can act on.
+
+    keyring's own message is "No recommended backend was available. Install a
+    recommended 3rd party backend package; or, ..." — which sent Hermes off to
+    search the web, try `keyring.backends.null`, and pip-install `keyrings.alt`,
+    three separate times over a week (2026-08-10 / 08-12 / 08-17) without ever
+    fixing it. The actual cause on that machine was two missing environment
+    variables, which its message never mentions.
+
+    So this names the most common cause FIRST and gives the exact command to
+    recover it, because the reader is usually a program that cannot inspect its
+    own launch environment.
+    """
+    return (
+        "\n\nIF YOU ARE AN AI AGENT: this is usually NOT a missing package.\n"
+        "The most common cause on Linux is that this process was started without\n"
+        "the desktop session's environment, so it cannot reach the system keyring\n"
+        "even though one is running. Check from an interactive shell:\n"
+        "    env | grep -E 'DBUS_SESSION_BUS_ADDRESS|XDG_RUNTIME_DIR'\n"
+        "and add both to this MCP server's launch environment.\n"
+        f"On a headless server with no keyring at all, set {PRIVATE_KEY_ENV}\n"
+        "instead, or let Vaultbeat store the key in a 0600 file (it does this\n"
+        "automatically when no backend exists)."
+    )
+
+
+def _keychain_store(config_path: Path, private_key_base64: str) -> None:
+    """Persist the private key, preferring the OS keyring.
+
+    Order: system keyring → 0600 file. `PRIVATE_KEY_ENV` is deliberately NOT
+    written to — an externally-injected key belongs to whoever injected it, and
+    copying it onto disk would defeat the reason they injected it.
     """
     username = _keychain_username(config_path)
     try:
         keyring.set_password(_KEYCHAIN_SERVICE, username, private_key_base64)
+        return
     except Exception as exc:
-        logger.error(
-            "Keychain write failed for service=%r username=%r: %s: %s",
-            _KEYCHAIN_SERVICE,
-            username,
-            type(exc).__name__,
-            exc,
-        )
-        raise ConfigError(
-            f"Failed to store private key in Keychain ({type(exc).__name__}): {exc}"
-        ) from exc
+        if not _keyring_unavailable(exc):
+            logger.error(
+                "Keychain write failed for service=%r username=%r: %s: %s",
+                _KEYCHAIN_SERVICE, username, type(exc).__name__, exc,
+            )
+            raise ConfigError(
+                f"Failed to store private key in Keychain ({type(exc).__name__}): {exc}"
+                f"{_keyring_env_hint()}"
+            ) from exc
+
+    path = identity_file_path(config_path)
+    logger.warning(
+        "No system keyring available; storing the private key at %s (mode 0600). "
+        "Anyone who can read that file can decrypt this account's health data.",
+        path,
+    )
+    write_secret_file(path, private_key_base64 + "\n", harden_parent=True)
 
 
 def _keychain_load(config_path: Path) -> str | None:
-    """Read the private key from the Keychain; returns *None* if absent.
+    """Read the private key: environment → system keyring → 0600 file.
 
-    Raises :class:`ConfigError` on unexpected Keychain errors so callers see
-    the failure rather than silently treating it as a missing key.
+    The env var wins so an operator can hand the key in from systemd-creds, a
+    vault, or a KMS without us knowing or caring where it came from — the one
+    escape hatch for people who will not accept a key on disk.
     """
+    injected = os.getenv(PRIVATE_KEY_ENV, "").strip()
+    if injected:
+        return injected
+
     username = _keychain_username(config_path)
     try:
-        return keyring.get_password(_KEYCHAIN_SERVICE, username)
+        stored = keyring.get_password(_KEYCHAIN_SERVICE, username)
+        if stored:
+            return stored
     except Exception as exc:
-        logger.error(
-            "Keychain read failed for service=%r username=%r: %s: %s",
-            _KEYCHAIN_SERVICE,
-            username,
-            type(exc).__name__,
-            exc,
-        )
-        raise ConfigError(
-            f"Failed to read private key from Keychain ({type(exc).__name__}): {exc}"
-        ) from exc
+        if not _keyring_unavailable(exc):
+            logger.error(
+                "Keychain read failed for service=%r username=%r: %s: %s",
+                _KEYCHAIN_SERVICE, username, type(exc).__name__, exc,
+            )
+            raise ConfigError(
+                f"Failed to read private key from Keychain ({type(exc).__name__}): {exc}"
+                f"{_keyring_env_hint()}"
+            ) from exc
+
+    path = identity_file_path(config_path)
+    if path.is_file():
+        return path.read_text(encoding="utf-8").strip() or None
+    return None
 
 
 def default_config_path() -> Path:
