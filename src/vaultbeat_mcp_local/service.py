@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import secrets
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -4077,6 +4078,31 @@ class VaultbeatLocalService:
         except httpx.HTTPError as error:
             return False, f"{type(error).__name__}: {error}"
 
+    def _private_key_location(self) -> str:
+        """Which of the three storage layers actually holds the key right now.
+
+        Reports the layer, never the value. Order matches `_keychain_load`, so
+        this describes what a read WOULD do rather than what it once did.
+        """
+        from vaultbeat_mcp_local.store import PRIVATE_KEY_ENV, identity_file_path
+
+        if os.getenv(PRIVATE_KEY_ENV, "").strip():
+            return (
+                f"injected via {PRIVATE_KEY_ENV} — supplied by whatever started this "
+                "process; Vaultbeat never writes it to disk."
+            )
+        path = identity_file_path(self.store.path)
+        if path.is_file():
+            return (
+                f"PLAINTEXT FILE at {path} (mode 0600). No system keyring was available "
+                "when this key was created — normal on a headless server. Anyone who can "
+                "read that file can decrypt this account's health data, so treat the "
+                "machine's own security as the boundary: full-disk encryption is the "
+                "meaningful protection here. To keep the key off disk entirely, set "
+                f"{PRIVATE_KEY_ENV} instead."
+            )
+        return "the system keyring (macOS Keychain / SecretService)."
+
     def _scope_report(self) -> dict[str, Any]:
         """What `doctor` can see, and what it structurally cannot.
 
@@ -4114,9 +4140,14 @@ class VaultbeatLocalService:
         return {
             "covers": (
                 "the Vaultbeat side on this machine only: the config file, the identity "
-                "key in the Keychain, the binding, cloud reachability, and whether a real "
+                "key, the binding, cloud reachability, and whether a real "
                 "record decrypts end to end."
             ),
+            # WHERE the decryption key lives, stated plainly. Not a footnote: on a
+            # headless server this key sits in a plaintext 0600 file, and the person
+            # running it has a right to know that without reading our source. Names
+            # a location and who can read it — never the key itself.
+            "private_key_location": self._private_key_location(),
             "does_not_cover": (
                 "your MCP client's own configuration. This server runs as a subprocess of "
                 "the client, so it cannot read the client's config file, cannot see which "
