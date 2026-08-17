@@ -4077,6 +4077,60 @@ class VaultbeatLocalService:
         except httpx.HTTPError as error:
             return False, f"{type(error).__name__}: {error}"
 
+    def _scope_report(self) -> dict[str, Any]:
+        """What `doctor` can see, and what it structurally cannot.
+
+        The half most likely to be broken is the half this process cannot
+        inspect. This server runs as a SUBPROCESS of the MCP client (Claude
+        Code, Claude Desktop, Hermes, …): the client owns the command line,
+        decides which environment variables survive into it, and holds a config
+        file this process never sees. So every check can pass while the client
+        is launching a different install, pointing at a different config, or
+        dropping a variable it does not recognise — and a reader who takes a
+        green report as "the whole setup is fine" then looks for the fault
+        everywhere except where it is. Recorded cost (2026-08-12): an agent
+        spent half an hour guessing environment variables and ended up reading
+        the HOST's source for its env allow-list, because doctor had reported
+        everything healthy.
+
+        `env_overrides_received` is what turns a disclaimer into something
+        actionable — it answers "did the client actually forward this?" without
+        anyone reading anyone's source. Names and presence ONLY, never values:
+        one of these is a bearer token.
+        """
+        import os
+
+        from vaultbeat_mcp_local.cache import TTL_ENV, _LEGACY_TTL_ENV
+        from vaultbeat_mcp_local.store import CONFIG_ENV, _LEGACY_CONFIG_ENV
+
+        names = (
+            CONFIG_ENV,
+            _LEGACY_CONFIG_ENV,
+            TTL_ENV,
+            _LEGACY_TTL_ENV,
+            "VAULTBEAT_MCP_HTTP_TOKEN",
+            "TETHER_MCP_HTTP_TOKEN",
+        )
+        return {
+            "covers": (
+                "the Vaultbeat side on this machine only: the config file, the identity "
+                "key in the Keychain, the binding, cloud reachability, and whether a real "
+                "record decrypts end to end."
+            ),
+            "does_not_cover": (
+                "your MCP client's own configuration. This server runs as a subprocess of "
+                "the client, so it cannot read the client's config file, cannot see which "
+                "environment variables the client chose to forward, and cannot tell whether "
+                "the client launched it with the arguments you think. Every check here can "
+                "pass while the client is starting a different install or pointing at a "
+                "different config — if the tools are missing, or the data looks like "
+                "someone else's, look there next rather than at this report."
+            ),
+            "env_overrides_received": {
+                name: bool(os.getenv(name, "").strip()) for name in names
+            },
+        }
+
     async def doctor(self) -> dict[str, Any]:
         """Aggregated self-diagnosis for the install/binding first mile
         (roadmap v1.2.1 "绑定失败自诊断"). Returns machine-readable checks;
@@ -4095,7 +4149,10 @@ class VaultbeatLocalService:
                 "config", False, f"no config at {self.store.path}",
                 hint="Run `vaultbeat-mcp bind` to initialize and pair with the iOS app.",
             )
-            return {"ok": False, "checks": checks}
+            # `scope` rides even the earliest bail-out: "no config" is exactly
+            # when a reader is most likely to start hunting on the client side,
+            # so this is the return that most needs to say where the border is.
+            return {"ok": False, "checks": checks, "scope": self._scope_report()}
         add("config", True, str(self.store.path))
 
         add(
@@ -4203,6 +4260,7 @@ class VaultbeatLocalService:
         report: dict[str, Any] = {
             "ok": all(check["ok"] for check in checks),
             "checks": checks,
+            "scope": self._scope_report(),
         }
         if config.is_bound:
             report["capabilities"] = await self._capability_report()

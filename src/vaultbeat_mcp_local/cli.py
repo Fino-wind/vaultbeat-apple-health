@@ -95,6 +95,23 @@ def handle_doctor(args: argparse.Namespace) -> int:
             else:
                 print(f"[OK]   capabilities: all {len(caps.get('kinds_with_data', []))} data types present")
 
+        # What was NOT checked. Printed last and unconditionally — a passing run
+        # is precisely when this matters, because "All checks passed" otherwise
+        # reads as "the whole setup is fine" and sends the reader hunting on the
+        # side of the pipe nobody just tested.
+        scope = report.get("scope") or {}
+        if scope:
+            print()
+            print(f"[NOTE] Not checked: {scope['does_not_cover']}")
+            received = [
+                name for name, present in (scope.get("env_overrides_received") or {}).items()
+                if present
+            ]
+            if received:
+                print(f"       This process did receive: {', '.join(received)}")
+            else:
+                print("       This process received no Vaultbeat environment overrides.")
+
         print("All checks passed." if report["ok"] else "Some checks failed — follow the hints above.")
     return 0 if report["ok"] else 1
 
@@ -123,10 +140,20 @@ def handle_bind(args: argparse.Namespace) -> int:
         # never read the README — and the reason no scan arrived is almost
         # always that the phone side is not ready.
         #
-        # Naming the Pro requirement is the part that matters: it is the one
-        # prerequisite that cannot be discovered by poking at the app, because
-        # the MCP screen is visible on every tier (the explainer is deliberately
-        # free — only the connect action is gated).
+        # ⚠️ This block said "Pro-only — Free and Plus accounts cannot complete a
+        # pairing" until 2026-08-17. That was true and is now false: connecting
+        # is open to every tier.
+        #
+        # 🔴 It must not mention Pro, subscriptions or trials AT ALL, and that is
+        # a product decision, not an omission (owner, 2026-08-17: 宣传语不要说需要
+        # pro。直接吸引过来。app 里面自然能体验到). The first replacement here still
+        # said "no subscription needed — 3 days of Pro free", which reads as
+        # helpful and is not: it puts a price and a deadline in front of someone
+        # who has not yet seen the product work. This text is ACQUISITION copy —
+        # its only job is to get the app installed and the QR scanned. The app
+        # shows what the plan is, once there is something to have an opinion
+        # about. Same rule as `server.json`'s description and the website: what a
+        # stranger reads first should be the reason to come, not the terms.
         #
         # The App Store link deliberately carries the numeric id and NO slug.
         # The slug follows the app's display name, so the ones written across
@@ -136,8 +163,7 @@ def handle_bind(args: argparse.Namespace) -> int:
         print("Binding is still pending — nothing scanned this within the timeout.")
         print()
         print("What the phone side needs:")
-        print("  1. Vaultbeat for iOS, with a PRO subscription. The MCP connection")
-        print("     is Pro-only — Free and Plus accounts cannot complete a pairing.")
+        print("  1. Vaultbeat for iOS — free to install, free to connect.")
         print("     https://apps.apple.com/app/id6759241985")
         print("  2. In the app: Settings -> Data & AI -> Connect an AI server")
         print("  3. Scan the QR above from that screen.")
@@ -166,6 +192,20 @@ def handle_bind(args: argparse.Namespace) -> int:
         return 2
 
     print(f"Bound local MCP server: {result.server_id}")
+    # ⚠️ Informational, NOT a sales line. The acquisition copy above deliberately
+    # says nothing about plans; this is the other side of that rule — once the
+    # thing is working, the user is entitled to know what they have. So it states
+    # a date and stops. No "subscribe to keep it", no price: at this moment the
+    # user has had zero seconds of the product, and asking for money before they
+    # have felt it is exactly the ordering the owner rejected.
+    #
+    # Absent for a grandfathered user, a trial already running, or an edge
+    # deployment older than 2026-08-17 — saying nothing is correct in all three,
+    # so this stays conditional rather than guessing a date.
+    if result.trial_ends_at:
+        print()
+        print(f"Full access to your health data is on until {result.trial_ends_at[:10]}.")
+        print("Go ask your AI something — that is what this was for.")
     return 0
 
 

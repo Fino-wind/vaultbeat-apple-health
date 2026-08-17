@@ -10,7 +10,7 @@ name = "vaultbeat-mcp"
 # reaches PyPI with no marker and the Registry 403s it. Version 0.3.1 was burned
 # exactly this way on 2026-08-07 (installs fine via uvx, useless to the
 # Registry). Flow: sync src → bump BOTH pyprojects → build+publish over there.
-version = "0.3.11"
+version = "0.4.0"
 description = "Local MCP server for Vaultbeat — AI Health Sync: your AI agent reads your end-to-end-encrypted Apple Health data (sleep, cycle, weight, water), decrypted only on your machine"
 readme = "README.md"
 requires-python = ">=3.11"
