@@ -11,6 +11,39 @@ class VaultbeatCloudError(RuntimeError):
     pass
 
 
+class VaultbeatTrialExpiredError(VaultbeatCloudError):
+    """The 3-day Pro trial has ended; this server can no longer read or write.
+
+    Its own type rather than a generic HTTP 403 for one reason: this is the only
+    failure in the whole client that is not a malfunction. Nothing is broken,
+    nothing is lost, and the fix is a purchase rather than a repair — so it must
+    never surface as `Cloud request failed: HTTP 403`, which sends a user to
+    check their network, re-run `bind`, or file a bug about data loss.
+
+    ⚠️ The sentence is built HERE from two machine values (an error code and a
+    timestamp), never echoed from the server. A server-chosen sentence reaching
+    an agent's context is a prompt-injection channel by construction — the tool
+    result and a real user turn arrive under the same role, so the model cannot
+    tell them apart (Anti-pattern 23). The edge function deliberately returns no
+    prose at all; if a `detail` string ever appears in that response, it is a
+    regression, not a convenience.
+
+    ⚠️ It says the data is intact. That is the first thing a user assumes has
+    gone wrong when their AI abruptly cannot see their health records, and the
+    assumption leads somewhere expensive (reinstall, re-pair, panic).
+    """
+
+    def __init__(self, trial_ended_at: str | None = None) -> None:
+        self.trial_ended_at = trial_ended_at
+        when = f" on {trial_ended_at[:10]}" if trial_ended_at else ""
+        super().__init__(
+            f"Your 3-day Vaultbeat Pro trial ended{when}. "
+            "Open the Vaultbeat app on your iPhone and subscribe to Pro to restore "
+            "access. Nothing was deleted — your health data is still encrypted in "
+            "your account and reappears the moment Pro is active."
+        )
+
+
 class VaultbeatRecordNotAgentWritableError(VaultbeatCloudError):
     """This day is sealed for a recipient this MCP server cannot re-seal for.
 
@@ -82,6 +115,11 @@ class PollBindingResult:
     owner_user_id: str | None = None
     owner_public_key_base64: str | None = None
     owner_device_id: str | None = None
+    # ISO8601 end of the free Pro trial, present only when this bind STARTED one
+    # (null for a grandfathered user, an already-running trial, or an older edge
+    # deployment that does not send the field). Purely informational — the
+    # entitlement decision is always the server's.
+    trial_ends_at: str | None = None
     request_id: str | None = None
 
 
@@ -248,6 +286,7 @@ class VaultbeatCloudClient:
             owner_user_id=payload.get("ownerUserID"),
             owner_public_key_base64=payload.get("ownerPublicKeyBase64"),
             owner_device_id=payload.get("ownerDeviceID"),
+            trial_ends_at=payload.get("trialEndsAt"),
             request_id=payload.get("request_id"),
         )
 
@@ -509,6 +548,13 @@ class VaultbeatCloudClient:
                 raise VaultbeatRecordNotAgentWritableError(
                     [str(k) for k in kinds] if isinstance(kinds, list) else None
                 )
+
+            # Checked before the generic branches: an ended trial is the one
+            # 4xx here that is not a malfunction, and the generic wording
+            # ("Cloud request failed") would send the user to debug a network.
+            if error_code == "trial_expired":
+                ended = payload.get("trial_ended_at") if isinstance(payload, dict) else None
+                raise VaultbeatTrialExpiredError(str(ended) if ended else None)
 
             if error_code == "invalid_metric_type" and isinstance(payload, dict):
                 allowed = payload.get("allowed")

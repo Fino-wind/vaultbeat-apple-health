@@ -186,6 +186,15 @@ def run_mcp_server(
         needs). An empty kind is NOT proof the user never recorded it: their app
         may predate the feature entirely.
 
+        `scope` — what this report does NOT cover. Everything here can pass and
+        the setup still be broken on the client side: this server is a subprocess
+        of your MCP client, so it cannot read the client's config file, cannot see
+        which environment variables the client forwarded, and cannot tell whether
+        it was launched with the arguments the user believes. A green report never
+        clears the client. `scope.env_overrides_received` lists which Vaultbeat
+        variables actually arrived — check that before guessing at the client's
+        environment.
+
         This runs a cloud round trip, so it is slower than `vaultbeat_status`
         (local config only) — prefer status for a quick liveness check.
         """
