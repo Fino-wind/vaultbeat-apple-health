@@ -177,4 +177,4 @@ pytest
 
 *Website: [vaultbeat.app](https://vaultbeat.app) · App Store: [Vaultbeat — AI Health Sync](https://apps.apple.com/app/id6759241985) · Bugs & feedback: [vaultbeat-community](https://github.com/Fino-wind/vaultbeat-community/issues)*
 
-<!-- mcp-name: io.github.Fino-wind/vaultbeat -->
+<!-- mcp-name: io.github.Fino-wind/vaultbeat-apple-health -->
