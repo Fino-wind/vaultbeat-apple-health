@@ -117,12 +117,71 @@ def test_an_injected_key_is_never_written_to_disk(tmp_path: Path) -> None:
 
 
 def test_keyring_is_preferred_when_it_works(tmp_path: Path) -> None:
-    """No downgrade on machines that have a keyring — macOS behaviour unchanged."""
+    """No downgrade on machines that have a keyring — macOS behaviour unchanged.
+
+    get_password must be stubbed alongside set_password: "the write worked" is
+    now decided by reading the value back, so a mock that accepts writes and
+    returns nothing IS the null backend, and would land in the fallback below.
+    """
     config = tmp_path / "config.json"
-    with mock.patch.object(store_mod.keyring, "set_password") as set_pw:
+    with (
+        mock.patch.object(store_mod.keyring, "set_password") as set_pw,
+        mock.patch.object(store_mod.keyring, "get_password", return_value="K"),
+    ):
         store_mod._keychain_store(config, "K")
     set_pw.assert_called_once()
     assert not identity_file_path(config).exists()
+
+
+def test_a_silent_backend_still_lands_the_key_on_disk(tmp_path: Path) -> None:
+    """The null backend: every operation is `pass`, so nothing ever raises.
+
+    Every other case in this file constructs failure by RAISING. That was the
+    entire imagination of the original suite — its header says "no D-Bus
+    session" — and it is why the bug shipped: `keyring.backends.null.Keyring`
+    implements set_password as a bare `pass`, so a "did the call raise" check
+    reports success while the key goes nowhere. Not a hypothetical backend
+    either: it is what PYTHON_KEYRING_BACKEND=...null... selects, i.e. what
+    someone sets to silence a keyring error on exactly the kind of server that
+    has no keyring.
+    """
+    config = tmp_path / "config.json"
+    with (
+        mock.patch.object(store_mod.keyring, "set_password", return_value=None),
+        mock.patch.object(store_mod.keyring, "get_password", return_value=None),
+    ):
+        store_mod._keychain_store(config, "K")
+
+    identity = identity_file_path(config)
+    assert identity.is_file(), (
+        "set_password returned without raising, so the write looked fine — but "
+        "nothing was stored and the file fallback never engaged. That is silent "
+        "key loss."
+    )
+    assert identity.read_text(encoding="utf-8").strip() == "K"
+
+
+def test_a_silent_backend_does_not_lose_a_freshly_minted_identity(tmp_path: Path) -> None:
+    """The real guardrail: assert the KEY SURVIVES, not what a function returned.
+
+    ensure_initialized mints a keypair and calls save(), which strips the private
+    key from config.json by design. If the keyring swallowed it and no file was
+    written, the key that was just generated no longer exists anywhere — and the
+    only symptom is a later "missing key material" on a config that looks fine.
+    """
+    config = tmp_path / "config.json"
+    store = store_mod.ConfigStore(config)
+
+    with (
+        mock.patch.object(store_mod.keyring, "set_password", return_value=None),
+        mock.patch.object(store_mod.keyring, "get_password", return_value=None),
+    ):
+        created = store.ensure_initialized()
+        reloaded = store.load()
+
+    assert reloaded is not None
+    assert reloaded.private_key_base64 == created.private_key_base64
+    assert identity_file_path(config).is_file()
 
 
 def test_the_error_names_the_environment_cause_before_packages() -> None:

@@ -15,6 +15,7 @@ from vaultbeat_mcp_local.client import (
     PollBindingResult,
     VaultbeatCloudClient,
     VaultbeatCloudError,
+    VaultbeatTrialExpiredError,
     VaultbeatUnsupportedMetricError,
 )
 from vaultbeat_mcp_local.crypto import (
@@ -25,7 +26,7 @@ from vaultbeat_mcp_local.crypto import (
     decrypt_blob_payload,
     encrypt_blob_payload,
 )
-from vaultbeat_mcp_local.store import ConfigStore, LocalServerConfig, now_iso
+from vaultbeat_mcp_local.store import ConfigError, ConfigStore, LocalServerConfig, now_iso
 
 
 _LOG = logging.getLogger("vaultbeat_mcp_local.service")
@@ -4174,7 +4175,29 @@ class VaultbeatLocalService:
                 check["hint"] = hint
             checks.append(check)
 
-        config = self.store.load()
+        # ⚠️ load() RAISES on a config it cannot read, and that path is earlier
+        # than the `if not config` bail-out below. Uncaught, it takes the whole
+        # doctor down: the CLI prints one bare `error: ConfigError: ...` line,
+        # zero [OK]/[FAIL] rows, and the MCP tool answers isError. So the two
+        # things written specifically for this situation — the [KEY] private-key
+        # location and the scope report — were unreachable at the exact moment
+        # they were needed, on the command every doc names as the first stop.
+        #
+        # A diagnostic tool may not decline to produce a diagnosis. Its whole
+        # job is to speak when everything else is failing.
+        try:
+            config = self.store.load()
+        except ConfigError as error:
+            add(
+                "config", False, f"{type(error).__name__}: {error}",
+                hint="The config file exists but its key material could not be "
+                "resolved. Do NOT delete it — the private key is stored outside "
+                "it, so deleting mints a new identity and orphans everything "
+                "already encrypted. The detail above lists all three key "
+                "locations and what was found in each.",
+            )
+            return {"ok": False, "checks": checks, "scope": self._scope_report()}
+
         if not config:
             add(
                 "config", False, f"no config at {self.store.path}",
@@ -4255,6 +4278,21 @@ class VaultbeatLocalService:
                     )
                 else:
                     add("data_roundtrip", True, f"decrypted {len(records)} sleep record(s)")
+            except VaultbeatTrialExpiredError as error:
+                # 🔴 Must precede the generic handler below, which would call
+                # this a dead server token and prescribe a re-bind. That advice
+                # is worse than useless here: re-binding SUCCEEDS, the trial does
+                # not restart, and the next doctor run says the same thing — a
+                # closed loop that never mentions the actual reason. Nothing is
+                # broken and no data is lost; the fix is a purchase, not a repair.
+                add(
+                    "data_roundtrip", False, str(error),
+                    hint="This is not a fault and nothing has been lost — your records "
+                    "are intact and still encrypted to this machine. Agent access has "
+                    "simply run out. Subscribe to Pro in the Vaultbeat iOS app "
+                    "(Settings → Membership) and this machine resumes with no re-pairing. "
+                    "Re-running `bind` will not help.",
+                )
             except Exception as error:  # noqa: BLE001 — diagnostic surface, report everything
                 add(
                     "data_roundtrip", False, f"{type(error).__name__}: {error}",
@@ -4403,18 +4441,43 @@ class VaultbeatLocalService:
         absent: list[str] = []
         try:
             records, _ = await self.sync_decrypted_records()
+        except VaultbeatTrialExpiredError as error:
+            # Distinguished from the generic failure below because it is not one:
+            # nothing is broken and nothing is missing. Reporting it as "could not
+            # read cloud data" invites the reader to hunt for a fault, and the
+            # conclusion a user draws from a health app that suddenly cannot see
+            # anything is that their records are gone.
+            return {"available": False, "reason": str(error)}
         except Exception:  # noqa: BLE001 — diagnostics must not raise
             return {"available": False, "reason": "could not read cloud data"}
 
-        seen = {r.metric_type or "sleep" for r in records}
+        counts: dict[str, int] = {}
+        for record in records:
+            kind = record.metric_type or "sleep"
+            counts[kind] = counts.get(kind, 0) + 1
+
         for kind in sorted(KNOWN_METRIC_TYPES):
-            (present if kind in seen else absent).append(kind)
+            (present if kind in counts else absent).append(kind)
 
         gated = {k: v for k, v in self.KIND_MIN_APP_RELEASE.items() if k in absent}
         return {
             "available": True,
             "kinds_with_data": present,
             "kinds_without_data": absent,
+            # A kind with one record and a kind with a year of them were reported
+            # identically — both just a name in kinds_with_data — so "this server
+            # is still filling in" and "this server has everything" looked the
+            # same in the one report meant to tell them apart. That matters most
+            # right after pairing, when a partial history is the normal state.
+            #
+            # ⚠️ Counts only, deliberately no date range: DecryptedRecord carries
+            # `created_at`, which is an UPLOAD-batch timestamp, not the day the
+            # record is about — a backfill uploads years of history in minutes
+            # (Invariant 38). Deriving a coverage window from it would print a
+            # precise-looking range that is simply false. A real range needs each
+            # kind's payload parsed for its own business date; until then a count
+            # is the honest signal.
+            "record_counts": {k: counts[k] for k in present},
             "possibly_needs_newer_app": gated,
             # 🔴 Cause (1) is FIRST because it is the one a brand-new user actually
             # hits, and the only one they can act on in seconds. Until 2026-08-11 this
@@ -4457,7 +4520,7 @@ class VaultbeatLocalService:
                     "Run: uvx --from 'vaultbeat-mcp[qr]@latest' vaultbeat-mcp bind "
                     "then scan the QR code in the iOS app under "
                     "Settings → Data & AI → Connect an AI server. "
-                    "Requires the Vaultbeat iOS app with a Pro subscription."
+                    "Requires the Vaultbeat iOS app; connecting is open on every plan."
                 ),
             }
 

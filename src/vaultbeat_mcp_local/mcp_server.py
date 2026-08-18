@@ -24,20 +24,48 @@ def _annotate_if_empty(result: dict[str, Any], kind: str, rows_key: str) -> dict
     Payload shape is the one contract layer no server can validate (see AGENTS.md
     § app↔MCP coupling), so anything touching a response has to be additive.
     """
-    since = VaultbeatLocalService.KIND_MIN_APP_RELEASE.get(kind)
-    if since is None or result.get(rows_key):
+    if result.get(rows_key):
         return result
+
+    since = VaultbeatLocalService.KIND_MIN_APP_RELEASE.get(kind)
+    if since is None:
+        # A kind that has existed since 1.2.0, so "your app is too old" cannot be
+        # the reason and naming it would send the reader down a dead end. The
+        # other causes still apply though — and the first one especially, because
+        # sleep is what a new user asks for first and a freshly paired server has
+        # barely any of it yet. Before this, those kinds returned a bare empty
+        # result with no explanation at all.
+        result.setdefault(
+            "hint",
+            f"No {kind} data came back. This server cannot tell why — it only sees "
+            f"that no rows arrived — but in the order worth checking: (1) this "
+            f"server was paired recently and the history has not finished sealing "
+            f"for it; every server gets its own encrypted copy, so a new one starts "
+            f"nearly empty and fills in. Open the app and tap Settings → Data & AI "
+            f"→ 'Re-sync all health data to AI', then retry in a few minutes. "
+            f"(2) Apple Health access for it was never granted — a read denial is "
+            f"invisible to the app, so it looks identical to having no data; "
+            f"recover via Settings → Data & AI → 'Apple Health access'. (3) it "
+            f"genuinely has not been recorded yet. Run `vaultbeat-mcp doctor` or "
+            f"call the vaultbeat_doctor tool for a full report.",
+        )
+        return result
+
     result.setdefault(
         "hint",
-        f"No {kind} data on this account. Three causes produce an identical empty "
+        f"No {kind} data on this account. Four causes produce an identical empty "
         f"result and this server cannot tell them apart — it only sees that no rows "
-        f"arrived: (1) the iOS app predates this data type, which needs a build from "
-        f"{since} or later; (2) Apple Health access for it was never granted — a read "
-        f"denial is invisible to the app, so this looks the same as having no data, and "
-        f"the recovery path is the app's Settings → Data & AI → 'Apple Health access' "
-        f"row, which re-presents the permission sheet; (3) it genuinely has not been "
-        f"recorded yet. Run `vaultbeat-mcp doctor` or call the vaultbeat_doctor tool "
-        f"for a full report.",
+        f"arrived, in the order worth checking: (1) this server was paired recently "
+        f"and the history has not finished sealing for it — every server gets its own "
+        f"encrypted copy, so a new one starts nearly empty and fills in; open the app "
+        f"and tap Settings → Data & AI → 'Re-sync all health data to AI', then retry "
+        f"in a few minutes; (2) the iOS app predates this data type, which needs a "
+        f"build from {since} or later; (3) Apple Health access for it was never "
+        f"granted — a read denial is invisible to the app, so this looks the same as "
+        f"having no data, and the recovery path is the app's Settings → Data & AI → "
+        f"'Apple Health access' row, which re-presents the permission sheet; (4) it "
+        f"genuinely has not been recorded yet. Run `vaultbeat-mcp doctor` or call the "
+        f"vaultbeat_doctor tool for a full report.",
     )
     return result
 
@@ -225,7 +253,11 @@ def run_mcp_server(
         pass fresh=True to force a cloud round trip.
         """
 
-        return await service.sleep_records(limit=limit, owner=owner, fresh=fresh)
+        return _annotate_if_empty(
+            await service.sleep_records(limit=limit, owner=owner, fresh=fresh),
+            "sleep",
+            "sessions",
+        )
 
     @mcp.tool()
     async def get_water_intake(
@@ -239,7 +271,11 @@ def run_mcp_server(
         Each record carries `owner_user_id` to identify whose data it is.
         """
 
-        return await service.water_intake_summary(limit=limit, owner=owner, fresh=fresh)
+        return _annotate_if_empty(
+            await service.water_intake_summary(limit=limit, owner=owner, fresh=fresh),
+            "water",
+            "days",
+        )
 
     @mcp.tool()
     async def get_weight_trend(
@@ -253,7 +289,13 @@ def run_mcp_server(
         Each record carries `owner_user_id` to identify whose data it is.
         """
 
-        return await service.weight_trend_summary(limit=limit, goal_kg=goal_kg, owner=owner, fresh=fresh)
+        return _annotate_if_empty(
+            await service.weight_trend_summary(
+                limit=limit, goal_kg=goal_kg, owner=owner, fresh=fresh
+            ),
+            "body",
+            "days",
+        )
 
     @mcp.tool()
     async def get_symptoms(limit: int = 120, fresh: bool = False) -> dict[str, Any]:
@@ -479,10 +521,11 @@ def run_mcp_server(
         """Initialize a binding session: generates a keypair (if needed) and returns a
         QR payload that the user scans in the Vaultbeat iOS app to authorize this AI server.
 
-        ⚠️ REQUIRES VAULTBEAT PRO on the owner's iPhone (monthly, yearly or
-        lifetime — the AI agent interface is the Pro tier). Mention this when you
-        show the QR code: without Pro that row opens a paywall instead of the
-        scanner, so they never reach a scannable state.
+        ⚠️ If the user says they cannot see the QR code, believe them. Many
+        terminals and most agent transcripts drop the block characters it is
+        drawn with, so the payload can reach you intact while their screen shows
+        a blank gap — do not assert that it is there. Have them run
+        `uvx vaultbeat-mcp bind` in a real terminal instead.
 
         Returns `qr_payload_json` — a JSON string the AI should render as a QR code
         for the user to scan, plus `poll_id` to pass to `vaultbeat_poll_binding`.
@@ -506,19 +549,33 @@ def run_mcp_server(
     async def vaultbeat_poll_binding() -> dict[str, Any]:
         """Check whether the user has scanned the QR code and authorized this server.
 
-        Call this after `vaultbeat_start_binding`. Returns `status`: "pending" (user hasn't
-        scanned yet — wait and retry) or "bound" (success — server is now authorized
-        and can decrypt health data). Polls once; call repeatedly with short delays
-        until status is "bound" or you decide to time out.
+        Call this after `vaultbeat_start_binding`. THREE possible `status` values:
 
-        ⚠️ Stuck on "pending" forever? Ask them to read the subtitle under
-        Settings → Data & AI → "Connect an AI server" — that line answers it
-        without tapping anything. "Vaultbeat Pro unlocks the AI agent interface"
-        means the tier is the whole problem: binding needs Pro, and the iOS app
-        creates no pending record at all until they have it. Do not send them to
-        re-scan, check the network, reinstall this server, or run diagnostics;
-        nothing on this side is broken. "Scan the QR code shown by your local MCP
-        server" means the tier is fine and they simply have not scanned yet.
+        · "pending"  — the pairing is alive and simply has not been scanned yet.
+                       Keep polling with short delays.
+        · "bound"    — success. The server can now decrypt health data.
+        · "expired"  — TERMINAL. Stop polling; no amount of retrying recovers it.
+                       Run `uvx vaultbeat-mcp bind` for a fresh QR code.
+
+        🔴 "pending" is positive evidence that nothing is wrong. The endpoint
+        looks the pairing row up by pollID and answers "expired" when it is gone,
+        so a long run of "pending" means the row is still there and nobody has
+        scanned — NOT that it went stale while you waited.
+
+        That distinction decides what you tell the user, and getting it backwards
+        is destructive: re-running `bind` mints a NEW pollID, which invalidates
+        the QR they are looking at — so "just run bind again" turns a pairing
+        that was one scan away from working into one that cannot complete. Only
+        do it on "expired".
+
+        So while it stays "pending", the useful action is to get the code
+        scanned, not to restart anything. Connecting is open on every plan, so
+        there is no tier to check; the scanner is at Settings → Data & AI →
+        "Connect an AI server". Do not send them to check the network, reinstall
+        this server, or run diagnostics — none of those are implicated.
+
+        If they cannot see a QR code at all, it is your output that failed, not
+        their phone — see `vaultbeat_start_binding`.
         """
 
         result = await service.poll_once()
@@ -535,8 +592,21 @@ def run_mcp_server(
         fresh: bool = False,
         include_timeline: bool = False,
     ) -> dict[str, Any]:
-        """Per-night sleep stages with per-stage HR/RR. The primary tool for detailed
-        sleep analysis — richer than vaultbeat_sync_sleep.
+        """Per-night sleep stages with per-stage HR/RR — depth on a few nights.
+
+        Which sleep tool to use:
+        · THIS one for going deep on one or two specific nights (stage bands,
+          per-stage vitals). It defaults to 2 nights because each is ~1-2k
+          characters; see the SIZE note below.
+        · `vaultbeat_sync_sleep` for anything spanning time — "how did I sleep
+          this week/month", trends, averages. Its default of 50 covers ~2-3
+          weeks. Reach for it whenever the question is about a period rather
+          than a night, and do not conclude from THIS tool's two rows that only
+          two nights exist.
+
+        (This used to call itself "the primary tool for detailed sleep analysis",
+        which read as "use this one for sleep" and handed back two days to
+        anyone who asked how their week went.)
 
         Returns `stage_intervals` (contiguous stage bands with start/end),
         `stage_minutes`, and `stage_vitals` (per-stage HR/RR min/mean/max). Use
@@ -568,7 +638,11 @@ def run_mcp_server(
         stand hours, distance km). One entry per day, newest first.
         Use `owner` prefix to filter by person. Each record carries `owner_user_id`."""
 
-        return await service.activity_summary(limit=limit, owner=owner, fresh=fresh)
+        return _annotate_if_empty(
+            await service.activity_summary(limit=limit, owner=owner, fresh=fresh),
+            "activity",
+            "days",
+        )
 
     @mcp.tool()
     async def get_resting_hr(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:

@@ -233,15 +233,21 @@ def handle_bind(args: argparse.Namespace) -> int:
         print("  2. In the app: Settings -> Data & AI -> Connect an AI server")
         print("  3. Scan the QR above from that screen.")
         print()
-        # The resume window is NOT open-ended, and saying so matters more than it
-        # looks. `bind` gives up at --timeout (300s), but the server row lives for
-        # 600s (mcp-bind-local sets expires_at = now + 600000), so resuming works
-        # for about five more minutes and then stops working — silently, because
-        # mcp-poll-binding deletes the expired row and still answers
-        # `status: "pending"`. A user who followed the three steps above (install,
-        # subscribe, scan) has almost certainly burned those five minutes, so the
-        # unqualified "it does not need a fresh QR" that used to be here sent
-        # exactly the wrong person into re-running poll forever.
+        # 🔴 The two cases have DIFFERENT answers, and the previous single
+        # paragraph gave the wrong one to whichever reader was in the other case.
+        #
+        # It said the resume window is "~5 more minutes", derived from `bind`
+        # giving up at 300s while the pending row lives 600s. That arithmetic
+        # assumes the row is created when bind starts. It is not: the row is
+        # written by `mcp_bind_local_server`, which the PHONE calls with its own
+        # JWT when the code is scanned (20260811090000, `now() + interval '10
+        # minutes'`). So the clock starts at the scan, not at bind — a user who
+        # has not scanned yet has no clock running at all, and one who scanned a
+        # moment ago has the full ten minutes rather than five.
+        #
+        # Which matters because the likeliest reader here has NOT scanned: they
+        # were installing the app while bind timed out. The old text opened with
+        # "Already scanned it?" and told them their window was half gone.
         #
         # The command is `vaultbeat-mcp`, not `vaultbeat-mcp-local`. That alias
         # exists for pre-rename installs, but the documented install path
@@ -250,10 +256,23 @@ def handle_bind(args: argparse.Namespace) -> int:
         # fails outright with "not found in the package registry". Printing it to
         # the one reader who by definition has not read the README was the worst
         # possible place to get this wrong.
-        print("Already scanned it? For the next ~5 minutes you can resume this")
-        print("pairing without a new QR:")
+        print("Not scanned yet? The QR above is still good — nothing expires until")
+        print("someone scans it. Scan it FIRST, then pick the pairing back up with:")
         print("  uvx vaultbeat-mcp poll")
-        print("After that it expires — just run `uvx vaultbeat-mcp bind` again.")
+        print()
+        print("Already scanned? You have 10 minutes from the moment you scanned to")
+        print("run that same command. After that, run `uvx vaultbeat-mcp bind` for")
+        print("a fresh code.")
+        print()
+        # Ordering matters and the failure is counter-intuitive: the pairing row
+        # is created BY THE SCAN, so polling before scanning finds no row and the
+        # endpoint correctly answers `expired` — whose own advice is to re-run
+        # `bind`. Following that mints a new pollID and invalidates the QR still
+        # on screen, turning "one scan away" into "cannot complete". Cheap to
+        # warn about, expensive to discover.
+        print("(Running poll BEFORE scanning reports `expired` — that is just")
+        print(" 'no scan has arrived', not a dead code. Don't re-run bind on it;")
+        print(" a new bind replaces the QR you are looking at.)")
         return 2
 
     print(f"Bound local MCP server: {result.server_id}")

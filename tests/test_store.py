@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from vaultbeat_mcp_local.crypto import generate_x25519_keypair
 from vaultbeat_mcp_local.store import (
     ConfigError,
     ConfigStore,
@@ -124,12 +125,17 @@ def test_legacy_json_key_is_migrated_to_keychain(
     must migrate it to the Keychain and strip the field from the JSON file."""
     config_path = tmp_path / "config.json"
 
-    # Write a legacy-style config with the key in the JSON.
+    # A REAL keypair, not two copies of the same placeholder. load() derives the
+    # public key from the private one and refuses a pair that disagrees, because
+    # a mismatch means two identities got crossed and nothing will decrypt — so a
+    # fixture whose "public key" equals its private key no longer represents any
+    # config that could exist.
+    legacy_private, legacy_public = generate_x25519_keypair()
     legacy_payload = {
         "api_base_url": "https://wjpnyxglgtmtgjuuhwru.supabase.co/functions/v1",
         "server_name": "Old Mac",
-        "private_key_base64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-        "public_key_base64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "private_key_base64": legacy_private,
+        "public_key_base64": legacy_public,
     }
     write_secret_file(config_path, json.dumps(legacy_payload) + "\n")
 
@@ -248,3 +254,87 @@ def test_ensure_initialized_gives_a_different_config_path_its_own_identity(
     second = ConfigStore(tmp_path / "b" / "config.json").ensure_initialized()
 
     assert first.public_key_base64 != second.public_key_base64
+
+
+# ---------------------------------------------------------------------------
+# The public/private consistency check — added 2026-08-18 after independent
+# verification found it had ZERO coverage in the direction that matters:
+# deleting the whole comparison from store.py left all 266 tests green.
+#
+# The reverse direction was already pinned by accident (inverting the operator
+# reddens ~117 tests, because "a normal config must load" is asserted
+# everywhere), so what was missing is proof that it FIRES. Without that, the
+# next person who finds the block redundant deletes it and CI says nothing —
+# the same shape as Invariant 58.
+# ---------------------------------------------------------------------------
+
+
+def test_a_keyring_key_that_disagrees_with_the_stored_public_key_is_refused(
+    tmp_path: Path, fake_keychain: dict[tuple[str, str], str]
+) -> None:
+    """Two identities crossed must fail loudly rather than half-work.
+
+    Reachable in practice: lose config.json while the keyring is unreachable,
+    let the file fallback mint a new identity, then restore keyring access —
+    now the keyring key (older, higher priority) is paired with the newer
+    stored public key. Before this check the mismatch was silent, and the
+    damage was invisible: bind sends the STORED public key while decryption
+    uses the private one, so pairing succeeds and nothing ever decrypts.
+    """
+    config_path = tmp_path / "config.json"
+    store = ConfigStore(config_path)
+    store.ensure_initialized()
+
+    # Swap the keyring's key for a different, perfectly valid one.
+    other_private, _ = generate_x25519_keypair()
+    username = _keychain_username(config_path)
+    fake_keychain[(_KEYCHAIN_SERVICE, username)] = other_private
+
+    with pytest.raises(ConfigError) as caught:
+        store.load()
+    assert "does not match" in str(caught.value)
+
+
+def test_an_unusable_private_key_is_reported_as_such_not_as_a_mismatch(
+    tmp_path: Path, fake_keychain: dict[tuple[str, str], str]
+) -> None:
+    """A corrupted key and two crossed identities need different answers.
+
+    Both surface at the same line; only the second is about identity. Telling
+    someone their keys belong to different identities when the real problem is
+    a truncated file sends them looking for a second install that never existed.
+    """
+    config_path = tmp_path / "config.json"
+    store = ConfigStore(config_path)
+    store.ensure_initialized()
+
+    username = _keychain_username(config_path)
+    fake_keychain[(_KEYCHAIN_SERVICE, username)] = "not-valid-base64!!!"
+
+    with pytest.raises(ConfigError) as caught:
+        store.load()
+    assert "present but unusable" in str(caught.value)
+
+
+def test_a_config_with_no_reachable_key_names_all_three_locations(
+    tmp_path: Path, fake_keychain: dict[tuple[str, str], str]
+) -> None:
+    """The error must name every place looked, and must not suggest deleting.
+
+    'missing key material' used to name config.json and nothing else, so the
+    reader's next move was to delete it — the one irreversible action here,
+    since the key lives outside that file and deleting mints a new identity.
+    """
+    config_path = tmp_path / "config.json"
+    store = ConfigStore(config_path)
+    store.ensure_initialized()
+
+    fake_keychain.clear()  # key gone from the keyring, and no identity.key exists
+
+    with pytest.raises(ConfigError) as caught:
+        store.load()
+    message = str(caught.value)
+    assert "VAULTBEAT_PRIVATE_KEY" in message
+    assert "system keyring" in message
+    assert "identity.key" in message
+    assert "DO NOT DELETE" in message
