@@ -19,7 +19,7 @@ iPhone (Apple Health) ──E2EE──▶ cloud (ciphertext only) ──E2EE─�
 
 ## Requirements
 
-- [Vaultbeat — AI Health Sync](https://apps.apple.com/app/id6759241985) on iOS, with a **Pro** subscription (the AI-agent interface is the Pro tier)
+- [Vaultbeat — AI Health Sync](https://apps.apple.com/app/id6759241985) on iOS, **version 1.2.3 or later** — connecting an AI server is open on every plan, and pairing a machine starts three days of full agent access. (On 1.2.2 and earlier, connecting required a Pro subscription; update the app first.)
 - Python 3.11+ on the machine where your agent runs (macOS / Linux / Windows)
 
 ## Quick start
@@ -60,7 +60,21 @@ don't start that one first and sit waiting for a code.
 dependency. The extra is still declared, empty, so older published commands
 keep resolving; you no longer need it.)
 
-This generates a keypair on your machine and prints a QR code. In the Vaultbeat iOS app, open **Settings → Data & AI → Connect an AI server** and scan it (or import a QR screenshot from Photos). The app authorizes this machine and starts sealing your health envelopes to its public key. The private key stays in `~/.tether/mcp-local/` (owner-only `0600` permissions, OS keychain where available) — it is never uploaded anywhere. (The directory keeps its original pre-rename path so existing bindings survive upgrades.)
+This generates a keypair on your machine and prints a QR code. In the Vaultbeat iOS app, open **Settings → Data & AI → Connect an AI server** and scan it (or import a QR screenshot from Photos). The app authorizes this machine and starts sealing your health envelopes to its public key. Config lives in `~/.tether/mcp-local/` with owner-only `0600` permissions. (The directory keeps its original pre-rename path so existing bindings survive upgrades.)
+
+**Where the private key is kept — it is never uploaded anywhere, but *where* it sits depends on the machine:**
+
+| Layer | When it is used |
+|---|---|
+| `VAULTBEAT_PRIVATE_KEY` environment variable | If set, it wins. Read only — never written back, because an injected key belongs to whoever injected it |
+| System keyring | The default on any machine that has one (macOS Keychain, GNOME Keyring, Windows Credential Locker) |
+| `identity.key`, `0600`, next to `config.json` | **Only** when the platform has no keyring backend at all — a headless server, a container |
+
+The file fallback is deliberately narrow: a *locked* keychain, a denied prompt, or a D-Bus hiccup all raise instead of quietly writing a plaintext key to disk. It is a separate file from `config.json` on purpose — that file holds your server token, and `config.json` is what people `cat` into bug reports. The token alone can download ciphertext it cannot read; the key alone has nothing to decrypt. Keeping them apart means one careless paste is not total exposure.
+
+Run `uvx vaultbeat-mcp@latest doctor` to see which of the three your machine is actually using (it reports the *layer*, never the key).
+
+> **Headless Linux**: if the keyring errors out even though a desktop session exists, the usual cause is that the process was launched without `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`. Add both to the MCP server's launch environment. On a truly headless box with no keyring at all, do nothing — the `identity.key` fallback handles it. Never set `PYTHON_KEYRING_BACKEND` to the null backend to silence the warning: it accepts writes and stores nothing.
 
 ### 3. Connect your agent
 

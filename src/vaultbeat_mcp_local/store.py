@@ -170,10 +170,70 @@ def _keyring_env_hint() -> str:
         "even though one is running. Check from an interactive shell:\n"
         "    env | grep -E 'DBUS_SESSION_BUS_ADDRESS|XDG_RUNTIME_DIR'\n"
         "and add both to this MCP server's launch environment.\n"
-        f"On a headless server with no keyring at all, set {PRIVATE_KEY_ENV}\n"
-        "instead, or let Vaultbeat store the key in a 0600 file (it does this\n"
-        "automatically when no backend exists)."
+        "On a headless server with no keyring at all, do nothing: Vaultbeat\n"
+        "stores the key in a 0600 identity.key file automatically when no\n"
+        "backend exists.\n"
+        f"Do NOT set PYTHON_KEYRING_BACKEND to the null backend to silence this.\n"
+        "That backend accepts writes and stores nothing, which is worse than the\n"
+        "error you are trying to remove.\n"
+        f"({PRIVATE_KEY_ENV} also works, but only if you already hold the key from\n"
+        "systemd-creds, a vault or a KMS — there is no command that prints it.)"
     )
+
+
+def _key_lookup_diagnosis(config_path: Path) -> str:
+    """Report what was actually found in each of the three key locations.
+
+    Exists because "missing key material" named only config.json, and the
+    reader's next move — delete it and start over — is the single most
+    destructive action available here: the key usually lives OUTSIDE that file,
+    so removing it mints a new identity and orphans every envelope already
+    sealed to the old one (see `ensure_initialized`, and the 8721 envelopes it
+    documents).
+
+    Reporting the LAYER, never the value. And every probe is individually
+    guarded: this runs on the error path, so a failure inside the diagnosis
+    must never replace the error it is trying to explain.
+    """
+    lines: list[str] = []
+    keyring_is_a_dead_end = False
+
+    injected = ""
+    try:
+        injected = os.getenv(PRIVATE_KEY_ENV, "").strip()
+    except Exception:  # pragma: no cover - os.getenv does not raise in practice
+        pass
+    lines.append(
+        f"  {PRIVATE_KEY_ENV}: {'set' if injected else 'not set'}"
+    )
+
+    try:
+        backend = type(keyring.get_keyring()).__name__
+    except Exception as exc:
+        backend = f"could not be determined ({type(exc).__name__})"
+    try:
+        stored = keyring.get_password(_KEYCHAIN_SERVICE, _keychain_username(config_path))
+        if stored:
+            lines.append(f"  system keyring [{backend}]: holds a key")
+        else:
+            lines.append(f"  system keyring [{backend}]: no entry for this config path")
+            keyring_is_a_dead_end = True
+    except Exception as exc:
+        lines.append(f"  system keyring [{backend}]: unreachable ({type(exc).__name__})")
+        keyring_is_a_dead_end = True
+
+    try:
+        identity_path = identity_file_path(config_path)
+        lines.append(
+            f"  {identity_path}: {'present' if identity_path.is_file() else 'not found'}"
+        )
+    except Exception as exc:  # pragma: no cover - path arithmetic does not raise
+        lines.append(f"  identity.key: could not be checked ({type(exc).__name__})")
+
+    report = "The private key was looked for in all three of its locations:\n" + "\n".join(lines)
+    if keyring_is_a_dead_end:
+        report += _keyring_env_hint()
+    return report
 
 
 def _keychain_store(config_path: Path, private_key_base64: str) -> None:
@@ -182,11 +242,36 @@ def _keychain_store(config_path: Path, private_key_base64: str) -> None:
     Order: system keyring → 0600 file. `PRIVATE_KEY_ENV` is deliberately NOT
     written to — an externally-injected key belongs to whoever injected it, and
     copying it onto disk would defeat the reason they injected it.
+
+    🔴 The write is VERIFIED BY READING IT BACK, and that is not belt-and-braces
+    — it is the only thing standing between a headless install and silent key
+    loss. `keyring.backends.null.Keyring` implements every operation as a bare
+    `pass`: `set_password` returns None and raises nothing, so a
+    "succeeded → return" check hands back success while storing the key
+    NOWHERE. The file fallback below never runs, `save()` then strips the key
+    from config.json as designed, and the freshly minted private key ceases to
+    exist — measured 2026-08-17 on a clean config: bind reports success and the
+    directory contains only config.json, with no identity.key.
+
+    That backend is not exotic. It is what `PYTHON_KEYRING_BACKEND=...null...`
+    selects, which is exactly what someone sets to silence a keyring error on a
+    server — the machine most likely to have no keyring is the one most likely
+    to reach this branch.
+
+    So the predicate is "can I read back what I just wrote", not "did the call
+    raise". A write that reports success is only an echo of the request; the
+    read is the evidence.
     """
     username = _keychain_username(config_path)
     try:
         keyring.set_password(_KEYCHAIN_SERVICE, username, private_key_base64)
-        return
+        if keyring.get_password(_KEYCHAIN_SERVICE, username) == private_key_base64:
+            return
+        logger.warning(
+            "The keyring backend accepted the private key but did not store it "
+            "(read-back returned nothing, or a different value). Falling back to a "
+            "0600 file — this is what the null backend does."
+        )
     except Exception as exc:
         if not _keyring_unavailable(exc):
             logger.error(
@@ -283,12 +368,46 @@ class ConfigStore:
         # ----------------------------------------------------------------------
 
         private_key_base64 = _keychain_load(self.path) or ""
-        public_key_base64 = str(raw.get("public_key_base64", "")).strip()
-        if private_key_base64 and not public_key_base64:
-            public_key_base64 = public_key_from_private(private_key_base64)
+        if not private_key_base64:
+            raise ConfigError(
+                f"Config at {self.path} exists, but its private key could not be read.\n"
+                f"{_key_lookup_diagnosis(self.path)}\n\n"
+                f"DO NOT DELETE {self.path} to start over. The private key is not "
+                "stored in it, so deleting it does not clear a bad key — it mints a "
+                "NEW identity, and every record already encrypted for the old one "
+                "becomes permanently unreadable."
+            )
 
-        if not private_key_base64 or not public_key_base64:
-            raise ConfigError(f"Config at {self.path} is missing key material")
+        # Always derive, then compare — never trust the stored value on its own.
+        # These can disagree, and when they do everything downstream is quietly
+        # wrong: the QR payload sent at bind time comes from the stored public
+        # key while decryption uses this private key, so pairing "succeeds" and
+        # then nothing can ever be decrypted. The way in is mundane — lose
+        # config.json while the keyring is unreachable, let the file fallback
+        # mint a new identity, then restore keyring access: now the keyring key
+        # (older, higher priority) is paired with the newer stored public key.
+        try:
+            derived_public_key = public_key_from_private(private_key_base64)
+        except Exception as error:
+            raise ConfigError(
+                f"The private key for {self.path} is present but unusable "
+                f"({type(error).__name__}). It may be truncated or corrupted.\n"
+                f"{_key_lookup_diagnosis(self.path)}"
+            ) from error
+
+        stored_public_key = str(raw.get("public_key_base64", "")).strip()
+        if stored_public_key and stored_public_key != derived_public_key:
+            raise ConfigError(
+                f"The public key recorded in {self.path} does not match the private "
+                "key currently in use — they belong to two different identities, so "
+                "nothing sealed for either one can be decrypted reliably.\n"
+                f"{_key_lookup_diagnosis(self.path)}\n\n"
+                "This usually means a second identity was created while the first "
+                "key was unreachable. Whichever identity the cloud holds envelopes "
+                "for is the one worth keeping; re-pair this machine once you know "
+                "which private key that is."
+            )
+        public_key_base64 = derived_public_key
 
         return LocalServerConfig(
             server_name=str(raw.get("server_name", "Local AI Server")).strip() or "Local AI Server",
