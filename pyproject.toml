@@ -27,7 +27,7 @@ name = "vaultbeat-mcp"
 # A comment cannot enforce this. `scripts/ci/check_mcp_registry_current.py`
 # now does, with one rule per failure above; if that guard is ever deleted,
 # this paragraph is what comes back.
-version = "0.4.5"
+version = "0.4.6"
 description = "Local MCP server for Vaultbeat — AI Health Sync: your AI agent reads your end-to-end-encrypted Apple Health data (sleep, cycle, weight, water), decrypted only on your machine"
 readme = "README.md"
 requires-python = ">=3.11"
