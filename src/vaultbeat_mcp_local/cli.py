@@ -110,6 +110,12 @@ def handle_doctor(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         _print_json(report)
     else:
+        # First line, before any [OK], so it cannot be scrolled past: every
+        # number below is synthetic and the checks below cover a demo, not an
+        # install.
+        if report.get("demo_mode"):
+            print(f"[DEMO] {report.get('demo_warning', '')}")
+            print()
         for check in report["checks"]:
             marker = "[OK]  " if check["ok"] else "[FAIL]"
             print(f"{marker} {check['name']}: {check['detail']}")
@@ -131,6 +137,22 @@ def handle_doctor(args: argparse.Namespace) -> int:
                 print(f"       → {caps['note']}")
             else:
                 print(f"[OK]   capabilities: all {len(caps.get('kinds_with_data', []))} data types present")
+
+        # Rows this run deliberately skipped, each with its reason. In demo mode
+        # the checks that ARE run all pass, so without this the CLI ends on "All
+        # checks passed." while config, binding, cloud reachability and the data
+        # round trip were never attempted — the exact green-tick-as-evidence
+        # problem the demo branch of `doctor()` exists to avoid. The JSON carried
+        # it from the start; the human-facing rendering dropped it, which is the
+        # half a person actually reads.
+        skipped = report.get("not_checked") or {}
+        if skipped:
+            print()
+            print("[SKIP] Not attempted in this run:")
+            for name, reason in sorted(skipped.items()):
+                print(f"       {name} — {reason}")
+            if report.get("next_step"):
+                print(f"       → {report['next_step']}")
 
         # What was NOT checked. Printed last and unconditionally — a passing run
         # is precisely when this matters, because "All checks passed" otherwise
@@ -550,6 +572,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="vaultbeat-mcp")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--config", help="Path to config JSON. Defaults to ~/.tether/mcp-local/config.json.")
+    # 🔴 A FLAG AND AN ENV VAR, NEVER A CONFIG FIELD. Both die with the process.
+    # A persisted `"demo": true` would survive a reboot while being invisible in
+    # every screen anyone looks at — and weeks later "how did I sleep last week?"
+    # would get a confident, plausible, entirely fabricated answer about a real
+    # person's health. That failure has no loud edge; it just quietly stops being
+    # true. The cost of this choice is that demo mode must be re-stated on every
+    # invocation, which is the point.
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help=(
+            "Serve SYNTHETIC health records instead of reading a real account. No "
+            "binding, no network, no decryption; write commands refuse. For trying "
+            "the tools out or reproducing a bug without handing over a key. Applies "
+            "to this invocation only — equivalent to setting VAULTBEAT_DEMO=1."
+        ),
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -638,7 +677,7 @@ def build_parser() -> argparse.ArgumentParser:
     sleep_parser.add_argument("--limit", type=int)
     sleep_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
     )
     sleep_parser.add_argument(
         "--fresh",
@@ -655,7 +694,7 @@ def build_parser() -> argparse.ArgumentParser:
     sleep_detail_parser.add_argument("--limit", type=int, help="Keep at most N most recent nights.")
     sleep_detail_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
     )
     sleep_detail_parser.add_argument(
         "--fresh",
@@ -671,7 +710,7 @@ def build_parser() -> argparse.ArgumentParser:
     water_parser.add_argument("--limit", type=int)
     water_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
     )
     water_parser.add_argument(
         "--fresh",
@@ -688,7 +727,7 @@ def build_parser() -> argparse.ArgumentParser:
     weight_parser.add_argument("--limit", type=int, help="Keep at most N most recent body days.")
     weight_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
     )
     weight_parser.add_argument(
         "--fresh",
@@ -711,7 +750,7 @@ def build_parser() -> argparse.ArgumentParser:
     menstrual_parser.add_argument("--limit", type=int)
     menstrual_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
     )
     menstrual_parser.add_argument(
         "--fresh",
@@ -727,7 +766,7 @@ def build_parser() -> argparse.ArgumentParser:
     activity_parser.add_argument("--limit", type=int)
     activity_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
     )
     activity_parser.add_argument(
         "--fresh",
@@ -743,7 +782,7 @@ def build_parser() -> argparse.ArgumentParser:
     resting_hr_parser.add_argument("--limit", type=int)
     resting_hr_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
     )
     resting_hr_parser.add_argument(
         "--fresh",
@@ -759,7 +798,7 @@ def build_parser() -> argparse.ArgumentParser:
     workouts_parser.add_argument("--limit", type=int)
     workouts_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
     )
     workouts_parser.add_argument(
         "--fresh",
@@ -775,7 +814,7 @@ def build_parser() -> argparse.ArgumentParser:
     mindfulness_parser.add_argument("--limit", type=int)
     mindfulness_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
     )
     mindfulness_parser.add_argument(
         "--fresh",
@@ -791,7 +830,7 @@ def build_parser() -> argparse.ArgumentParser:
     hrv_parser.add_argument("--limit", type=int)
     hrv_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
     )
     hrv_parser.add_argument(
         "--fresh",
@@ -814,7 +853,7 @@ def build_parser() -> argparse.ArgumentParser:
     wrist_temp_parser.add_argument("--limit", type=int)
     wrist_temp_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. dce9 or f835).",
+        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
     )
     wrist_temp_parser.add_argument(
         "--fresh",
@@ -933,6 +972,20 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Set here, once, rather than inside `_service()` / `_store()`: `serve` never
+    # goes through either — it hands a ConfigStore to `run_mcp_server`, which asks
+    # `demo_enabled()` itself — so a flag applied in the service factory would be
+    # silently ignored by the one subcommand a reviewer is most likely to run.
+    #
+    # Only ever set, never unset: `--demo` turns demo mode ON, and its absence
+    # means "whatever the environment already said", so a wrapper that exports
+    # VAULTBEAT_DEMO keeps working.
+    if getattr(args, "demo", False):
+        from vaultbeat_mcp_local.demo import DEMO_ENV
+
+        os.environ[DEMO_ENV] = "1"
+
     try:
         return int(args.func(args))
     except Exception as error:

@@ -4,30 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vaultbeat-mcp"
-# ⚠️ RELEASES GO OUT FROM THE PUBLIC REPO (Fino-wind/vaultbeat-mcp), never from
-# the monorepo's copy of this file. Only the public README carries the
-# `mcp-name` marker the official MCP Registry validates; the monorepo's README
-# is developer-facing and does not, so a wheel built there reaches PyPI with no
-# marker and the Registry 403s it — the package installs fine via uvx and is
-# invisible to every directory that ingests the Registry.
-# Flow: sync src (excluding README) → bump BOTH pyprojects → build and publish
-# from the public repo.
-#
-# 🔴 This warning has sat directly above the version line since 2026-08-07,
-# when 0.3.1 was burned this way. It half-worked, and the two halves fail
-# differently — verified per-version against PyPI on 2026-08-18, not recalled:
-#   0.3.11 · 0.4.0 · 0.4.1 · 0.4.2  built from the public repo, marker PRESENT,
-#     publishable to the Registry — and nobody ever ran `mcp-publisher publish`.
-#   0.4.3 · 0.4.4                   built from the monorepo, marker ABSENT,
-#     so the Registry 403s them and the version numbers are spent.
-# Net effect for five releases: every directory that ingests the Registry
-# (Glama, PulseMCP, mcp.so) kept handing installers 0.3.11 — the last build
-# WITHOUT headless key storage, i.e. the one that loses its private key on a
-# server. The worst possible version to be pinned to.
-# A comment cannot enforce this. `scripts/ci/check_mcp_registry_current.py`
-# now does, with one rule per failure above; if that guard is ever deleted,
-# this paragraph is what comes back.
-version = "0.4.6"
+# ⚠️ NEVER `uv publish` FROM THIS DIRECTORY. Releases go out from the public
+# repo (~/Desktop/vaultbeat-mcp) — its README carries the `mcp-name` marker the
+# official MCP Registry validates; THIS readme does not, so a wheel built here
+# reaches PyPI with no marker and the Registry 403s it. Version 0.3.1 was burned
+# exactly this way on 2026-08-07 (installs fine via uvx, useless to the
+# Registry). Flow: sync src → bump BOTH pyprojects → build+publish over there.
+version = "0.5.1"
 description = "Local MCP server for Vaultbeat — AI Health Sync: your AI agent reads your end-to-end-encrypted Apple Health data (sleep, cycle, weight, water), decrypted only on your machine"
 readme = "README.md"
 requires-python = ">=3.11"

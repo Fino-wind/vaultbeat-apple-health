@@ -164,7 +164,7 @@ def test_run_mcp_server_stdio_uses_mcp_run(monkeypatch: Any, tmp_path: Path) -> 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
 
-        def tool(self) -> Any:
+        def tool(self, *args: Any, **kwargs: Any) -> Any:
             def decorator(function: Any) -> Any:
                 return function
 
@@ -196,7 +196,7 @@ def test_run_mcp_server_registers_water_and_menstrual_tools(
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
 
-        def tool(self) -> Any:
+        def tool(self, *args: Any, **kwargs: Any) -> Any:
             def decorator(function: Any) -> Any:
                 registered.append(function.__name__)
                 return function
@@ -234,7 +234,7 @@ def test_get_hrv_falls_back_to_raw_when_hourly_is_empty(
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
 
-        def tool(self) -> Any:
+        def tool(self, *args: Any, **kwargs: Any) -> Any:
             def decorator(function: Any) -> Any:
                 tools[function.__name__] = function
                 return function
@@ -293,7 +293,7 @@ def test_get_hrv_prefers_hourly_when_available(monkeypatch: Any, tmp_path: Path)
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
 
-        def tool(self) -> Any:
+        def tool(self, *args: Any, **kwargs: Any) -> Any:
             def decorator(function: Any) -> Any:
                 tools[function.__name__] = function
                 return function
@@ -337,7 +337,7 @@ def _capture_tools(monkeypatch: Any) -> dict[str, Any]:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
 
-        def tool(self) -> Any:
+        def tool(self, *args: Any, **kwargs: Any) -> Any:
             def decorator(function: Any) -> Any:
                 tools[function.__name__] = function
                 return function
@@ -427,3 +427,338 @@ def test_vaultbeat_doctor_is_exposed_as_a_tool(monkeypatch: Any, tmp_path: Path)
     assert "vaultbeat_doctor" in tools
     result = asyncio.run(tools["vaultbeat_doctor"]())
     assert result["capabilities"]["available"] is True
+
+
+# ── Tool metadata: title + annotations ──────────────────────────────────────
+
+
+def _capture_tool_meta(monkeypatch: Any) -> dict[str, dict[str, Any]]:
+    """Register the MCP surface and return {tool_name: {title, annotations}}.
+
+    Distinct from `_capture_tools`, which throws the kwargs away — here the
+    kwargs ARE the thing under test.
+    """
+    meta: dict[str, dict[str, Any]] = {}
+
+    class FakeFastMCP:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            meta.setdefault("__server__", {})["name"] = args[0] if args else None
+
+        def tool(self, *args: Any, **kwargs: Any) -> Any:
+            def decorator(function: Any) -> Any:
+                meta[function.__name__] = dict(kwargs)
+                return function
+
+            return decorator
+
+        def run(self, **kwargs: Any) -> None:
+            pass
+
+    fake_module = types.ModuleType("mcp.server.fastmcp")
+    fake_module.FastMCP = FakeFastMCP
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_module)
+    return meta
+
+
+def test_every_tool_carries_a_title_and_annotations(monkeypatch: Any, tmp_path: Path) -> None:
+    """Annotations travel in `list_tools`, so a client decides whether to prompt
+    for confirmation BEFORE running anything. A tool with none defaults, per the
+    MCP spec, to the most alarming reading (`destructiveHint` defaults to true) —
+    so an unannotated read tool is not merely undescribed, it is mis-described.
+    """
+    meta = _capture_tool_meta(monkeypatch)
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    tools = {k: v for k, v in meta.items() if not k.startswith("__")}
+    missing_title = sorted(k for k, v in tools.items() if not v.get("title"))
+    missing_annotations = sorted(k for k, v in tools.items() if v.get("annotations") is None)
+
+    assert missing_title == []
+    assert missing_annotations == []
+    # Titles are what a human picks from in a tool list; two identical ones make
+    # the pair unpickable. The sleep pair is the live example — one goes deep on
+    # a night, the other spans weeks.
+    titles = [v["title"] for v in tools.values()]
+    assert len(titles) == len(set(titles))
+
+
+def test_read_tools_are_annotated_read_only(monkeypatch: Any, tmp_path: Path) -> None:
+    meta = _capture_tool_meta(monkeypatch)
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    for name in ("vaultbeat_status", "get_sleep_detail", "get_food_log", "get_hrv"):
+        annotations = meta[name]["annotations"]
+        assert annotations.readOnlyHint is True, name
+        assert annotations.destructiveHint is False, name
+
+
+def test_only_the_doctor_reaches_outside_this_system(monkeypatch: Any, tmp_path: Path) -> None:
+    """`openWorldHint` says a tool talks to an unbounded external world.
+
+    Everything else here speaks only to the owner's own Supabase project, which
+    is a closed system from the caller's point of view; `vaultbeat_doctor` is the
+    one tool that asks PyPI a question. If a second tool ever needs this, that is
+    a fact worth noticing rather than a line to relax.
+    """
+    meta = _capture_tool_meta(monkeypatch)
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    open_world = sorted(
+        name
+        for name, kwargs in meta.items()
+        if not name.startswith("__") and kwargs["annotations"].openWorldHint
+    )
+    assert open_world == ["vaultbeat_doctor"]
+
+
+def test_append_tools_are_annotated_non_destructive_and_entry_tools_are_not(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """The whole point of the split, in one assertion.
+
+    `merge=True` and `log_food_append` do exactly the same thing — the
+    difference is that an ARGUMENT cannot be annotated. A tool with both modes
+    has to be published as destructive (worst case), so the only way an agent
+    can be told "this call cannot delete anything" is a separate tool.
+    """
+    meta = _capture_tool_meta(monkeypatch)
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    for entry, append in (
+        ("log_food_entry", "log_food_append"),
+        ("log_strength_entry", "log_strength_append"),
+        ("log_note", "log_note_append"),
+    ):
+        assert meta[entry]["annotations"].destructiveHint is True, entry
+        assert meta[append]["annotations"].destructiveHint is False, append
+        assert meta[append]["annotations"].readOnlyHint is False, append
+
+
+# ── Append tools ─────────────────────────────────────────────────────────────
+
+
+def test_append_tools_are_registered(monkeypatch: Any, tmp_path: Path) -> None:
+    tools = _capture_tools(monkeypatch)
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    for name in ("log_food_append", "log_strength_append", "log_note_append"):
+        assert name in tools
+
+
+@pytest.mark.parametrize(
+    ("append_tool", "service_method", "payload"),
+    [
+        ("log_food_append", "log_food_entry", {"date": "2026-08-20", "meals": [{"items": []}]}),
+        (
+            "log_strength_append",
+            "log_strength_entry",
+            {"date": "2026-08-20", "exercises": [{"name": "卧推", "sets": []}]},
+        ),
+        ("log_note_append", "log_note", {"text": "恶心", "kind": "general"}),
+    ],
+)
+def test_append_tool_is_the_entry_tool_with_merge_true(
+    monkeypatch: Any,
+    tmp_path: Path,
+    append_tool: str,
+    service_method: str,
+    payload: dict[str, Any],
+) -> None:
+    """The zero-duplication guarantee, mechanically.
+
+    The append tools are one line each — a fixed call into the same service
+    method — and nothing but this test stops someone growing a second
+    implementation behind one of them. If that ever happens, the merge/note
+    kwargs stop matching and this goes red.
+    """
+    tools = _capture_tools(monkeypatch)
+    seen: dict[str, Any] = {}
+
+    async def spy(self: Any, **kwargs: Any) -> dict[str, Any]:
+        seen.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        f"vaultbeat_mcp_local.service.VaultbeatLocalService.{service_method}", spy
+    )
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    asyncio.run(tools[append_tool](**payload))
+
+    assert seen["merge"] is True
+    if service_method == "log_note":
+        # log_note's text IS the note; there is no separate replace-only field
+        # to withhold, so the append tool forwards no `note` kwarg at all.
+        assert "note" not in seen
+    else:
+        assert seen["note"] is None
+    for key, value in payload.items():
+        assert seen[key] == value
+
+
+def test_append_tools_cannot_touch_the_replace_only_note(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """`note` is replace-only even under `merge=True` — `_resolve_note("x", old)`
+    returns "x" and the old note is gone.
+
+    So a tool published as `destructiveHint=False` must not expose it, or the one
+    field that was actually lost in the 2026-07-27 incident ('腿日 + 腹肌') stays
+    deletable through the tool whose whole promise is that nothing can be. Not
+    exposing it makes that a property of the signature rather than of a docstring
+    nobody has to obey.
+    """
+    import inspect
+
+    tools = _capture_tools(monkeypatch)
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    for name in ("log_food_append", "log_strength_append"):
+        assert "note" not in inspect.signature(tools[name]).parameters, name
+
+
+# ── Demo mode ────────────────────────────────────────────────────────────────
+
+
+def test_demo_mode_watermarks_every_tool_result(monkeypatch: Any, tmp_path: Path) -> None:
+    """A pasted tool result has to identify itself as synthetic.
+
+    The description prefix covers the live session; this covers everything that
+    outlives it — a screenshot, a bug report, a payload quoted into a document
+    three weeks later. Neither one substitutes for the other.
+    """
+    monkeypatch.setenv("VAULTBEAT_DEMO", "1")
+    tools = _capture_tools(monkeypatch)
+
+    async def fake_food(self: Any, **_: Any) -> dict[str, Any]:
+        return {"days": [{"date": "2026-08-18"}], "day_count": 1}
+
+    monkeypatch.setattr(
+        "vaultbeat_mcp_local.service.VaultbeatLocalService.food_summary", fake_food
+    )
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    result = asyncio.run(tools["get_food_log"]())
+    assert result["demo_mode"] is True
+    assert "SYNTHETIC" in result["demo_warning"]
+    # Add-only: the real payload survives untouched.
+    assert result["day_count"] == 1
+
+
+def test_demo_mode_wraps_sync_tools_too(monkeypatch: Any, tmp_path: Path) -> None:
+    """Two of these tools are plain `def`, not `async def`.
+
+    One sync wrapper around a coroutine function would hand FastMCP a coroutine
+    object as the result — the tool would "succeed" and return something
+    unserialisable — so the wrapper has to branch on the shape.
+    `vaultbeat_start_binding` is the sync one that returns a plain dict.
+    """
+    monkeypatch.setenv("VAULTBEAT_DEMO", "1")
+    tools = _capture_tools(monkeypatch)
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    result = tools["vaultbeat_start_binding"]()
+    assert not asyncio.iscoroutine(result)
+    assert result["demo_mode"] is True
+    assert "poll_id" in result
+
+
+def test_demo_mode_prefixes_every_tool_description(monkeypatch: Any, tmp_path: Path) -> None:
+    """The warning has to be in the DESCRIPTION, not only in results.
+
+    A description is read once and stays in context for the session; a
+    per-result banner has to survive the agent paraphrasing three calls into one
+    sentence. The prefix is what stops "your HRV was 42" being said about a
+    person who does not exist.
+    """
+    monkeypatch.setenv("VAULTBEAT_DEMO", "1")
+    tools = _capture_tools(monkeypatch)
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    for name, function in tools.items():
+        assert (function.__doc__ or "").startswith("⚠️ DEMO MODE"), name
+        # The original text must still be there — the prefix prepends, it does
+        # not replace, so everything the tool said about its own arguments and
+        # its own traps survives.
+        assert len(function.__doc__ or "") > 200, name
+
+
+def test_demo_mode_keeps_the_real_signature(monkeypatch: Any, tmp_path: Path) -> None:
+    """FastMCP builds each tool's JSON schema from `inspect.signature(fn)`.
+
+    `functools.wraps` sets `__wrapped__`, which `signature` follows — without it
+    every wrapped tool would publish `(*args, **kwargs)` and clients would lose
+    every parameter. Cosmetic-looking, load-bearing.
+    """
+    import inspect
+
+    monkeypatch.setenv("VAULTBEAT_DEMO", "1")
+    tools = _capture_tools(monkeypatch)
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    params = inspect.signature(tools["get_hrv"]).parameters
+    assert sorted(params) == ["fresh", "granularity", "limit", "owner"]
+
+
+def test_demo_mode_renames_the_server(monkeypatch: Any, tmp_path: Path) -> None:
+    """serverInfo is the one label a client shows without calling anything."""
+    monkeypatch.setenv("VAULTBEAT_DEMO", "1")
+    meta = _capture_tool_meta(monkeypatch)
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    assert "DEMO" in meta["__server__"]["name"]
+
+
+def test_without_demo_the_tools_are_not_wrapped_at_all(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Production must be byte-identical to before this feature existed.
+
+    Not a performance point: an unconditional wrapper is a second place every
+    result passes through, on the path that handles real health data. Off means
+    absent, not inert.
+    """
+    monkeypatch.delenv("VAULTBEAT_DEMO", raising=False)
+    tools = _capture_tools(monkeypatch)
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    for name, function in tools.items():
+        assert not hasattr(function, "__wrapped__"), name
+        assert not (function.__doc__ or "").startswith("⚠️ DEMO MODE"), name
+
+
+def test_destructive_titles_name_their_consequence(monkeypatch: Any, tmp_path: Path) -> None:
+    """A `destructiveHint` tool's title must say what it destroys.
+
+    Titles and annotations travel together in `list_tools`, so a client shows
+    the title next to the confirmation prompt the hint triggered — and a title
+    that describes the tool as harmless is what produces reflexive approval.
+    `vaultbeat_poll_binding` was called "Check pairing status" while its success
+    branch replaces server_id, rotates the server token, rewrites the owner
+    identity and can clear the decrypted cache; the annotation was right and the
+    title pointed the other way.
+
+    Written as a rule rather than as two string comparisons on purpose: it is
+    the NEXT destructive tool that needs catching, and a test naming today's two
+    cannot do that. House style is `verb (consequence)`, so the parenthesis is
+    the machine-checkable part of it.
+    """
+    meta = _capture_tool_meta(monkeypatch)
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    offenders = [
+        (name, kwargs["title"])
+        for name, kwargs in meta.items()
+        if name != "__server__"
+        and kwargs["annotations"].destructiveHint
+        and "(" not in kwargs["title"]
+    ]
+    assert not offenders, (
+        "destructive tools whose title does not name the consequence: "
+        f"{offenders}. Use `verb (consequence)`, e.g. 'Log food (replaces day)'."
+    )
+
+    # And the two that prompted the rule say the right thing specifically —
+    # the rule above accepts any parenthesis, which is deliberately loose.
+    assert meta["vaultbeat_poll_binding"]["title"] == "Finish pairing (replaces this binding)"
+    assert meta["vaultbeat_start_binding"]["title"] == "Start pairing (invalidates any open QR)"

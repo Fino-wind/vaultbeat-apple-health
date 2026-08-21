@@ -277,7 +277,7 @@ def test_menstrual_summary_reuses_cache_across_internal_queries(tmp_path: Path) 
             metric_type="menstrual",
             envelope_id="env-m",
             blob_id="blob-m",
-            owner_user_id="f8350dfc-0000-0000-0000-000000000000",
+            owner_user_id="b2b2b2b2-0000-0000-0000-000000000000",
         ),
     ]
 

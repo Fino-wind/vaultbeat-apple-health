@@ -98,7 +98,7 @@ def test_run_mcp_server_configures_http_transport_on_fastmcp_init(
             captured["init_args"] = args
             captured["init_kwargs"] = kwargs
 
-        def tool(self) -> Any:
+        def tool(self, *args: Any, **kwargs: Any) -> Any:
             def decorator(function: Any) -> Any:
                 return function
 

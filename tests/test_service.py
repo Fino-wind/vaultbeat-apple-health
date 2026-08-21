@@ -936,7 +936,7 @@ def test_symptom_summary_groups_by_owner_and_skips_not_present(tmp_path: Path) -
             metric_type="symptom",
             envelope_id="env-s1",
             blob_id="symptom-aaaa1111-100",
-            owner_user_id="f8350dfc-0000-0000-0000-000000000000",
+            owner_user_id="b2b2b2b2-0000-0000-0000-000000000000",
         ),
         _make_envelope(
             public_key,
@@ -949,7 +949,7 @@ def test_symptom_summary_groups_by_owner_and_skips_not_present(tmp_path: Path) -
             metric_type="symptom",
             envelope_id="env-s2",
             blob_id="symptom-bbbb2222-100",
-            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+            owner_user_id="a1a1a1a1-0000-0000-0000-000000000000",
         ),
     ]
 
@@ -959,10 +959,10 @@ def test_symptom_summary_groups_by_owner_and_skips_not_present(tmp_path: Path) -
     assert summary["sensitive"] is True
     assert summary["owner_count"] == 2
     by_owner = {o["owner_user_id"]: o for o in summary["owners"]}
-    her = by_owner["f8350dfc-0000-0000-0000-000000000000"]
+    her = by_owner["b2b2b2b2-0000-0000-0000-000000000000"]
     # notPresent entries must not inflate the per-type tally.
     assert her["symptom_counts"] == {"abdominalCramps": 1}
-    him = by_owner["dce9b9cf-0000-0000-0000-000000000000"]
+    him = by_owner["a1a1a1a1-0000-0000-0000-000000000000"]
     assert him["symptom_counts"] == {"coughing": 1}
 
 
@@ -1001,7 +1001,7 @@ def test_notes_summary_dedups_edits_and_filters_kind(tmp_path: Path) -> None:
             metric_type="note",
             envelope_id="env-n1",
             blob_id=note_id,
-            owner_user_id="f8350dfc-0000-0000-0000-000000000000",
+            owner_user_id="b2b2b2b2-0000-0000-0000-000000000000",
         ),
         _make_envelope(
             public_key,
@@ -1010,7 +1010,7 @@ def test_notes_summary_dedups_edits_and_filters_kind(tmp_path: Path) -> None:
             metric_type="note",
             envelope_id="env-n1-edit",
             blob_id=note_id,
-            owner_user_id="f8350dfc-0000-0000-0000-000000000000",
+            owner_user_id="b2b2b2b2-0000-0000-0000-000000000000",
         ),
         _make_envelope(
             public_key,
@@ -1019,7 +1019,7 @@ def test_notes_summary_dedups_edits_and_filters_kind(tmp_path: Path) -> None:
             metric_type="note",
             envelope_id="env-n2",
             blob_id="note-ffee00112233445566778899aabbccdd",
-            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+            owner_user_id="a1a1a1a1-0000-0000-0000-000000000000",
         ),
     ]
 
@@ -1028,8 +1028,8 @@ def test_notes_summary_dedups_edits_and_filters_kind(tmp_path: Path) -> None:
     assert all_notes["total_note_count"] == 2  # edit deduped by note_id
     kinds = {k["target_kind"]: k for k in all_notes["kinds"]}
     assert kinds["menstrual"]["notes"][0]["text"] == "编辑后"
-    assert kinds["menstrual"]["notes"][0]["owner_user_id"].startswith("f8350dfc")
-    assert kinds["sleep"]["notes"][0]["owner_user_id"].startswith("dce9b9cf")
+    assert kinds["menstrual"]["notes"][0]["owner_user_id"].startswith("b2b2b2b2")
+    assert kinds["sleep"]["notes"][0]["owner_user_id"].startswith("a1a1a1a1")
 
     only_sleep = asyncio.run(service.notes_summary(limit=50, target_kind="sleep"))
     assert only_sleep["total_note_count"] == 1
@@ -1194,7 +1194,7 @@ def test_strength_summary_orders_newest_first_and_computes_volume(tmp_path: Path
             metric_type="strength",
             envelope_id="env-st1",
             blob_id="strength-aaaa000011112222aaaa000011112222",
-            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+            owner_user_id="a1a1a1a1-0000-0000-0000-000000000000",
         ),
         _make_envelope(
             public_key,
@@ -1210,7 +1210,7 @@ def test_strength_summary_orders_newest_first_and_computes_volume(tmp_path: Path
             metric_type="strength",
             envelope_id="env-st2",
             blob_id="strength-bbbb000011112222bbbb000011112222",
-            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+            owner_user_id="a1a1a1a1-0000-0000-0000-000000000000",
         ),
     ]
 
@@ -1302,7 +1302,7 @@ def _bound_service_with_owner_identity(tmp_path: Path) -> tuple[VaultbeatLocalSe
             encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
         )
     ).decode()
-    cloud.owner_user_id = "dce9b9cf-0000-0000-0000-000000000000"
+    cloud.owner_user_id = "a1a1a1a1-0000-0000-0000-000000000000"
     cloud.owner_public_key_base64 = owner_public_b64
     cloud.owner_device_id = "device-owner-1"
 
@@ -1480,7 +1480,7 @@ def test_food_summary_orders_newest_first_and_counts_items(tmp_path: Path) -> No
             metric_type="food",
             envelope_id="env-fd1",
             blob_id="food-aaaa000011112222aaaa000011112222",
-            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+            owner_user_id="a1a1a1a1-0000-0000-0000-000000000000",
         ),
         _make_envelope(
             public_key,
@@ -1501,7 +1501,7 @@ def test_food_summary_orders_newest_first_and_counts_items(tmp_path: Path) -> No
             metric_type="food",
             envelope_id="env-fd2",
             blob_id="food-bbbb000011112222bbbb000011112222",
-            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+            owner_user_id="a1a1a1a1-0000-0000-0000-000000000000",
         ),
     ]
 
@@ -1778,7 +1778,7 @@ def test_vo2max_records_owner_prefix_filter_selects_one_person(tmp_path: Path) -
             metric_type="vo2max",
             envelope_id="env-vo-owner",
             blob_id="vo2max-1",
-            owner_user_id="dce9b9cf-5daf-470e-9606-c5076cce55ae",
+            owner_user_id="a1a1a1a1-5daf-470e-9606-c5076cce55ae",
         ),
         _make_envelope(
             public_key,
@@ -1786,12 +1786,12 @@ def test_vo2max_records_owner_prefix_filter_selects_one_person(tmp_path: Path) -
             metric_type="vo2max",
             envelope_id="env-vo-partner",
             blob_id="vo2max-2",
-            owner_user_id="f8350dfc-1111-2222-3333-444444444444",
+            owner_user_id="b2b2b2b2-1111-2222-3333-444444444444",
         ),
     ]
 
-    only_owner = asyncio.run(service.vo2max_records(limit=50, owner="dce9"))
-    only_partner = asyncio.run(service.vo2max_records(limit=50, owner="f835"))
+    only_owner = asyncio.run(service.vo2max_records(limit=50, owner="a1a1"))
+    only_partner = asyncio.run(service.vo2max_records(limit=50, owner="b2b2"))
 
     assert only_owner["count"] == 1
     assert only_partner["count"] == 1
@@ -1844,7 +1844,7 @@ def test_weight_trend_unfiltered_mixed_owners_gets_warning(tmp_path: Path) -> No
             metric_type="body",
             envelope_id="env-body-owner",
             blob_id="body-1",
-            owner_user_id="dce9b9cf-5daf-470e-9606-c5076cce55ae",
+            owner_user_id="a1a1a1a1-5daf-470e-9606-c5076cce55ae",
         ),
         _make_envelope(
             public_key,
@@ -1852,16 +1852,16 @@ def test_weight_trend_unfiltered_mixed_owners_gets_warning(tmp_path: Path) -> No
             metric_type="body",
             envelope_id="env-body-partner",
             blob_id="body-2",
-            owner_user_id="f8350dfc-1111-2222-3333-444444444444",
+            owner_user_id="b2b2b2b2-1111-2222-3333-444444444444",
         ),
     ]
 
     mixed = asyncio.run(service.weight_trend_summary(limit=50))
     assert mixed["mixed_owners"] is True
-    assert mixed["owner_user_id_prefixes"] == ["dce9b9cf", "f8350dfc"]
+    assert mixed["owner_user_id_prefixes"] == ["a1a1a1a1", "b2b2b2b2"]
     assert "warning" in mixed
 
-    filtered = asyncio.run(service.weight_trend_summary(limit=50, owner="dce9", fresh=True))
+    filtered = asyncio.run(service.weight_trend_summary(limit=50, owner="a1a1", fresh=True))
     assert "mixed_owners" not in filtered
     assert filtered["latest_kg"] == 82.75
 
@@ -1876,11 +1876,11 @@ def test_weight_day_carries_local_date(tmp_path: Path) -> None:
             metric_type="body",
             envelope_id="env-body-1",
             blob_id="body-1",
-            owner_user_id="dce9b9cf-5daf-470e-9606-c5076cce55ae",
+            owner_user_id="a1a1a1a1-5daf-470e-9606-c5076cce55ae",
         ),
     ]
 
-    summary = asyncio.run(service.weight_trend_summary(limit=50, owner="dce9"))
+    summary = asyncio.run(service.weight_trend_summary(limit=50, owner="a1a1"))
     day = summary["days"][0]
     # local_date must match the same local-day bucketing the service uses
     # elsewhere (never assume the test machine's UTC offset).
@@ -2172,7 +2172,7 @@ def test_mindfulness_sorted_by_business_day_not_upload_order(tmp_path: Path) -> 
             metric_type="mindfulness",
             envelope_id="env-m2",
             blob_id="m-2",
-            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+            owner_user_id="a1a1a1a1-0000-0000-0000-000000000000",
         ),
         _make_envelope(
             public_key,
@@ -2180,7 +2180,7 @@ def test_mindfulness_sorted_by_business_day_not_upload_order(tmp_path: Path) -> 
             metric_type="mindfulness",
             envelope_id="env-m1",
             blob_id="m-1",
-            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+            owner_user_id="a1a1a1a1-0000-0000-0000-000000000000",
         ),
         _make_envelope(
             public_key,
@@ -2188,11 +2188,11 @@ def test_mindfulness_sorted_by_business_day_not_upload_order(tmp_path: Path) -> 
             metric_type="mindfulness",
             envelope_id="env-m3",
             blob_id="m-3",
-            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+            owner_user_id="a1a1a1a1-0000-0000-0000-000000000000",
         ),
     ]
 
-    summary = asyncio.run(service.mindfulness_summary(limit=2, owner="dce9"))
+    summary = asyncio.run(service.mindfulness_summary(limit=2, owner="a1a1"))
 
     returned_days = [d["day_start_date"] for d in summary["days"]]
     # Newest two by BUSINESS day — the July record must survive the cut even
@@ -2215,76 +2215,267 @@ def test_wrist_temp_carries_honest_absolute_field(tmp_path: Path) -> None:
             metric_type="wrist_temp",
             envelope_id="env-wrist-1",
             blob_id="wrist-1",
-            owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
+            owner_user_id="a1a1a1a1-0000-0000-0000-000000000000",
         ),
     ]
 
-    summary = asyncio.run(service.wrist_temp_records(limit=5, owner="dce9"))
+    summary = asyncio.run(service.wrist_temp_records(limit=5, owner="a1a1"))
     record = summary["records"][0]
     assert record["wrist_temperature_celsius"] == 35.99
     # Legacy misnomer stays for back-compat, same value.
     assert record["temperature_delta_celsius"] == 35.99
 
 
-def test_total_energy_burned_excludes_partial_today_from_average(tmp_path: Path) -> None:
-    from datetime import date as _date_type, timedelta as _td
+def _basal_day_envelopes(
+    public_key: str,
+    day: "date",
+    total_kcal: float,
+    *,
+    hours: int = 24,
+    tag: str,
+    with_activity: bool = True,
+    active_kcal: float = 100.0,
+) -> list[dict[str, Any]]:
+    """Envelopes for ONE local day of basal, as `hours` hourly buckets.
 
-    from vaultbeat_mcp_local.service import _local_midnight_iso
+    Real basal is one blob per UTC hour (Invariant 26), never one blob carrying
+    a whole day. Building the fixture the real shape is what lets these tests
+    say anything about coverage at all — a one-sample-per-day fixture is a
+    12-fold under-report wearing a normal-looking total, which is precisely the
+    production bug this file now pins.
+
+    `hours` is the knob: 24 = a fully worn, fully synced day; anything below
+    _BASAL_MIN_HOURS_COVERED = the Watch was off the wrist or had not synced.
+    `total_kcal` is split across the buckets so a short day's total is short in
+    proportion, exactly as it is in production.
+    """
+    from datetime import timedelta as _td
+
+    from vaultbeat_mcp_local.service import _local_midnight_iso, _parse_iso8601
+
+    midnight = _parse_iso8601(_local_midnight_iso(day))
+    per_hour = total_kcal / hours
+    out: list[dict[str, Any]] = []
+    for hour in range(hours):
+        start = (midnight + _td(hours=hour)).isoformat().replace("+00:00", "Z")
+        out.append(
+            _make_envelope(
+                public_key,
+                json.dumps(
+                    {
+                        "sampleID": f"basal-{tag}-{hour}",
+                        "sampleStartDate": start,
+                        "basalEnergyKcal": per_hour,
+                    }
+                ).encode(),
+                metric_type="basal_energy",
+                envelope_id=f"env-basal-{tag}-{hour}",
+                blob_id=f"basal-{tag}-{hour}",
+                owner_user_id="a1a1a1a1-0000-0000-0000-000000000000",
+            )
+        )
+    if with_activity:
+        out.append(
+            _make_envelope(
+                public_key,
+                json.dumps(
+                    {
+                        "dayID": f"act-{tag}",
+                        "dayStartDate": _local_midnight_iso(day),
+                        "stepCount": 1000,
+                        "activeEnergyKcal": active_kcal,
+                        "exerciseMinutes": 10,
+                        "standMinutes": 5,
+                        "distanceMeters": 800.0,
+                    }
+                ).encode(),
+                metric_type="activity",
+                envelope_id=f"env-act-{tag}",
+                blob_id=f"act-{tag}",
+                owner_user_id="a1a1a1a1-0000-0000-0000-000000000000",
+            )
+        )
+    return out
+
+
+def test_total_energy_burned_excludes_partial_today_from_average(tmp_path: Path) -> None:
+    """`partial` excludes today on its own, independently of coverage.
+
+    Today is given a FULL 24 buckets deliberately: if it were also short, the
+    test would pass for either reason and would not pin which one.
+    """
+    from datetime import date as _date_type, timedelta as _td
 
     service, cloud, public_key = _bound_service(tmp_path)
     today = _date_type.today()
 
-    def _basal_payload(record_id: str, start_iso: str, kcal: float) -> bytes:
-        return json.dumps(
-            {"sampleID": record_id, "sampleStartDate": start_iso, "basalEnergyKcal": kcal}
-        ).encode()
-
-    def _activity_payload(day_id: str, day_start: str) -> bytes:
-        return json.dumps(
-            {
-                "dayID": day_id,
-                "dayStartDate": day_start,
-                "stepCount": 1000,
-                "activeEnergyKcal": 100.0,
-                "exerciseMinutes": 10,
-                "standMinutes": 5,
-                "distanceMeters": 800.0,
-            }
-        ).encode()
-
-    envelopes = []
+    envelopes: list[dict[str, Any]] = []
     for i, (day, kcal) in enumerate(
         [(today, 200.0), (today - _td(days=1), 2000.0), (today - _td(days=2), 2100.0)]
     ):
-        midnight = _local_midnight_iso(day)
-        envelopes.append(
-            _make_envelope(
-                public_key,
-                _basal_payload(f"basal-{i}", midnight, kcal),
-                metric_type="basal_energy",
-                envelope_id=f"env-basal-{i}",
-                blob_id=f"basal-{i}",
-                owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
-            )
-        )
-        envelopes.append(
-            _make_envelope(
-                public_key,
-                _activity_payload(f"act-{i}", midnight),
-                metric_type="activity",
-                envelope_id=f"env-act-{i}",
-                blob_id=f"act-{i}",
-                owner_user_id="dce9b9cf-0000-0000-0000-000000000000",
-            )
-        )
+        envelopes += _basal_day_envelopes(public_key, day, kcal, tag=str(i))
     cloud.envelopes = envelopes
 
-    result = asyncio.run(service.total_energy_burned(days=7, owner="dce9"))
+    result = asyncio.run(service.total_energy_burned(days=7, owner="a1a1"))
 
     by_day = {d["day"]: d for d in result["days"]}
     assert by_day[today.isoformat()]["partial"] is True
+    assert by_day[today.isoformat()]["basal_hours_covered"] == 24
+    assert by_day[today.isoformat()]["basal_incomplete"] is False
     # Average = the two COMPLETE days only: (2000+100 + 2100+100) / 2 = 2150.
     assert result["average_tdee_kcal"] == 2150.0
+    assert result["average_day_count"] == 2
+    assert result["average_excluded_days"] == [{"day": today.isoformat(), "reason": "partial"}]
+
+
+def test_total_energy_burned_excludes_days_the_watch_barely_covered(tmp_path: Path) -> None:
+    """A short-coverage day must not enter the average, and must say why.
+
+    Reproduces the real 2026-08-14 / 2026-08-19 shape at 1/2 scale: the owner's
+    own history had those two days at 12 and 16 of 24 hourly buckets, whose
+    883 and 1221 kcal read as a collapsed metabolism and pulled a 14-day
+    average down 178 kcal/day. That number is not decorative — the standing
+    downstream action is `average_tdee_kcal - 500`, and a low-biased average
+    silently deepens the deficit.
+    """
+    from datetime import date as _date_type, timedelta as _td
+
+    service, cloud, public_key = _bound_service(tmp_path)
+    today = _date_type.today()
+    d1, d2, d3 = today - _td(days=1), today - _td(days=2), today - _td(days=3)
+
+    envelopes: list[dict[str, Any]] = []
+    envelopes += _basal_day_envelopes(public_key, d1, 2000.0, hours=24, tag="full")
+    envelopes += _basal_day_envelopes(public_key, d2, 1000.0, hours=12, tag="half")
+    envelopes += _basal_day_envelopes(public_key, d3, 2100.0, hours=24, tag="full2")
+    cloud.envelopes = envelopes
+
+    result = asyncio.run(service.total_energy_burned(days=7, owner="a1a1"))
+    by_day = {d["day"]: d for d in result["days"]}
+
+    short = by_day[d2.isoformat()]
+    assert short["basal_hours_covered"] == 12
+    assert short["basal_hours_expected"] == 24
+    assert short["basal_incomplete"] is True
+    # The two pre-existing flags keep their exact original meanings: the day HAS
+    # basal data and is not today, so neither of them fires. Coverage is a third,
+    # independent question — that is why it needed a third field.
+    assert short["basal_missing"] is False
+    assert short["partial"] is False
+    # Still present in `days`: a caller asking for a window gets every day in it.
+    assert d2.isoformat() in by_day
+
+    assert by_day[d1.isoformat()]["basal_incomplete"] is False
+    assert by_day[d3.isoformat()]["basal_incomplete"] is False
+
+    # Average = the two full days only. Including the short one would give
+    # (2100 + 1100 + 2200)/3 = 1800.0 — the bug this pins.
+    assert result["average_tdee_kcal"] == 2150.0
+    assert result["average_day_count"] == 2
+    assert {"day": d2.isoformat(), "reason": "basal_incomplete"} in result["average_excluded_days"]
+    assert "basal_incomplete" not in [
+        e["reason"] for e in result["average_excluded_days"] if e["day"] == d1.isoformat()
+    ]
+
+
+@pytest.mark.parametrize(
+    "hours,expect_incomplete",
+    [(24, False), (23, False), (22, False), (21, True), (16, True), (12, True), (1, True)],
+)
+def test_basal_coverage_threshold_is_22_of_24(
+    tmp_path: Path, hours: int, expect_incomplete: bool
+) -> None:
+    """Pins the exact boundary, both sides.
+
+    22 is chosen from the real distribution (bimodal: 598 of 655 days at 24,
+    then a gap, then a tail at <=20), so 18..22 all flag the same days — the top
+    of that flat region is taken so a one-bucket shortfall is not called a
+    defect. 23 must NOT flag, or a DST changeover day (23 local hours) raises a
+    false alarm once a year in Portugal.
+    """
+    from datetime import date as _date_type, timedelta as _td
+
+    service, cloud, public_key = _bound_service(tmp_path)
+    day = _date_type.today() - _td(days=1)
+    cloud.envelopes = _basal_day_envelopes(
+        public_key, day, 2000.0, hours=hours, tag="probe", with_activity=False
+    )
+
+    result = asyncio.run(service.total_energy_burned(days=7, owner="a1a1"))
+    row = {d["day"]: d for d in result["days"]}[day.isoformat()]
+    assert row["basal_hours_covered"] == hours
+    assert row["basal_incomplete"] is expect_incomplete
+    # And the average agrees with the flag rather than being decided separately.
+    assert (result["average_tdee_kcal"] is None) is expect_incomplete
+
+
+def test_total_energy_burned_reads_past_the_basal_display_cap(tmp_path: Path) -> None:
+    """A day older than `basal_energy_records`' 30-day display cap is NOT missing.
+
+    `basal_energy_records` truncates `daily` to the newest 30 days for its own
+    tool; consuming that truncated list here reported `basal_missing` for
+    everything older — 60 of 90 days on the owner's real account, for data that
+    was present and decryptable the whole time. Rendering "I truncated the list"
+    as "the Watch was off" is an Invariant 57 violation, and it is invisible:
+    the wrong answer looks exactly like a legitimately sparse history.
+    """
+    from datetime import date as _date_type, timedelta as _td
+
+    service, cloud, public_key = _bound_service(tmp_path)
+    today = _date_type.today()
+    old_day = today - _td(days=40)
+
+    envelopes: list[dict[str, Any]] = []
+    for back in range(1, 32):  # 31 days, enough to push `old_day` past the cap
+        envelopes += _basal_day_envelopes(
+            public_key, today - _td(days=back), 2000.0, tag=f"r{back}", with_activity=False
+        )
+    envelopes += _basal_day_envelopes(
+        public_key, old_day, 1900.0, tag="old", with_activity=False
+    )
+    cloud.envelopes = envelopes
+
+    result = asyncio.run(service.total_energy_burned(days=90, owner="a1a1"))
+    by_day = {d["day"]: d for d in result["days"]}
+    assert old_day.isoformat() in by_day, "the old day fell out of the window entirely"
+    old = by_day[old_day.isoformat()]
+    assert old["basal_missing"] is False
+    assert old["basal_kcal"] == 1900.0
+    assert old["basal_hours_covered"] == 24
+
+    # The tool's own default cap is unchanged — this is about who consumes it.
+    capped = asyncio.run(service.basal_energy_records(owner="a1a1"))
+    assert len(capped["daily"]) == 30
+    uncapped = asyncio.run(service.basal_energy_records(owner="a1a1", day_limit=None))
+    assert len(uncapped["daily"]) == 32
+
+
+def test_basal_energy_records_reports_coverage_and_a_denominator(tmp_path: Path) -> None:
+    """The newest day is the one most likely to be quoted bare, and to be short."""
+    from datetime import date as _date_type, timedelta as _td
+
+    service, cloud, public_key = _bound_service(tmp_path)
+    today = _date_type.today()
+
+    envelopes: list[dict[str, Any]] = []
+    envelopes += _basal_day_envelopes(
+        public_key, today - _td(days=1), 1221.0, hours=16, tag="short", with_activity=False
+    )
+    envelopes += _basal_day_envelopes(
+        public_key, today - _td(days=2), 2000.0, tag="full", with_activity=False
+    )
+    cloud.envelopes = envelopes
+
+    summary = asyncio.run(service.basal_energy_records(owner="a1a1"))
+    assert summary["latest_day_basal_kcal"] == 1221.0
+    assert summary["latest_day_hours_covered"] == 16
+    assert summary["latest_day_incomplete"] is True
+    # The average is over the ONE complete day, and says so rather than leaving
+    # the reader to infer the denominator from `day_count` (which is 2).
+    assert summary["average_daily_basal_kcal"] == 2000.0
+    assert summary["average_over_days"] == 1
+    assert summary["day_count"] == 2
+    assert "22 of 24" in summary["average_note"]
 
 
 def test_unsupported_metric_degrades_instead_of_raising(tmp_path: Path) -> None:
@@ -2403,7 +2594,7 @@ def test_doctor_capability_report_is_quiet_when_everything_has_data(tmp_path: Pa
 # up to 50 blobs, all sharing a timestamp). Cutting there and parsing afterwards
 # silently drops the newest days whenever a history backfill uploads old data
 # late. Eight kinds were fixed 2026-07-24; water/body/menstrual/basal still cut
-# early until now. Reproduced live: get_weight_trend(limit=10, owner="dce9")
+# early until now. Reproduced live: get_weight_trend(limit=10, owner="a1a1")
 # hid the real 2026-07-21 weigh-in (83.0 kg) while keeping an older 07-10 one.
 
 
@@ -2425,7 +2616,7 @@ _UPLOAD_ORDER_DAYS = [
     "2026-07-20T16:00:00Z",
 ]
 _NEWEST_TWO_DAYS = ["2026-07-20T16:00:00Z", "2026-04-24T16:00:00Z"]
-_TEST_OWNER = "dce9b9cf-0000-0000-0000-000000000000"
+_TEST_OWNER = "a1a1a1a1-0000-0000-0000-000000000000"
 
 # strength / food / note carry a plain local day ("YYYY-MM-DD"), not a timestamp.
 # Same three days in the same deliberately-wrong upload order.
@@ -2439,21 +2630,21 @@ _NEWEST_TWO_DATES = ["2026-07-20", "2026-04-24"]
         (
             "water",
             lambda i, day: _water_payload(f"w-{i}", day, 0.5, 4),
-            lambda svc: svc.water_intake_summary(limit=2, owner="dce9"),
+            lambda svc: svc.water_intake_summary(limit=2, owner="a1a1"),
             lambda summary: [d["day_start_date"] for d in summary["days"]],
             _NEWEST_TWO_DAYS,
         ),
         (
             "body",
             lambda i, day: _body_payload(f"b-{i}", day, 80.0 + i),
-            lambda svc: svc.weight_trend_summary(limit=2, owner="dce9"),
+            lambda svc: svc.weight_trend_summary(limit=2, owner="a1a1"),
             lambda summary: [d["day_start_date"] for d in summary["days"]],
             _NEWEST_TWO_DAYS,
         ),
         (
             "menstrual",
             lambda i, day: _menstrual_payload(f"mc-{i}", day, "medium"),
-            lambda svc: svc.menstrual_cycle_summary(limit=2, owner="dce9"),
+            lambda svc: svc.menstrual_cycle_summary(limit=2, owner="a1a1"),
             lambda summary: [d["day_start_date"] for d in summary["days"]],
             _NEWEST_TWO_DAYS,
         ),
@@ -2558,7 +2749,7 @@ def test_basal_energy_limit_cuts_on_business_day_not_upload_order(tmp_path: Path
         for i, day in enumerate(_UPLOAD_ORDER_DAYS)
     ]
 
-    summary = asyncio.run(service.basal_energy_records(limit=2, owner="dce9"))
+    summary = asyncio.run(service.basal_energy_records(limit=2, owner="a1a1"))
 
     assert summary["sample_count"] == 2
     # July (uploaded last) survives and leads; March (oldest) is the one cut.
@@ -2644,7 +2835,7 @@ def test_in_bed_only_night_is_labelled_no_sleep_data_not_zero(tmp_path: Path) ->
     service, cloud, public_key = _bound_service(tmp_path)
     cloud.envelopes = _sleep_envelopes(public_key)
 
-    summary = asyncio.run(service.sleep_records(limit=5, owner="dce9"))
+    summary = asyncio.run(service.sleep_records(limit=5, owner="a1a1"))
     newest, older = summary["daily_summary"][0], summary["daily_summary"][1]
 
     # The honest zero stays — sleep genuinely was not measured that night —
@@ -2664,7 +2855,7 @@ def test_sleep_detail_in_bed_only_night_carries_the_same_labels(tmp_path: Path) 
     service, cloud, public_key = _bound_service(tmp_path)
     cloud.envelopes = _sleep_envelopes(public_key)
 
-    summary = asyncio.run(service.sleep_detail_records(limit=5, owner="dce9"))
+    summary = asyncio.run(service.sleep_detail_records(limit=5, owner="a1a1"))
     newest, older = summary["nights"][0], summary["nights"][1]
 
     assert newest["is_in_bed_only"] is True
@@ -2712,12 +2903,12 @@ def test_stage_minutes_truncate_once_per_stage_not_once_per_sample(tmp_path: Pat
         )
     ]
 
-    summary = asyncio.run(service.sleep_records(limit=5, owner="dce9"))
+    summary = asyncio.run(service.sleep_records(limit=5, owner="a1a1"))
     night = summary["daily_summary"][0]
     assert night["total_sleep_minutes"] == 4
     assert night["stage_minutes"]["asleepCore"] == 4
 
-    detail = asyncio.run(service.sleep_detail_records(limit=5, owner="dce9"))
+    detail = asyncio.run(service.sleep_detail_records(limit=5, owner="a1a1"))
     assert detail["nights"][0]["total_sleep_minutes"] == 4
 
 
@@ -2780,7 +2971,7 @@ def _service_with_vitals_night(tmp_path: Path) -> Any:
 def test_sleep_detail_omits_timeline_by_default(tmp_path: Path) -> None:
     service = _service_with_vitals_night(tmp_path)
 
-    summary = asyncio.run(service.sleep_detail_records(limit=5, owner="dce9"))
+    summary = asyncio.run(service.sleep_detail_records(limit=5, owner="a1a1"))
     night = summary["nights"][0]
 
     assert summary["timeline_included"] is False
@@ -2799,7 +2990,7 @@ def test_sleep_detail_include_timeline_returns_the_samples(tmp_path: Path) -> No
     service = _service_with_vitals_night(tmp_path)
 
     summary = asyncio.run(
-        service.sleep_detail_records(limit=5, owner="dce9", include_timeline=True)
+        service.sleep_detail_records(limit=5, owner="a1a1", include_timeline=True)
     )
     night = summary["nights"][0]
 
@@ -2844,7 +3035,7 @@ def test_sleep_detail_reports_malformed_samples_instead_of_swallowing(tmp_path: 
         )
     ]
 
-    summary = asyncio.run(service.sleep_detail_records(limit=5, owner="dce9"))
+    summary = asyncio.run(service.sleep_detail_records(limit=5, owner="a1a1"))
 
     assert len(summary["errors"]) == 1
     assert "1 sleep sample(s) skipped" in summary["errors"][0]
@@ -3176,3 +3367,318 @@ def test_poll_until_bound_never_reports_pending_when_every_poll_failed(tmp_path:
 
     with pytest.raises(httpx.ReadTimeout):
         asyncio.run(service.poll_until_bound(timeout_sec=0, interval_sec=0))
+
+
+# ── The append path: exactly what log_*_append sends ─────────────────────────
+#
+# `merge=True` is already covered above. What these pin is the SPECIFIC
+# combination the append tools send — `note=None, merge=True` — and they assert
+# against the decrypted round trip rather than the return value, because a
+# return value is built by the same call that is under suspicion (the
+# `test_log_weight_entry_preserves_scale_composition` lesson: its first draft
+# asserted the return value and stayed green after the fix was broken by hand).
+
+
+def test_append_path_leaves_an_existing_strength_note_untouched(tmp_path: Path) -> None:
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    asyncio.run(
+        service.log_strength_entry(
+            date="2026-08-20",
+            exercises=[{"name": "卧推", "sets": [{"weightKg": 30, "reps": 8}]}],
+            note="腿日 + 腹肌",
+        )
+    )
+    # The append tool's exact call shape.
+    asyncio.run(
+        service.log_strength_entry(
+            date="2026-08-20",
+            exercises=[{"name": "深蹲", "sets": [{"weightKg": 60, "reps": 5}]}],
+            note=None,
+            merge=True,
+        )
+    )
+
+    summary = asyncio.run(service.strength_summary(limit=50, fresh=True))
+    session = summary["sessions"][0]
+    assert session["note"] == "腿日 + 腹肌"
+    assert sorted(e["name"] for e in session["exercises"]) == ["卧推", "深蹲"]
+
+
+def test_append_path_leaves_an_existing_food_note_untouched(tmp_path: Path) -> None:
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    asyncio.run(
+        service.log_food_entry(
+            date="2026-08-20",
+            meals=[{"name": "lunch", "items": [{"food": "香蕉"}]}],
+            note="外食日",
+        )
+    )
+    asyncio.run(
+        service.log_food_entry(
+            date="2026-08-20",
+            meals=[{"name": "dinner", "items": [{"food": "鸡胸"}]}],
+            note=None,
+            merge=True,
+        )
+    )
+
+    summary = asyncio.run(service.food_summary(limit=50, fresh=True))
+    day = summary["days"][0]
+    assert day["note"] == "外食日"
+    assert sorted(m["name"] for m in day["meals"]) == ["dinner", "lunch"]
+
+
+def test_append_path_reports_that_it_deleted_nothing(tmp_path: Path) -> None:
+    """`replaced_*` is the receipt the append tools' docstrings promise.
+
+    An agent cannot see the day it is writing into, so "I deleted nothing" has to
+    come back in the payload — that silence is what made this class of loss
+    invisible for weeks before it was reported at all.
+    """
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    asyncio.run(
+        service.log_food_entry(
+            date="2026-08-20", meals=[{"name": "lunch", "items": [{"food": "香蕉"}]}]
+        )
+    )
+    food = asyncio.run(
+        service.log_food_entry(
+            date="2026-08-20",
+            meals=[{"name": "dinner", "items": [{"food": "鸡胸"}]}],
+            note=None,
+            merge=True,
+        )
+    )
+    assert food["merge_mode"] is True
+    assert food["replaced_meals"] == []
+
+    asyncio.run(
+        service.log_strength_entry(
+            date="2026-08-20",
+            exercises=[{"name": "卧推", "sets": [{"weightKg": 30, "reps": 8}]}],
+        )
+    )
+    strength = asyncio.run(
+        service.log_strength_entry(
+            date="2026-08-20",
+            exercises=[{"name": "深蹲", "sets": [{"weightKg": 60, "reps": 5}]}],
+            note=None,
+            merge=True,
+        )
+    )
+    assert strength["merge_mode"] is True
+    assert strength["replaced_exercises"] == []
+
+    asyncio.run(service.log_note(text="早上恶心", kind="general", date="2026-08-20"))
+    note = asyncio.run(
+        service.log_note(text="晚上头晕", kind="general", date="2026-08-20", merge=True)
+    )
+    assert note["merge_mode"] is True
+    assert note["replaced_text"] is None
+
+
+def test_append_on_a_day_that_does_not_exist_yet_just_creates_it(tmp_path: Path) -> None:
+    """The append tools have no "does this day exist?" branch, so the empty case
+    has to be the ordinary one — otherwise the first log of the day fails and the
+    agent falls back to the destructive tool."""
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    result = asyncio.run(
+        service.log_food_entry(
+            date="2026-08-20",
+            meals=[{"name": "lunch", "items": [{"food": "香蕉"}]}],
+            note=None,
+            merge=True,
+        )
+    )
+
+    assert result["updated_existing_day"] is False
+    assert result["replaced_meals"] == []
+    summary = asyncio.run(service.food_summary(limit=50, fresh=True))
+    assert summary["days"][0]["note"] is None
+
+
+# ── Demo mode ────────────────────────────────────────────────────────────────
+
+
+def test_demo_mode_reads_without_a_binding_a_key_or_a_network(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The whole point: a reviewer with no iPhone gets real-shaped data.
+
+    The cloud client raises on any call, so this also proves the branch sits
+    ABOVE the fetch — not that it happens to return cached results.
+    """
+
+    class ExplodingCloud:
+        def __getattr__(self, name: str) -> Any:
+            raise AssertionError(f"demo mode must not touch the cloud (called {name!r})")
+
+    monkeypatch.setenv("VAULTBEAT_DEMO", "1")
+    # No config file at all — never initialized, never bound.
+    service = VaultbeatLocalService(ConfigStore(tmp_path / "config.json"), ExplodingCloud())
+
+    summary = asyncio.run(service.sleep_records(limit=5))
+    assert summary["sessions"]
+    assert not (tmp_path / "config.json").exists()
+
+
+def test_demo_mode_cannot_write_synthetic_records_into_the_plaintext_cache(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Structural, not careful: the demo branch sits above `self.cache`, so a
+    demo run cannot contaminate a later real one even if someone forgets."""
+    monkeypatch.setenv("VAULTBEAT_DEMO", "1")
+    service = VaultbeatLocalService(ConfigStore(tmp_path / "config.json"))
+    # Not an env var — the cache lives beside the config, so pointing the config
+    # at tmp_path is what scopes it. (An earlier draft of this test invented a
+    # `VAULTBEAT_MCP_CACHE_DIR` that does not exist, which made it assert on a
+    # directory nothing would ever have written to: green for the wrong reason.)
+    cache_dir = service.cache.directory
+
+    asyncio.run(service.sleep_records(limit=5))
+    asyncio.run(service.food_summary(limit=5))
+
+    assert cache_dir == tmp_path / "cache"
+    written = [p for p in cache_dir.rglob("*") if p.is_file()] if cache_dir.exists() else []
+    assert written == []
+
+
+def test_demo_mode_serves_every_known_kind(tmp_path: Path, monkeypatch: Any) -> None:
+    """A kind returning empty in a demo reads as a broken tool, and the reader
+    has no way to tell it apart from a broken product."""
+    from vaultbeat_mcp_local.service import KNOWN_METRIC_TYPES
+
+    monkeypatch.setenv("VAULTBEAT_DEMO", "1")
+    service = VaultbeatLocalService(ConfigStore(tmp_path / "config.json"))
+
+    for kind in sorted(KNOWN_METRIC_TYPES):
+        records, errors = asyncio.run(service.sync_decrypted_records(metric_type=kind))
+        assert records, kind
+        assert errors == [], kind
+
+
+def test_demo_mode_still_rejects_an_unknown_metric_type(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The branch sits BELOW the membership check on purpose, so the tool's real
+    contract stays observable to whoever is evaluating it."""
+    monkeypatch.setenv("VAULTBEAT_DEMO", "1")
+    service = VaultbeatLocalService(ConfigStore(tmp_path / "config.json"))
+
+    with pytest.raises(ValueError, match="unknown metric_type"):
+        asyncio.run(service.sync_decrypted_records(metric_type="not_a_kind"))
+
+
+@pytest.mark.parametrize(
+    ("method", "kwargs"),
+    [
+        ("log_strength_entry", {"date": "2026-08-20", "exercises": [{"name": "卧推", "sets": [{"weightKg": 30, "reps": 8}]}]}),
+        ("log_food_entry", {"date": "2026-08-20", "meals": [{"name": "lunch", "items": [{"food": "香蕉"}]}]}),
+        ("log_weight_entry", {"weight_kg": 72.5, "date": "2026-08-20"}),
+        ("log_note", {"text": "恶心", "kind": "general", "date": "2026-08-20"}),
+    ],
+)
+def test_demo_mode_refuses_writes_by_returning_not_by_raising(
+    tmp_path: Path, monkeypatch: Any, method: str, kwargs: dict[str, Any]
+) -> None:
+    """A raise becomes a ToolError, which never passes through the watermarking
+    wrapper — so the one fact the caller most needs (this is a demo, nothing is
+    broken) would be the one fact stripped off.
+
+    The refusal must also name demo mode, or an agent reads "not bound" and
+    re-pairs a machine that is working as configured — the most destructive
+    thing it can do here (Invariant 54).
+    """
+    monkeypatch.setenv("VAULTBEAT_DEMO", "1")
+    service = VaultbeatLocalService(ConfigStore(tmp_path / "config.json"))
+
+    result = asyncio.run(getattr(service, method)(**kwargs))
+
+    assert result["ok"] is False
+    assert result["error"] == "demo_mode_is_read_only"
+    assert result["demo_mode"] is True
+    assert "VAULTBEAT_DEMO" in result["detail"]
+    assert "not" in result["detail"].lower() and "fault" in result["detail"].lower()
+
+
+def test_demo_mode_validates_arguments_before_refusing(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The guards sit below each method's own validation, so a malformed call
+    still raises its real error and the tool's contract stays observable."""
+    monkeypatch.setenv("VAULTBEAT_DEMO", "1")
+    service = VaultbeatLocalService(ConfigStore(tmp_path / "config.json"))
+
+    with pytest.raises(ValueError, match="unsupported note kind"):
+        asyncio.run(service.log_note(text="x", kind="sleep"))
+    with pytest.raises(ValueError):
+        asyncio.run(service.log_food_entry(date="not-a-date", meals=[]))
+
+
+def test_demo_status_never_claims_to_be_bound(tmp_path: Path, monkeypatch: Any) -> None:
+    """The one lie that would matter. An agent that believes it is bound will try
+    to write, and will read every synthetic number as its owner's real record."""
+    monkeypatch.setenv("VAULTBEAT_DEMO", "1")
+    service = VaultbeatLocalService(ConfigStore(tmp_path / "config.json"))
+
+    status = service.status()
+    assert status["demo_mode"] is True
+    assert status["bound"] is False
+    assert status["initialized"] is False
+
+
+def test_demo_doctor_does_not_claim_a_round_trip_it_never_made(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """`data_roundtrip` must NOT appear as a green check.
+
+    The tempting shape is to keep the real check list and mark it OK — the
+    report then looks healthy while no round trip was attempted, and a reader
+    takes a green tick as evidence about a network path nobody exercised.
+    """
+    monkeypatch.setenv("VAULTBEAT_DEMO", "1")
+    service = VaultbeatLocalService(ConfigStore(tmp_path / "config.json"))
+
+    report = asyncio.run(service.doctor())
+
+    assert report["demo_mode"] is True
+    assert report["ok"] is True
+    assert {check["name"] for check in report["checks"]} == {"demo_mode", "demo_dataset"}
+    assert "data_roundtrip" in report["not_checked"]
+    assert "NOT ATTEMPTED" in report["not_checked"]["data_roundtrip"]
+    # The capability report is derived from the demo dataset through the same
+    # code path the real one uses, so it reports genuine per-kind counts.
+    assert report["capabilities"]["available"] is True
+    assert report["capabilities"]["kinds_without_data"] == []
+
+
+def test_scope_report_names_the_demo_env_var(tmp_path: Path, monkeypatch: Any) -> None:
+    """`env_overrides_received` is hand-maintained and has no discovery
+    mechanism. VAULTBEAT_DEMO silently swaps every number this server returns,
+    so "did the client forward it?" is the first question worth answering."""
+    monkeypatch.setenv("VAULTBEAT_DEMO", "1")
+    service = VaultbeatLocalService(ConfigStore(tmp_path / "config.json"))
+
+    received = service._scope_report()["env_overrides_received"]
+    assert received["VAULTBEAT_DEMO"] is True
+
+    monkeypatch.delenv("VAULTBEAT_DEMO")
+    assert service._scope_report()["env_overrides_received"]["VAULTBEAT_DEMO"] is False
+
+
+def test_demo_mode_does_not_claim_a_private_key_exists(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The keyring answer is a fallback reached when env var and file are both
+    absent — it never checks that the keyring holds anything. In demo mode that
+    printed "Private key: the system keyring" for an install with no key at all."""
+    monkeypatch.setenv("VAULTBEAT_DEMO", "1")
+    service = VaultbeatLocalService(ConfigStore(tmp_path / "config.json"))
+
+    where = service._scope_report()["private_key_location"]
+    assert "keyring" not in where.lower()
+    assert "nowhere" in where.lower()
