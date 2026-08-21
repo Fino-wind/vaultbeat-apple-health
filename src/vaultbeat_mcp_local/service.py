@@ -81,6 +81,28 @@ KNOWN_METRIC_TYPES = frozenset(
     }
 )
 
+# ── Basal-energy day completeness ────────────────────────────────────────────
+#
+# `basal_energy` is uploaded as ONE blob per UTC hour bucket (Invariant 26), so
+# a fully-worn, fully-synced day holds 24 of them and the count IS the coverage.
+# Anything below the threshold means the Watch was off the wrist or had not
+# synced — NOT that the person's metabolism dropped.
+#
+# 22 (≥91.7% coverage) is picked from the real distribution, not by feel. Over
+# 655 days of the owner's history the shape is strongly bimodal — 598 days at
+# 24 buckets, then a clean gap, then a long tail at ≤20 — so every threshold in
+# 18..22 flags exactly the same days on a 14- or 30-day window. Given a flat
+# region, take its top edge: <24 and <23 would also flag days short by a single
+# bucket (~80 kcal, ~4%), and a flag that fires on noise is a flag people learn
+# to ignore. <16 was rejected outright: it misses 2026-08-19 (16 buckets,
+# 1221 kcal), which is precisely the day that must not enter an average.
+#
+# 22 also survives a move to a DST timezone, which is not hypothetical here —
+# a local calendar day is 23 or 25 UTC hours on the two changeover days, and
+# <23 would raise a false alarm on one of them every year.
+_BASAL_HOURS_PER_DAY = 24
+_BASAL_MIN_HOURS_COVERED = 22
+
 # Note target kinds (mirrors iOS VaultbeatNoteTargetKind). Unknown kinds are
 # accepted as-is so a newer app adding a kind doesn't brick older decoders.
 NOTE_TARGET_KINDS = frozenset({"sleep", "menstrual"})
@@ -1955,16 +1977,93 @@ def _select_primary_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, A
     return daily
 
 
+def _demo_write_refusal(tool: str) -> dict[str, Any]:
+    """The answer every `log_*` gives while demo mode is on.
+
+    RETURNED, never raised. An exception out of a tool becomes a ToolError,
+    which a client renders as a failure and — more to the point — never passes
+    through the watermarking wrapper in `mcp_server`, so the one fact the caller
+    most needs (this was a demo, nothing is broken) would be the one fact
+    stripped off.
+
+    It names demo mode in the first clause on purpose. A refusal that only said
+    "not bound" would send an agent to re-pair a machine that is working exactly
+    as configured — and re-pairing is the most destructive thing an agent can do
+    here (Invariant 54).
+
+    Writes are the one thing demo mode cannot honestly fake: sealing a blob
+    needs a real key and a real edge function, so a write tool reporting success
+    would be lying about the only kind of call that changes something.
+    """
+
+    from vaultbeat_mcp_local.demo import DEMO_BANNER, DEMO_ENV
+
+    return {
+        # Banner first — the sentence acts on a reader who does not already know
+        # to look for a boolean. Same ordering as `_watermark_demo`.
+        "demo_warning": DEMO_BANNER,
+        "demo_mode": True,
+        "ok": False,
+        "error": "demo_mode_is_read_only",
+        "tool": tool,
+        "detail": (
+            f"Demo mode is on ({DEMO_ENV} is set), so nothing was written and nothing "
+            f"changed. This is NOT a fault and the binding is not broken — demo mode "
+            f"serves synthetic records so the read tools can be exercised without an "
+            f"account, and it has no account to write to. Do not re-pair or run "
+            f"diagnostics. To log real data, unset {DEMO_ENV} and pair this machine "
+            f"with the Vaultbeat iOS app (Settings → Data & AI → Connect an AI server)."
+        ),
+    }
+
+
 class VaultbeatLocalService:
     def __init__(
         self,
         store: ConfigStore,
         cloud_client: CloudClientProtocol | None = None,
         cache: LocalRecordCache | None = None,
+        *,
+        demo: bool | None = None,
     ):
         self.store = store
         self._cloud_client = cloud_client
         self._cache = cache
+        # Demo mode is resolved ONCE, here, and every branch below reads
+        # `self._demo` rather than the environment.
+        #
+        # `mcp_server.run_mcp_server` already froze its own copy at registration
+        # — it has to, because a tool's description and the server's displayed
+        # name are captured by the SDK at that moment and cannot be changed
+        # afterwards. So the only reachable shape is "everything frozen"; when
+        # this class re-read the environment per call, the two halves could
+        # disagree, and the half that lies is the one that leaves the machine:
+        # flipping VAULTBEAT_DEMO on after startup served SYNTHETIC RECORDS
+        # THROUGH AN UNWATERMARKED WRAPPER (verified 2026-08-20 — owner id
+        # demo0001-…, no banner, no description prefix), while `status` and
+        # `doctor` went on correctly reporting demo_mode. The surface that gets
+        # copied, quoted and pasted was the one telling the lie.
+        #
+        # Keyword-only, and defaulting to "ask the environment": the several
+        # dozen existing constructions pass `store` and `cloud_client`
+        # positionally and are unaffected, while a test can put one demo and one
+        # real service side by side in one process — which a module-level latch
+        # could not do, and which is why one was rejected.
+        from vaultbeat_mcp_local.demo import demo_enabled
+
+        self._demo = demo_enabled() if demo is None else demo
+        # What the ENVIRONMENT said when this object was built — which is a
+        # different question from which mode it is in, and conflating the two
+        # broke the constructor argument the first time it was tried.
+        #
+        # The tripwire below asks "did the environment change under me?", so it
+        # must compare against the environment's own past value. Comparing
+        # against `self._demo` instead makes an explicit `demo=True` illegal
+        # whenever the variable happens to be unset — i.e. it would forbid
+        # exactly the two-services-in-one-process case the argument exists for,
+        # while ALSO disarming itself in production, where `run_mcp_server`
+        # passes the flag explicitly.
+        self._demo_env_at_start = demo_enabled()
 
     @property
     def cache(self) -> LocalRecordCache:
@@ -2143,6 +2242,56 @@ class VaultbeatLocalService:
                 f"unknown metric_type {metric_type!r}; expected one of "
                 f"{', '.join(sorted(KNOWN_METRIC_TYPES))}"
             )
+
+        # ── Demo mode ────────────────────────────────────────────────────────
+        #
+        # THE choke point for demo data, and the reason there is no second
+        # implementation of anything: every read tool reaches this method via
+        # `_records_for_metric`, and `_capability_report` calls it directly, so
+        # one branch covers all of them.
+        #
+        # Its position is three separate guarantees, none of them incidental:
+        #  · BELOW the membership check, so a bad `metric_type` still raises in
+        #    demo mode — the tool's real contract stays visible to whoever is
+        #    evaluating it.
+        #  · ABOVE `require_bound()`, so demo mode needs no config, no server
+        #    token and no private key. `status` / `doctor` keep saying "not
+        #    bound", which is the truth.
+        #  · ABOVE `self.cache`, so synthetic records are structurally incapable
+        #    of being written into the on-disk plaintext cache. A demo run cannot
+        #    contaminate a real one by construction, not by care.
+        #
+        # Imported here rather than at module scope: `demo` imports this module
+        # for `DecryptedRecord` / `KNOWN_METRIC_TYPES`, so a top-level import
+        # would be a cycle.
+        from vaultbeat_mcp_local.demo import DEMO_ENV, demo_enabled, demo_sync_result
+
+        # Tripwire, not a second source of truth. `self._demo` is the decision;
+        # this compares it against the environment purely to refuse rather than
+        # mislead when the two have come apart. It sits at the DATA choke point
+        # because that is where both failure directions land: demo data leaving
+        # through a wrapper that no longer stamps it, and real records leaving
+        # under a stamp that calls them synthetic — the second being the worse
+        # one, since an agent told "SYNTHETIC" about a successful real write
+        # concludes nothing was written and retries.
+        #
+        # Unreachable in normal operation (an MCP client cannot edit an already
+        # exec'd subprocess's environment), so this costs one getenv per read
+        # and its message names the variable, the frozen value and the fix.
+        if demo_enabled() != self._demo_env_at_start:
+            raise RuntimeError(
+                f"{DEMO_ENV} changed after this server started "
+                f"(it was {self._demo_env_at_start}, it is now {demo_enabled()}; this "
+                f"server is running in demo_mode={self._demo}). "
+                "Refusing to serve: this server's tool descriptions, displayed name and "
+                "result watermarks were all fixed at startup and cannot follow the "
+                "change, so continuing would either hand you synthetic records with no "
+                "synthetic marker, or label your real records synthetic. "
+                f"Restart the server with {DEMO_ENV} set the way you want it."
+            )
+
+        if self._demo:
+            return demo_sync_result(metric_type=metric_type, limit=limit)
 
         config = self.store.require_bound()
         server_token = config.server_token
@@ -2556,7 +2705,14 @@ class VaultbeatLocalService:
         newest-first.
 
         *owner*: if given, only include records whose ``owner_user_id`` starts
-        with this prefix (e.g. ``"dce9b9cf"`` or ``"f8350dfc"``).
+        with this prefix — the first characters of the account's UUID, enough to
+        tell two people apart (e.g. ``"a1b2c3d4"``).
+
+        The example is synthetic on purpose. This file ships to PyPI, so a
+        docstring written against whichever account was open at the time
+        publishes that person's real id fragment to everyone who installs the
+        package — on a product whose entire claim is that we cannot see your
+        data. Two real prefixes rode here from v0.1.0 until 2026-08-21.
 
         *include_timeline*: the per-sample ``timeline`` array is ~80% of this
         payload — roughly 13k characters PER NIGHT, so the old ``limit=5``
@@ -2826,7 +2982,7 @@ class VaultbeatLocalService:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
         # Business-time sort before the cut (see activity_summary's comment).
         # 2026-07-27: reproduced on live data — get_weight_trend(limit=10,
-        # owner="dce9") silently dropped the real 2026-07-21 weigh-in (83.0 kg)
+        # owner="a1a1") silently dropped the real 2026-07-21 weigh-in (83.0 kg)
         # while keeping the older 07-10 one, because the created_at cut landed
         # before the parse.
         days.sort(key=lambda d: d.day_start_date, reverse=True)
@@ -3104,7 +3260,14 @@ class VaultbeatLocalService:
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
-    async def basal_energy_records(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def basal_energy_records(
+        self,
+        *,
+        limit: int | None = None,
+        owner: str | None = None,
+        fresh: bool = False,
+        day_limit: int | None = 30,
+    ) -> dict[str, Any]:
         """Return recent basal-energy-burned samples (Watch BMR estimate, kcal).
 
         Watch emits many samples per day, so `limit` caps SAMPLES, not days —
@@ -3113,6 +3276,19 @@ class VaultbeatLocalService:
         view (usually 1500-2000 kcal for an active young adult). Combine with
         `get_activity`'s `active_energy_kcal` for a proper TDEE (see
         `total_energy_burned`).
+
+        Every `daily` row carries `hours_covered` — how many of the day's 24
+        hourly buckets actually arrived. A day the Watch spent on the charger
+        still produces a row, just a short one, and the kcal figure is short in
+        exact proportion; `incomplete` is the flag that keeps such a day out of
+        any average.
+
+        `day_limit` caps how many days `daily` RETURNS (30 by default — this is
+        a display cap for a tool whose caller usually wants "recent"). It is
+        NOT a cap on what was read: pass None to get every day, which is what
+        `total_energy_burned` does. That distinction is load-bearing — consuming
+        the truncated list is how a 90-day TDEE query came to report 60 days of
+        `basal_missing` for data that was present the whole time.
         """
 
         records, errors = await self._records_for_metric(METRIC_BASAL_ENERGY, limit=None, fresh=fresh)
@@ -3140,29 +3316,70 @@ class VaultbeatLocalService:
         # ~600-700 kcal of sleeping basal per night, self-cancelling on middle
         # days but visibly wrong on the edges (2026-07-24 11:40 "today" showed
         # 191.9 kcal when local 00:00-11:40 alone should hold ~900).
-        by_day: dict[str, float] = {}
+        # Sum kcal AND count buckets in the same pass. The count was previously
+        # discarded here, and losing it at this line is what made every
+        # downstream consumer unable to tell a 24-hour day from a 12-hour one:
+        # both arrive as a single kcal scalar, and 883 kcal reads as a real
+        # (very low) metabolism rather than as half a day of missing data.
+        by_day: dict[str, list[float]] = {}
         for r in parsed:
             try:
                 day_key = _local_calendar_day(_parse_iso8601(r.date)).isoformat()
             except ValueError:
                 day_key = r.date[:10]  # unparseable date: degrade to old cut
-            by_day[day_key] = by_day.get(day_key, 0.0) + r.kcal
+            bucket = by_day.setdefault(day_key, [0.0, 0.0])
+            bucket[0] += r.kcal
+            bucket[1] += 1
         daily: list[dict[str, Any]] = sorted(
-            [{"day": d, "basal_kcal": round(kcal, 1)} for d, kcal in by_day.items()],
+            [
+                {
+                    "day": d,
+                    "basal_kcal": round(kcal, 1),
+                    "hours_covered": int(hours),
+                    "hours_expected": _BASAL_HOURS_PER_DAY,
+                    "incomplete": int(hours) < _BASAL_MIN_HOURS_COVERED,
+                }
+                for d, (kcal, hours) in by_day.items()
+            ],
             key=lambda x: str(x["day"]),
             reverse=True,
         )
-        latest_day_kcal: float | None = float(daily[0]["basal_kcal"]) if daily else None
+
+        # Today is still accumulating, so it is short for a reason that says
+        # nothing about the Watch — excluded alongside the genuinely incomplete
+        # days rather than lumped in with them.
+        today_key = _local_calendar_day(datetime.now(timezone.utc)).isoformat()
+        latest_day: dict[str, Any] | None = daily[0] if daily else None
+        full_days = [d for d in daily if not d["incomplete"] and str(d["day"]) != today_key]
         avg_daily: float | None = (
-            round(sum(float(d["basal_kcal"]) for d in daily) / len(daily), 1) if daily else None
+            round(sum(float(d["basal_kcal"]) for d in full_days) / len(full_days), 1)
+            if full_days
+            else None
         )
 
         summary = {
             "sample_count": len(parsed),
             "day_count": len(daily),
-            "latest_day_basal_kcal": latest_day_kcal,
+            "latest_day_basal_kcal": float(latest_day["basal_kcal"]) if latest_day else None,
+            # The newest day is the one an agent is most likely to quote as a
+            # bare number, and the one most likely to be short (Watch not synced
+            # yet). It says how complete it is in the same breath.
+            "latest_day_hours_covered": int(latest_day["hours_covered"]) if latest_day else None,
+            "latest_day_incomplete": bool(latest_day["incomplete"]) if latest_day else None,
             "average_daily_basal_kcal": avg_daily,
-            "daily": daily[:30],  # newest 30 days
+            # The denominator, stated. It is NOT len(daily) and it is NOT the
+            # length of the `daily` list below (that one is display-capped), so
+            # without this field the two numbers look like they disagree.
+            "average_over_days": len(full_days),
+            "average_note": (
+                f"average over {len(full_days)} complete days of {len(daily)} with any "
+                f"data; excludes today and any day with fewer than "
+                f"{_BASAL_MIN_HOURS_COVERED} of {_BASAL_HOURS_PER_DAY} hourly buckets. "
+                f"`daily` below is capped at "
+                f"{'all days' if day_limit is None else f'the newest {day_limit} days'}, "
+                f"so its own average will differ from this one."
+            ),
+            "daily": daily if day_limit is None else daily[:day_limit],
         }
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
@@ -3182,17 +3399,43 @@ class VaultbeatLocalService:
         (via `activity_summary`). If basal is empty (Vaultbeat hadn't ingested
         the kind yet for the day, or Watch was off), the day's total is
         active-only and flagged `basal_missing=true`.
+
+        A day can also be PARTLY covered, which is the common case and the one
+        that used to be invisible: basal arrives as one blob per hour, so a
+        Watch left on the charger produces a real-looking row that is short in
+        exact proportion to the hours it missed. 2026-08-19 came back as
+        1221 kcal (16 of 24 hours) and 2026-08-14 as 883 kcal (12 of 24) —
+        both fed straight into the average, pulling it down 178 kcal/day.
+        `basal_hours_covered` reports it and `basal_incomplete` flags it; such
+        days stay in `days` (a caller asking for a window should see every day
+        in it) and are kept out of `average_tdee_kcal`, with the reason listed
+        in `average_excluded_days`.
+
+        This matters more than a normal rounding error because there is a
+        standing downstream action: a cut is set at `average_tdee_kcal - 500`.
+        The contamination is one-directional — a short day can only drag the
+        average DOWN — so the errors never cancel out, they accumulate into a
+        deficit nobody chose.
         """
 
         # Pull both underlying streams in parallel — this is a compute
         # aggregation, no new envelope fetches once both caches are warm.
-        basal_task = asyncio.create_task(self.basal_energy_records(owner=owner, fresh=fresh))
+        # day_limit=None: `basal_energy_records` display-caps `daily` at 30 days
+        # for its own tool, and consuming that cap here reported `basal_missing`
+        # for every day older than 30 — 60 of them on a days=90 query, for data
+        # that was present and readable the whole time. That is an
+        # Invariant 57 violation (rendering "I truncated the list" as "the Watch
+        # was off"), so this asks for everything and does its own windowing.
+        basal_task = asyncio.create_task(
+            self.basal_energy_records(owner=owner, fresh=fresh, day_limit=None)
+        )
         activity_task = asyncio.create_task(self.activity_summary(owner=owner, fresh=fresh))
         basal = await basal_task
         activity = await activity_task
 
         # Build lookups: day -> kcal
         basal_by_day = {d["day"]: d["basal_kcal"] for d in basal.get("daily", [])}
+        basal_hours_by_day = {d["day"]: d.get("hours_covered") for d in basal.get("daily", [])}
 
         # activity_summary emits {"days": [{day_start_date, active_energy_kcal, ...}]}
         active_by_day: dict[str, float] = {}
@@ -3220,8 +3463,18 @@ class VaultbeatLocalService:
         out = []
         for day in all_days:
             b = basal_by_day.get(day)
+            hours = basal_hours_by_day.get(day)
             a = active_by_day.get(day, 0.0)
             total = (b or 0.0) + a
+            # A missing day is the most incomplete day there is (0 of 24), so it
+            # sets this too — a consumer that only looks at `basal_incomplete`
+            # must not accidentally treat "no data at all" as fine. `hours is
+            # None` while `b` is present cannot happen (one source), but if it
+            # ever did, not flagging is the safe direction: never assert
+            # incompleteness we did not measure.
+            incomplete = b is None or (
+                hours is not None and int(hours) < _BASAL_MIN_HOURS_COVERED
+            )
             out.append({
                 "day": day,
                 "basal_kcal": b,
@@ -3229,13 +3482,30 @@ class VaultbeatLocalService:
                 "total_kcal": round(total, 1),
                 "basal_missing": b is None,
                 "partial": day == today_key,
+                # ADD-ONLY (2026-08-20). `basal_missing` and `partial` keep their
+                # exact original meanings — "no basal row at all" and "this is
+                # today" — and neither ever meant "trustworthy".
+                "basal_hours_covered": hours,
+                "basal_hours_expected": _BASAL_HOURS_PER_DAY,
+                "basal_incomplete": incomplete,
             })
 
-        totals_with_basal: list[float] = [
-            float(d["total_kcal"] or 0.0)
-            for d in out
-            if not d["basal_missing"] and not d["partial"]
-        ]
+        # Say what was left out, not just how many survived. The caller is an
+        # LLM that cannot see the days it did not receive, so an average of
+        # 2227.6 is indistinguishable from a wrong one unless the exclusions are
+        # named — the same reasoning as Invariant 41 for whole-day writers.
+        excluded: list[dict[str, str]] = []
+        totals_with_basal: list[float] = []
+        for d in out:
+            day_str = str(d["day"])
+            if d["partial"]:
+                excluded.append({"day": day_str, "reason": "partial"})
+            elif d["basal_missing"]:
+                excluded.append({"day": day_str, "reason": "basal_missing"})
+            elif d["basal_incomplete"]:
+                excluded.append({"day": day_str, "reason": "basal_incomplete"})
+            else:
+                totals_with_basal.append(float(d["total_kcal"] or 0.0))
         avg_tdee: float | None = (
             round(sum(totals_with_basal) / len(totals_with_basal), 1)
             if totals_with_basal
@@ -3245,7 +3515,17 @@ class VaultbeatLocalService:
         return {
             "days_returned": len(out),
             "average_tdee_kcal": avg_tdee,
-            "average_note": "average excludes today (partial, still accumulating) and basal-missing days",
+            "average_day_count": len(totals_with_basal),
+            "average_excluded_days": excluded,
+            "average_note": (
+                f"average over {len(totals_with_basal)} complete days; excludes today "
+                f"(partial, still accumulating), days with no basal data at all, and "
+                f"days with fewer than {_BASAL_MIN_HOURS_COVERED} of "
+                f"{_BASAL_HOURS_PER_DAY} hourly basal buckets (Watch not worn or not "
+                f"synced — its kcal is short in proportion, so it would drag the "
+                f"average down). Every exclusion is listed with its reason in "
+                f"average_excluded_days."
+            ),
             "days": out,
             "basal_errors": basal.get("errors", []),
             "activity_errors": activity.get("errors", []),
@@ -3412,6 +3692,12 @@ class VaultbeatLocalService:
 
         requested_day = _date_type.fromisoformat(date)
         normalized_exercises = _normalize_strength_exercises(exercises)
+
+        # Demo mode has no account to write to — see `_demo_write_refusal`.
+        # Sits BELOW the argument validation above, so a malformed call still
+        # raises its real error and the tool's contract stays observable.
+        if self._demo:
+            return _demo_write_refusal("log_strength_entry")
 
         config = self.store.require_bound()
         server_token = config.server_token
@@ -3599,6 +3885,12 @@ class VaultbeatLocalService:
         requested_day = _date_type.fromisoformat(date)
         normalized_meals = _normalize_food_meals(meals)
 
+        # Demo mode has no account to write to — see `_demo_write_refusal`.
+        # Sits BELOW the argument validation above, so a malformed call still
+        # raises its real error and the tool's contract stays observable.
+        if self._demo:
+            return _demo_write_refusal("log_food_entry")
+
         config = self.store.require_bound()
         server_token = config.server_token
         if not (
@@ -3750,6 +4042,12 @@ class VaultbeatLocalService:
         from datetime import date as _date_type
 
         requested_day = _date_type.fromisoformat(date) if date else _date_type.today()
+
+        # Demo mode has no account to write to — see `_demo_write_refusal`.
+        # Sits BELOW the argument validation above, so a malformed call still
+        # raises its real error and the tool's contract stays observable.
+        if self._demo:
+            return _demo_write_refusal("log_weight_entry")
 
         config = self.store.require_bound()
         server_token = config.server_token
@@ -3938,6 +4236,12 @@ class VaultbeatLocalService:
             raise ValueError("note text must be a non-empty string")
         requested_day = _date_type.fromisoformat(date) if date else _date_type.today()
 
+        # Demo mode has no account to write to — see `_demo_write_refusal`.
+        # Sits BELOW the argument validation above, so a malformed call still
+        # raises its real error and the tool's contract stays observable.
+        if self._demo:
+            return _demo_write_refusal("log_note")
+
         config = self.store.require_bound()
         server_token = config.server_token
         if not (
@@ -4087,6 +4391,17 @@ class VaultbeatLocalService:
         """
         from vaultbeat_mcp_local.store import PRIVATE_KEY_ENV, identity_file_path
 
+        # The keyring branch below is a FALLBACK — it is reached whenever the env
+        # var and the file are both absent, without checking that the keyring
+        # actually holds anything. That is fine for a real install (a bound one
+        # has a key somewhere), but in demo mode it printed "Private key: the
+        # system keyring" for an install that has no key at all and decrypts
+        # nothing. Small, and still a claim about where a secret lives.
+        if self._demo:
+            return (
+                "nowhere — demo mode holds no private key and decrypts nothing. "
+                "The synthetic records are generated in memory on this machine."
+            )
         if os.getenv(PRIVATE_KEY_ENV, "").strip():
             return (
                 f"injected via {PRIVATE_KEY_ENV} — supplied by whatever started this "
@@ -4128,13 +4443,21 @@ class VaultbeatLocalService:
         import os
 
         from vaultbeat_mcp_local.cache import TTL_ENV, _LEGACY_TTL_ENV
+        from vaultbeat_mcp_local.demo import DEMO_ENV
         from vaultbeat_mcp_local.store import CONFIG_ENV, _LEGACY_CONFIG_ENV
 
+        # HAND-MAINTAINED. A new Vaultbeat env var is invisible here until someone
+        # adds it — there is no discovery mechanism, and the whole value of this
+        # block is answering "did the client forward it?" without reading anyone's
+        # source. DEMO_ENV especially: it silently swaps every number this server
+        # returns for a synthetic one, so "is it set, and did it survive into this
+        # process?" is the first question worth being able to answer.
         names = (
             CONFIG_ENV,
             _LEGACY_CONFIG_ENV,
             TTL_ENV,
             _LEGACY_TTL_ENV,
+            DEMO_ENV,
             "VAULTBEAT_MCP_HTTP_TOKEN",
             "TETHER_MCP_HTTP_TOKEN",
         )
@@ -4174,6 +4497,84 @@ class VaultbeatLocalService:
             if hint and not ok:
                 check["hint"] = hint
             checks.append(check)
+
+        # ── Demo mode: a different report, not a decorated one ───────────────
+        #
+        # First statement, before `store.load()`, because a demo install usually
+        # has no config at all and the real path bails out there with
+        # `ok: False, "no config"` — which reads as "broken" for a mode that is
+        # working exactly as designed.
+        #
+        # 🔴 The rule this branch exists to obey: report what was ACTUALLY
+        # checked, and name what was not. The tempting shape is to keep the
+        # real check list and mark `data_roundtrip` OK — the report then looks
+        # healthy while no round trip was attempted, and a reader takes a green
+        # tick as evidence about a network path nobody exercised. Same family as
+        # the Product Positioning rule: state what was observed, never what was
+        # inferred. So the skipped checks move to `not_checked`, out of the
+        # OK/FAIL list a client renders, and each says why.
+        from vaultbeat_mcp_local.demo import (
+            DEMO_ANCHOR_DAY,
+            DEMO_BANNER,
+            DEMO_ENV,
+            demo_records,
+            missing_kinds,
+            stale_kinds,
+        )
+
+        if self._demo:
+            uncovered = sorted(missing_kinds())
+            retired = sorted(stale_kinds())
+            add(
+                "demo_mode",
+                True,
+                f"{DEMO_ENV} is set — every number this server returns is synthetic, "
+                f"generated locally, anchored at {DEMO_ANCHOR_DAY}. No account, no "
+                f"network, no decryption.",
+            )
+            add(
+                "demo_dataset",
+                not uncovered and not retired,
+                f"{len(demo_records())} synthetic records"
+                + (f"; kinds with no dataset: {uncovered}" if uncovered else "")
+                + (f"; datasets for retired kinds: {retired}" if retired else ""),
+                hint="A known metric kind has no demo dataset, so its tool will "
+                "return empty and read as broken. Add a builder in demo.py.",
+            )
+            return {
+                # Banner first, ahead of even `ok` — a green `ok: true` is
+                # exactly the shape a reader stops reading after, and here it
+                # means "the demo dataset is intact", not "your install is fine".
+                "demo_warning": DEMO_BANNER,
+                "demo_mode": True,
+                "ok": all(check["ok"] for check in checks),
+                "checks": checks,
+                # Named individually rather than summarised, because these are the
+                # exact rows a reader expects to find and will otherwise hunt for.
+                "not_checked": {
+                    "config": "demo mode reads no config file",
+                    "identity_key": "demo mode needs no private key — nothing is decrypted",
+                    "cloud_reachable": "no request was made; demo mode is fully offline",
+                    "bound": "demo mode is deliberately unbound",
+                    "data_roundtrip": (
+                        "NOT ATTEMPTED. No blob was fetched and none was decrypted, so "
+                        "this report says nothing about whether the cloud path works."
+                    ),
+                    "client_version": (
+                        "skipped so demo mode makes no network calls at all; run without "
+                        f"{DEMO_ENV} to check for a newer release"
+                    ),
+                },
+                "next_step": (
+                    f"To diagnose a real install, unset {DEMO_ENV} and run this again."
+                ),
+                # Derived from the demo dataset by the same code path the real one
+                # uses — `sync_decrypted_records` is where demo data is injected, so
+                # this reports genuine per-kind counts rather than a second answer
+                # written by hand.
+                "capabilities": await self._capability_report(),
+                "scope": self._scope_report(),
+            }
 
         # ⚠️ load() RAISES on a config it cannot read, and that path is earlier
         # than the `if not config` bail-out below. Uncaught, it takes the whole
@@ -4505,7 +4906,65 @@ class VaultbeatLocalService:
         }
 
     def status(self) -> dict[str, Any]:
-        config = self.store.load()
+        # Demo facts ride ON TOP of the real ones; `initialized` and `bound` keep
+        # reporting the actual config. Making them True would be the one lie that
+        # matters: an agent that believes it is bound will try to write, and will
+        # read every subsequent synthetic number as its owner's real health
+        # record.
+        #
+        # It is NOT true that a demo install is "usually neither" — this comment
+        # said so until 2026-08-20, and the assumption was load-bearing enough to
+        # be wrong twice. Demo mode is orthogonal to binding: it reads no config,
+        # so it happily runs on a fully bound machine, where `status` correctly
+        # reports bound: true while every read tool is serving synthetic records.
+        # Both statements are individually true and together they mislead, so the
+        # gap is closed by a field that answers the question neither of them does
+        # — `data_source` — rather than by making one of them lie.
+        from vaultbeat_mcp_local.demo import DEMO_ENV
+
+        try:
+            config = self.store.load()
+        except ConfigError as error:
+            # `status` is the FIRST thing a stuck user runs, and until 2026-08-20
+            # this raised — through `_watermark_demo`, which only wraps returns,
+            # so in demo mode the exception escaped unstamped and surfaced as a
+            # bare ToolError. Worse, what it threw was the private-key recovery
+            # essay, whose central warning is "DO NOT DELETE config.json or every
+            # record already encrypted becomes permanently unreadable" — a
+            # sentence with no referent in demo mode, which has no key and no
+            # encrypted records. Catch it and report it as a field.
+            return {
+                **self._demo_block(bound=False),
+                # The file EXISTS (load() only raises after exists()), so this is
+                # true — and it is the answer that matters, because a consumer
+                # reading `initialized: False` would recommend `bind`, and
+                # minting a fresh identity is the single most destructive thing
+                # to do to an install whose key is merely unreadable.
+                "initialized": True,
+                "bound": False,
+                "data_source": "synthetic" if self._demo else "account",
+                "config_error": (
+                    f"{type(error).__name__} at {self.store.path} — not used in demo "
+                    f"mode, which reads no config and decrypts nothing. Run without "
+                    f"{DEMO_ENV} for the full diagnosis."
+                    if self._demo
+                    else str(error)
+                ),
+                "next_step": (
+                    f"Nothing to do for demo mode. To diagnose the real install, unset "
+                    f"{DEMO_ENV} and run `vaultbeat-mcp doctor`."
+                    if self._demo
+                    else (
+                        "Run `vaultbeat-mcp doctor` for the full private-key report. "
+                        "DO NOT delete the config file and DO NOT run `bind` — the key "
+                        "is unreadable, not absent, and re-binding mints a new identity "
+                        "that cannot decrypt anything already stored."
+                    )
+                ),
+            }
+
+        demo_block = self._demo_block(bound=bool(config and config.is_bound))
+
         if not config:
             # `next_step` added 2026-08-11. The website tells first-time users to run
             # `status` to "verify the server", and the honest answer at that point was
@@ -4513,8 +4972,10 @@ class VaultbeatLocalService:
             # installed the thing, and says nothing about what to do next. It is
             # ADD-ONLY: agents keying off `bound` / `initialized` are unaffected.
             return {
+                **demo_block,
                 "initialized": False,
                 "bound": False,
+                "data_source": "synthetic" if self._demo else "account",
                 "next_step": (
                     "Not paired yet — this is the expected state before first use. "
                     "Run: uvx --from 'vaultbeat-mcp[qr]@latest' vaultbeat-mcp bind "
@@ -4525,8 +4986,16 @@ class VaultbeatLocalService:
             }
 
         return {
+            **demo_block,
             "initialized": True,
             "bound": config.is_bound,
+            # `bound` answers "is a binding stored", which in demo mode is a
+            # true answer to the wrong question — the binding is real and is
+            # being BYPASSED. Nothing here previously answered "where did these
+            # numbers come from", so an agent had to infer it, and the available
+            # signals pointed the wrong way. Emitted in both modes on purpose: a
+            # missing field and "not demo" must not look the same.
+            "data_source": "synthetic" if self._demo else "account",
             **(
                 {}
                 if config.is_bound
@@ -4548,6 +5017,20 @@ class VaultbeatLocalService:
             "owner_device_bound": bool(config.owner_device_id),
             "config_path": str(self.store.path),
         }
+
+    def _demo_block(self, *, bound: bool) -> dict[str, Any]:
+        """The demo facts spliced into `status()`, or `{}` when demo mode is off.
+
+        Takes `bound` because the honest wording depends on it: on an unbound
+        machine demo mode is simply what is running, while on a BOUND one it is
+        overriding a real, working binding — and `bound: true` sitting beside a
+        note that says binding "still requires a real paired account" reads as
+        confirmation that the binding is in use. It is not.
+        """
+
+        from vaultbeat_mcp_local.demo import demo_status
+
+        return demo_status(bound=bound) if self._demo else {}
 
     def _client(self, config: LocalServerConfig) -> CloudClientProtocol:
         return self._cloud_client or VaultbeatCloudClient(config.api_base_url)

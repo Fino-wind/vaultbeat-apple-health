@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 import vaultbeat_mcp_local.store as store_module
+from vaultbeat_mcp_local.demo import DEMO_ENV
 
 
 @pytest.fixture(autouse=True)
@@ -52,3 +55,38 @@ def no_pypi_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
     """
 
     monkeypatch.setenv("VAULTBEAT_MCP_FAKE_LATEST", "")
+
+
+@pytest.fixture(autouse=True)
+def demo_env_is_off_unless_a_test_asks_for_it() -> None:
+    """Fail loudly if `VAULTBEAT_DEMO` is set at the START of any test.
+
+    Demo mode swaps EVERY number this server returns for a synthetic one, at a
+    choke point above the binding check, the cache and the network. A test that
+    runs with it on is not testing the code it names — it is testing `demo.py`,
+    and it passes for the wrong reason with nothing anywhere saying so.
+
+    Two ways that happens, and the message names both because they need different
+    fixes:
+
+    · a test set it via `os.environ` instead of `monkeypatch.setenv`, so nothing
+      undid it and every later test in the process inherited it. This is why the
+      check is an assertion rather than a silent `delenv` — clearing it here
+      would repair the symptom and hide the leak permanently.
+    · the developer has it exported in their shell, in which case the whole suite
+      is meaningless and ~300 confusing green results are strictly worse than one
+      loud red one.
+
+    Tests that WANT demo mode set it inside their own body (see
+    `tests/test_demo.py`); autouse fixtures are set up before the test runs, so
+    this sees the state they inherited, not the state they chose.
+    """
+
+    leaked = os.environ.get(DEMO_ENV)
+    assert leaked is None, (
+        f"{DEMO_ENV}={leaked!r} was already set when this test started. Demo mode "
+        f"replaces every value the server returns, so this test would pass or fail "
+        f"for reasons unrelated to what it asserts. Either an earlier test set it "
+        f"without monkeypatch (use `monkeypatch.setenv` so it is undone), or it is "
+        f"exported in your shell (`unset {DEMO_ENV}` and re-run)."
+    )

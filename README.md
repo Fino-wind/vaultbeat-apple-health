@@ -19,7 +19,7 @@ iPhone (Apple Health) ──E2EE──▶ cloud (ciphertext only) ──E2EE─�
 
 ## Requirements
 
-- [Vaultbeat — AI Health Sync](https://apps.apple.com/app/id6759241985) on iOS, **version 1.2.3 or later** — connecting an AI server is open on every plan, and pairing a machine starts three days of full agent access. (On 1.2.2 and earlier, connecting required a Pro subscription; update the app first.)
+- [Vaultbeat — AI Health Sync](https://apps.apple.com/app/id6759241985) on iOS, **version 1.2.3 or later** — 1.2.3 opened AI-server connections to every account; older builds restricted them, so update the app before pairing.
 - Python 3.11+ on the machine where your agent runs (macOS / Linux / Windows)
 
 ## Quick start
@@ -45,6 +45,32 @@ pip install 'vaultbeat-mcp[qr]'
 ```
 
 > Upgrading from the old `tether-mcp` package? Same code, new name — your existing binding and config carry over unchanged. Just swap the package name in your install command and MCP client config.
+
+### Try it first — no app, no pairing, no key
+
+```bash
+uvx vaultbeat-mcp@latest --demo doctor
+uvx vaultbeat-mcp@latest --demo sleep --limit 5
+uvx vaultbeat-mcp@latest --demo serve --transport stdio   # same dataset, wired into your agent
+```
+
+`--demo` is a **global flag**: it goes *before* the subcommand, and `VAULTBEAT_DEMO=1` does the
+same thing. It serves a deterministic synthetic dataset covering every data type this server can
+read — the same records on every machine and every run, so demo output can be pasted into a bug
+report as a shared baseline. Nothing is fetched, nothing is decrypted, and there is no private
+key involved at all, so you can see exactly what your agent would be able to answer before
+installing anything on your phone.
+
+Demo output is built so it cannot be mistaken for a real export: every MCP tool result carries
+`demo_mode: true` and a `[SYNTHETIC DEMO DATA]` banner, each tool's description says so, and the
+server introduces itself to your client as `Vaultbeat Health [DEMO — SYNTHETIC DATA]`. The
+`log_*` write tools deliberately **refuse** in demo mode — writing needs a real key and a real
+account, and a write that pretends to succeed is worse than one that says it needs pairing.
+The flag applies to that one invocation only and is never written to your config.
+
+⚠️ **Synthetic numbers are not health observations.** They are generated locally and belong to
+no real person — don't save them into a note or file, and don't let an agent reason about anyone's
+health from them.
 
 ### 2. Bind your phone
 
@@ -105,11 +131,14 @@ Debugging: `npx @modelcontextprotocol/inspector uvx vaultbeat-mcp@latest serve -
 
 Then just ask your agent: *“How did we sleep last night?”*
 
-<!-- Keep this count in step with the table below: 19 read + 4 write + 2 bind + doctor = 26.
-     The get_hrv_hourly row is a granularity argument to get_hrv, not a 27th registered tool.
+<!-- Keep this count in step with the table below: 19 read + 7 write + 2 bind + doctor = 29.
+     The get_hrv_hourly row is a granularity argument to get_hrv, not a registered tool, so the
+     table always has one more row than the heading counts.
      This said (16) until 2026-07-31 while the table already listed all 26 — directory listings
-     render the heading, not the table, so the stale number was the public-facing one. -->
-## MCP tools (26)
+     render the heading, not the table, so the stale number was the public-facing one.
+     0.5.0 took write from 4 to 7 by splitting the `_append` tools out of the `merge=True` flag.
+     Source of truth is the code, not this comment: `grep -cE '^    @tool' mcp_server.py`. -->
+## MCP tools (29)
 
 | Tool | Returns |
 |---|---|
@@ -137,16 +166,22 @@ Then just ask your agent: *“How did we sleep last night?”*
 | `get_strength_log` | Structured strength training: exercise, sets, reps, weight per day |
 | `get_food_log` | Meals as free text with optional portions and timing |
 | `log_weight_entry` | **Write** a weight entry (optionally mirrored into Apple Health when the user opts in). Carries over that day's existing body composition instead of erasing it — an agent cannot supply fat/BMI/lean mass, so a bare weight log must not wipe what the scale recorded |
-| `log_strength_entry` | **Write** a strength-training entry for a given day (`merge=True` to append) |
-| `log_food_entry` | **Write** a meal entry for a given day (`merge=True` to append) |
-| `log_note` | **Write** a mood or general note for a given day (`merge=True` to append) |
+| `log_strength_entry` | **Write** a strength session for a day — **replaces that whole day**. Use `log_strength_append` unless you mean to delete what is already there |
+| `log_strength_append` | **Write** exercises onto a day *without deleting anything*; sets are appended to a matching exercise name. The tool for "log the set I forgot", or for logging a session in installments while the owner is still in the gym |
+| `log_food_entry` | **Write** a day's meals — **replaces that whole day**. Use `log_food_append` unless you mean to delete what is already there |
+| `log_food_append` | **Write** extra meals onto a day *without deleting anything* — the right tool whenever the day may not be empty |
+| `log_note` | **Write** a mood or general note for a day — **replaces that day's note** |
+| `log_note_append` | **Write** one more line onto a day's note *without erasing what is there*. Use this for symptoms: discomfort arrives in installments, so a second write the same day is the normal case |
 
-> ⚠️ **The three `log_*` write tools replace the WHOLE DAY by default.** Passing only what you
-> want to add will delete everything else recorded for that day. Pass `merge=True` to append
-> instead — that is almost always what you want when adding to a day that already has data.
-> Every write returns a `replaced_*` field naming exactly what it deleted, so an agent can
-> notice and re-send. Since 0.2.4; before that the deletion was silent and there was no
-> merge mode.
+> ⚠️ **`log_strength_entry` / `log_food_entry` / `log_note` replace the WHOLE DAY.** Passing only
+> what you want to add deletes everything else recorded that day. Since 0.5.0 each one has an
+> `_append` twin — `log_strength_append` / `log_food_append` / `log_note_append` — that only adds
+> and *cannot* delete. **Prefer the `_append` form whenever the day may not be empty**, which an
+> agent generally cannot tell without reading it back first. (The three replace-tools still accept
+> `merge=True` for the same effect; the `_append` tools make the safe option reachable by name
+> instead of by remembering a flag.) Every write returns a `replaced_*` field naming exactly what
+> it deleted — from an `_append` call that field is always `[]` / `null`, which is the receipt
+> that nothing was. `log_weight_entry` has no twin: a day has one weight.
 
 Every data tool accepts `owner` (a user-ID prefix) to filter to one person — the server may hold both your and your partner's shared records, and omitting `owner` mixes them into one pool, so per-person questions should always pass it. (Earlier releases named some tools `get_partner_*` / `tether_*`; they were renamed in the 16-tool and Vaultbeat releases.)
 

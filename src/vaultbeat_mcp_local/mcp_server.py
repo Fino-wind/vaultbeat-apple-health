@@ -1,13 +1,204 @@
 from __future__ import annotations
 
+import functools
 import hmac
+import inspect
 import ipaddress
 import json
-from typing import Any
+from typing import Any, Callable, TypeVar, cast
 
 from vaultbeat_mcp_local import __version__
+from vaultbeat_mcp_local.demo import DEMO_BANNER, demo_enabled
 from vaultbeat_mcp_local.service import VaultbeatLocalService
 from vaultbeat_mcp_local.store import ConfigStore
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+# ── Tool annotations ─────────────────────────────────────────────────────────
+#
+# `ToolAnnotations` is the MCP spec's per-tool behaviour hint block. It travels
+# in `list_tools` and is what lets a client decide whether a call needs a
+# confirmation prompt BEFORE running it — a static promise about the tool, not a
+# per-call one, which is why anything with two modes has to be annotated for its
+# worst mode (see `log_food_entry` vs `log_food_append`).
+#
+# The import is function-local on purpose. `run_mcp_server` deliberately imports
+# FastMCP lazily so a missing SDK produces a sentence instead of a traceback; a
+# module-level `from mcp.types import ...` here would raise first and make that
+# whole guard dead code.
+
+
+def _read_only_tool(*, open_world: bool = False) -> Any:
+    """A tool that only reads. Safe to call, safe to repeat, changes nothing.
+
+    `idempotentHint=True` is about EFFECT, not about the answer: a later call
+    may return newer numbers because the account moved on, but nothing changed
+    because this tool ran. Some of these do touch local state — the plaintext
+    cache, `last_sync_at`, a decrypt-failure report — and that is still
+    read-only in the sense a client cares about: no user data is created,
+    modified or destroyed. Annotating them all `False` for that would collapse
+    the read/write distinction to zero signal, which is the one thing these
+    hints exist to carry.
+
+    `open_world=True` for the single tool that talks to a host outside this
+    system (`vaultbeat_doctor` asks PyPI for the current version).
+    """
+
+    from mcp.types import ToolAnnotations
+
+    return ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=open_world,
+    )
+
+
+def _mutating_tool(*, destructive: bool, idempotent: bool = False) -> Any:
+    """A tool that changes something — the health record, or this binding.
+
+    `destructive=True` means a call CAN remove or overwrite something that was
+    already there. It is the spec's worst-case flag, so a tool with both a
+    replace and an append mode gets `True` and the append-only sibling gets
+    `False` — that split is the entire reason `log_*_append` exists as separate
+    tools rather than a `merge=True` argument, because an argument cannot be
+    annotated.
+    """
+
+    from mcp.types import ToolAnnotations
+
+    return ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=destructive,
+        idempotentHint=idempotent,
+        openWorldHint=False,
+    )
+
+
+# ── Demo mode ────────────────────────────────────────────────────────────────
+
+#: Prepended to every tool description while demo mode is on.
+#:
+#: Deliberately in the DESCRIPTION and not only in the results: a description is
+#: read once and stays in the model's context for the whole session, while a
+#: per-result banner has to survive summarisation, truncation and the agent
+#: paraphrasing three tool calls into one sentence. Both are used — this one so
+#: the agent never forgets, the result stamp so a copy-pasted payload still
+#: identifies itself.
+_DEMO_DOC_PREFIX = (
+    "⚠️ DEMO MODE — every number this tool returns is SYNTHETIC, generated locally, "
+    "and belongs to no real person. Say so in any answer built on it, and DO NOT "
+    "quietly persist it: if you are asked to write these numbers into a note, file, "
+    "journal, spreadsheet, database, calendar, health app or another MCP server, say "
+    "first that they are synthetic and get confirmation — and if you do write them, "
+    "label the entry [SYNTHETIC DEMO DATA] in the file itself. A disclosure in this "
+    "chat is gone in a week; an unlabelled fake row in the user's own notes is not. "
+    "Nothing is fetched from the cloud and nothing is decrypted."
+)
+
+
+def _watermark_demo(result: Any) -> Any:
+    """Stamp a synthetic-data marker onto a tool result.
+
+    Add-only and non-destructive, same discipline as `_annotate_if_empty`: it
+    never reads, edits or drops an existing key. The marker goes FIRST in the
+    dict so it survives a client that truncates a long payload from the end.
+
+    🔴 `demo_warning` is the FIRST key, ahead of the boolean. The result is
+    serialised with `json.dumps`, which preserves insertion order, so the first
+    key is literally the first thing in the text an agent receives — and
+    `"demo_mode": true` is a flag someone has to already know to look for,
+    while the banner is a sentence that acts on a reader who does not. Ordering
+    is free; which of the two goes first is not.
+
+    A result that already carries `demo_mode` (`vaultbeat_status`,
+    `vaultbeat_doctor`, which build a richer block of their own) is returned
+    untouched rather than double-stamped — those two order their own keys the
+    same way.
+    """
+
+    if not isinstance(result, dict) or "demo_mode" in result:
+        return result
+    return {
+        "demo_warning": DEMO_BANNER,
+        "demo_mode": True,
+        **_mark_demo_rows(result),
+    }
+
+
+def _mark_demo_rows(result: dict[str, Any]) -> dict[str, Any]:
+    """Tag each row of a top-level list-of-dicts with `synthetic: True`.
+
+    The top-level banner covers a result quoted whole; it does NOT survive a row
+    being lifted out of it. Most read tools self-identify anyway because their
+    rows carry `owner_user_id`, which in demo mode reads `demo0001-…` — but the
+    two aggregating tools build brand-new dicts (`{"day": …, "basal_kcal": …}`)
+    and drop that field on the way, so `get_basal_energy` and
+    `get_total_energy_burned` were the only two whose rows were, taken alone,
+    indistinguishable from real ones (verified 2026-08-20: 17 of 19 read tools
+    self-identify, those two did not).
+
+    Done HERE rather than in those two methods on purpose — one site, so a third
+    aggregating tool is covered on the day it is written rather than on the day
+    someone notices. It is also structurally absent from a real run: the wrapper
+    is only installed when demo mode is on.
+
+    One level deep, deliberately. Recursing would reach into `sleep`'s per-night
+    `stages` and similar, which is noise for no gain — a stage array is not
+    something anyone lifts out and quotes as a health fact. Non-dict rows
+    (`errors` is a list of strings) are left alone.
+    """
+
+    marked: dict[str, Any] = {}
+    for key, value in result.items():
+        if isinstance(value, list) and any(isinstance(row, dict) for row in value):
+            marked[key] = [
+                {**row, "synthetic": True} if isinstance(row, dict) else row
+                for row in value
+            ]
+        else:
+            marked[key] = value
+    return marked
+
+
+def _demo_wrap(function: _F) -> _F:
+    """Wrap one tool so its output is watermarked and its docstring says DEMO.
+
+    Two shapes, because this server has both: `vaultbeat_status` and
+    `vaultbeat_start_binding` are plain `def`, everything else is `async def`.
+    A single sync wrapper around a coroutine function would hand FastMCP a
+    coroutine object as the tool's result — the tool would "succeed" and return
+    something unserialisable.
+
+    `functools.wraps` is load-bearing beyond cosmetics: FastMCP builds each
+    tool's JSON schema from `inspect.signature(fn)`, which follows the
+    `__wrapped__` attribute wraps sets — so the published schema stays the real
+    function's, not `(*args, **kwargs)`.
+    """
+
+    if inspect.iscoroutinefunction(function):
+
+        @functools.wraps(function)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            return _watermark_demo(await function(*args, **kwargs))
+
+        _prefix_doc(async_wrapper, function)
+        return cast(_F, async_wrapper)
+
+    @functools.wraps(function)
+    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+        return _watermark_demo(function(*args, **kwargs))
+
+    _prefix_doc(sync_wrapper, function)
+    return cast(_F, sync_wrapper)
+
+
+def _prefix_doc(wrapper: Any, original: Any) -> None:
+    """Put the demo warning at the top of the description FastMCP will publish."""
+
+    doc = inspect.getdoc(original) or ""
+    wrapper.__doc__ = f"{_DEMO_DOC_PREFIX}\n\n{doc}" if doc else _DEMO_DOC_PREFIX
 
 
 def _annotate_if_empty(result: dict[str, Any], kind: str, rows_key: str) -> dict[str, Any]:
@@ -165,15 +356,43 @@ def run_mcp_server(
             "The MCP SDK is not installed. Install with `pip install -e ./mcp-local-server`."
         ) from error
 
-    service = VaultbeatLocalService(store or ConfigStore())
     selected_transport = _normalize_transport(transport)
+
+    # Read ONCE, here, rather than per call. A tool whose annotations say
+    # "read-only" while its body has quietly switched to synthetic data mid-session
+    # is worse than either state on its own, and the description prefix is fixed at
+    # registration anyway — so the whole server is either a demo or it is not.
+    #
+    # 🔴 That was the INTENT from the start; it became true on 2026-08-20. The
+    # service used to re-read the environment on every call, so this constant
+    # only ever froze half the server: flip VAULTBEAT_DEMO on after startup and
+    # the service began serving synthetic records while this value — and with it
+    # every result watermark, every description prefix and the displayed server
+    # name — stayed on "real". Verified: a read tool returned owner id
+    # demo0001-… with no banner and no prefix, i.e. the ONE surface that gets
+    # copied out of the session was the one that had stopped saying so.
+    #
+    # Going the other way was structurally impossible, which is why this is
+    # frozen rather than live: the SDK captures each tool's description at
+    # registration (mutating `__doc__` afterwards changes nothing — verified)
+    # and clients cache serverInfo from `initialize`. So "all frozen" is the
+    # only self-consistent state available, and it is now passed DOWN rather
+    # than re-derived, so the two halves cannot disagree by construction.
+    demo_active = demo_enabled()
+    service = VaultbeatLocalService(store or ConfigStore(), demo=demo_active)
+
     # This name and version are what a user SEES: every MCP client lists the server
     # by its serverInfo. It said "Vaultbeat Local Sleep" until 2026-08-11 — a name
-    # from when sleep was the only kind — while actually serving 26 tools across 18
-    # kinds, so the listing undersold the product to the one audience already looking
-    # at it.
+    # from when sleep was the only kind — while at that point already serving 26
+    # tools across 18 kinds, so the listing undersold the product to the one audience
+    # already looking at it. (That 26 is the count on the day it was fixed, not a
+    # figure to keep current — `grep -cE '^    @tool' mcp_server.py` is. Anchored,
+    # because an unanchored pattern matches this very sentence and reports N+1.)
+    #
+    # The demo suffix rides on the same string for the same reason: it is the one
+    # label a client shows without anyone calling anything.
     mcp = FastMCP(
-        "Vaultbeat Health",
+        "Vaultbeat Health [DEMO — SYNTHETIC DATA]" if demo_active else "Vaultbeat Health",
         host=host,
         port=port,
         streamable_http_path=_normalize_http_path(path),
@@ -192,13 +411,33 @@ def run_mcp_server(
     if inner_server is not None and hasattr(inner_server, "version"):
         inner_server.version = __version__
 
-    @mcp.tool()
+    def tool(*, title: str, annotations: Any) -> Callable[[_F], _F]:
+        """Register one tool — the single place demo mode can reach every tool.
+
+        A choke point, not a convenience wrapper (Invariant 58): the alternative
+        is 29 call sites each remembering to watermark, which is 29 chances to
+        forget and no way to notice the one that did.
+
+        Patching `mcp.call_tool` after construction does NOT work and was tried:
+        `FastMCP.__init__` calls `_setup_handlers`, which binds the bound method
+        into the low-level server at construction time, so a later reassignment
+        is never consulted. Decorating on the way in is the only hook that
+        exists.
+        """
+
+        def decorator(function: _F) -> _F:
+            prepared = _demo_wrap(function) if demo_active else function
+            return cast(_F, mcp.tool(title=title, annotations=annotations)(prepared))
+
+        return decorator
+
+    @tool(title="Connection status", annotations=_read_only_tool())
     def vaultbeat_status() -> dict[str, Any]:
         """Return local Vaultbeat binding state without exposing private keys or server tokens."""
 
         return service.status()
 
-    @mcp.tool()
+    @tool(title="Run diagnostics", annotations=_read_only_tool(open_world=True))
     async def vaultbeat_doctor() -> dict[str, Any]:
         """Diagnose this Vaultbeat MCP install, and report which data types are unavailable.
 
@@ -229,7 +468,7 @@ def run_mcp_server(
 
         return await service.doctor()
 
-    @mcp.tool()
+    @tool(title="Sleep history", annotations=_read_only_tool())
     async def vaultbeat_sync_sleep(
         limit: int = 50, owner: str | None = None, fresh: bool = False
     ) -> dict[str, Any]:
@@ -239,8 +478,8 @@ def run_mcp_server(
         Returns `daily_summary` (one primary session per local date, selected by
         iOS priority: Watch > iPhone > inBedOnly) and `sessions` (all raw records).
         The `limit` controls how many raw blobs are fetched; 50 covers ~2-3 weeks.
-        Use `owner` prefix to filter by person (e.g. "dce9" for one user,
-        "f835" for the other) — without it, both partners' data is mixed and
+        Use `owner` prefix to filter by person (e.g. "a1a1" for one user,
+        "b2b2" for the other) — without it, both partners' data is mixed and
         per-day selection may pick the wrong person's session.
 
         ⚠️ `is_in_bed_only: true` means sleep was NEVER MEASURED that night (the
@@ -259,7 +498,7 @@ def run_mcp_server(
             "sessions",
         )
 
-    @mcp.tool()
+    @tool(title="Water intake", annotations=_read_only_tool())
     async def get_water_intake(
         limit: int = 30, owner: str | None = None, fresh: bool = False
     ) -> dict[str, Any]:
@@ -267,7 +506,7 @@ def run_mcp_server(
 
         Returns one entry per day (newest first) with refill count, container volume, and
         derived intake in liters, plus `average_daily_intake_liters` over the window.
-        Use `owner` prefix to filter by person (e.g. "dce9" or "f835").
+        Use `owner` prefix to filter by person (e.g. "a1a1" or "b2b2").
         Each record carries `owner_user_id` to identify whose data it is.
         """
 
@@ -277,7 +516,7 @@ def run_mcp_server(
             "days",
         )
 
-    @mcp.tool()
+    @tool(title="Weight trend", annotations=_read_only_tool())
     async def get_weight_trend(
         limit: int = 90, goal_kg: float | None = None, owner: str | None = None, fresh: bool = False
     ) -> dict[str, Any]:
@@ -285,7 +524,7 @@ def run_mcp_server(
 
         Returns one entry per day (newest first, kilograms) plus latest/average/min/max,
         the OLS weekly rate (kg/week), and — when `goal_kg` is given — the distance to goal.
-        Use `owner` prefix to filter by person (e.g. "dce9" or "f835").
+        Use `owner` prefix to filter by person (e.g. "a1a1" or "b2b2").
         Each record carries `owner_user_id` to identify whose data it is.
         """
 
@@ -297,7 +536,7 @@ def run_mcp_server(
             "days",
         )
 
-    @mcp.tool()
+    @tool(title="Symptoms", annotations=_read_only_tool())
     async def get_symptoms(limit: int = 120, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent HealthKit symptom days locally, grouped by data owner.
 
@@ -311,7 +550,7 @@ def run_mcp_server(
 
         return await service.symptom_summary(limit=limit, fresh=fresh)
 
-    @mcp.tool()
+    @tool(title="Notes", annotations=_read_only_tool())
     async def get_notes(limit: int = 120, target_kind: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent free-text notes (day annotations) locally.
 
@@ -326,7 +565,7 @@ def run_mcp_server(
 
         return await service.notes_summary(limit=limit, target_kind=target_kind, fresh=fresh)
 
-    @mcp.tool()
+    @tool(title="Strength log", annotations=_read_only_tool())
     async def get_strength_log(
         limit: int = 120, limit_days: int | None = None, fresh: bool = False
     ) -> dict[str, Any]:
@@ -346,7 +585,7 @@ def run_mcp_server(
             "sessions",
         )
 
-    @mcp.tool()
+    @tool(title="Log strength session (replaces day)", annotations=_mutating_tool(destructive=True))
     async def log_strength_entry(
         date: str,
         exercises: list[dict[str, Any]],
@@ -355,12 +594,15 @@ def run_mcp_server(
     ) -> dict[str, Any]:
         """Log one strength-training session on the owner's behalf (agent write).
 
-        ⚠️ DEFAULT IS REPLACE-THE-WHOLE-DAY: with `merge=False`, the supplied
-        `exercises` become the day's ENTIRE session — any exercise you don't
-        re-send is silently deleted. To ADD an exercise or a forgotten set to a
-        day that already has one, pass `merge=True`: your exercises are appended
-        to the existing session (an exercise whose `name` matches an existing one
-        gets its sets appended to it), and nothing already logged can be lost.
+        ⚠️ THIS TOOL DELETES. The supplied `exercises` become the day's ENTIRE
+        session — any exercise you don't re-send is silently deleted. If you meant
+        to ADD to a day rather than replace it, STOP and call
+        `log_strength_append` instead; it cannot delete anything.
+
+        (`merge=True` still does the same thing as `log_strength_append` and
+        keeps working for callers that already use it. New callers should use
+        the separate tool: which one you called is visible to the owner, a flag
+        buried in the arguments is not.)
 
         The result carries `replaced_exercises` — the names this call deleted.
         If that list is non-empty and you did not intend to replace the day, you
@@ -381,7 +623,42 @@ def run_mcp_server(
             date=date, exercises=exercises, note=note, merge=merge
         )
 
-    @mcp.tool()
+    @tool(title="Add to strength log", annotations=_mutating_tool(destructive=False))
+    async def log_strength_append(
+        date: str,
+        exercises: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Add exercises to a session WITHOUT touching what is already logged (agent write).
+
+        This tool cannot delete anything you did not send. Your `exercises` are
+        appended to the day's existing session; an exercise whose `name` matches an
+        existing one gets its sets appended to it. This is the right tool for "log
+        the set I forgot" or for logging a session in installments while the owner
+        is still in the gym — which is how strength data actually arrives.
+
+        Reach for `log_strength_entry` ONLY when you intend the supplied exercises
+        to become the day's ENTIRE session and everything else to be deleted.
+
+        `date` is the LOCAL calendar day the session happened, "YYYY-MM-DD".
+        `exercises` is `[{"name": "卧推", "sets": [{"weightKg": 30, "reps": 8}, ...]}, ...]`.
+
+        This tool deliberately cannot set the session note: that field is
+        replace-only, and a tool that promises to delete nothing must not carry an
+        exception. Use `log_strength_entry` to change it.
+
+        The result is the same shape `log_strength_entry` returns.
+        `replaced_exercises` is always `[]` here — that empty list is the receipt
+        that this call deleted nothing. Encrypted end-to-end before it ever leaves
+        this machine. Requires a bind made after the agent write path shipped; an
+        older bind must re-pair via `vaultbeat_start_binding` then
+        `vaultbeat_poll_binding`.
+        """
+
+        return await service.log_strength_entry(
+            date=date, exercises=exercises, note=None, merge=True
+        )
+
+    @tool(title="Food log", annotations=_read_only_tool())
     async def get_food_log(
         limit: int = 90, limit_days: int | None = None, fresh: bool = False
     ) -> dict[str, Any]:
@@ -402,18 +679,21 @@ def run_mcp_server(
             "days",
         )
 
-    @mcp.tool()
+    @tool(title="Log food (replaces day)", annotations=_mutating_tool(destructive=True))
     async def log_food_entry(
         date: str, meals: list[dict[str, Any]], note: str | None = None, merge: bool = False
     ) -> dict[str, Any]:
         """Log one day's food intake on the owner's behalf (agent write).
 
-        ⚠️ DEFAULT IS REPLACE-THE-WHOLE-DAY: with `merge=False`, the supplied
-        `meals` become the day's ENTIRE log — any meal you don't re-send is
-        silently deleted. To ADD a meal/snack to a day that already has
-        entries, pass `merge=True`: your meals are appended to the existing
-        day (a meal whose `name` matches an existing meal gets its items
-        appended to that meal) and nothing already logged can be lost.
+        ⚠️ THIS TOOL DELETES. The supplied `meals` become the day's ENTIRE log —
+        any meal you don't re-send is silently deleted. If you meant to ADD to a
+        day rather than replace it, STOP and call `log_food_append` instead; it
+        cannot delete anything.
+
+        (`merge=True` still does the same thing as `log_food_append` and keeps
+        working for callers that already use it. New callers should use the
+        separate tool: which one you called is visible to the owner, a flag
+        buried in the arguments is not.)
 
         The result carries `replaced_meals` — the meals this call deleted. If
         that list is non-empty and you did not intend to replace the day, you
@@ -440,12 +720,60 @@ def run_mcp_server(
         totals later, so a confident "650 kcal" that is wrong does more damage
         than "roughly 500-700, nothing in frame to judge size by" — the first
         silently poisons a week of trends, the second invites a correction.
+        [keep the photo-estimation paragraph above in sync with log_food_append's copy]
         Encrypted end-to-end before it ever leaves this machine.
         """
 
         return await service.log_food_entry(date=date, meals=meals, note=note, merge=merge)
 
-    @mcp.tool()
+    @tool(title="Add to food log", annotations=_mutating_tool(destructive=False))
+    async def log_food_append(
+        date: str,
+        meals: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Add meals to a day WITHOUT touching what is already logged (agent write).
+
+        This tool cannot delete anything you did not send. Your `meals` are appended
+        to whatever the day already holds; a meal whose `name` matches an existing
+        meal gets its items appended to that meal. This is the right tool for "log
+        the snack I forgot" / "add dinner to today" — which is almost every
+        follow-up write of the day.
+
+        Reach for `log_food_entry` ONLY when you intend the supplied meals to become
+        the day's ENTIRE log and everything else to be deleted.
+
+        `date` is the LOCAL calendar day, "YYYY-MM-DD".
+        `meals` is a list of `{name?, timeOfDay?, items: [...], note?}` where each
+        item is `{food, portion?, note?, kcal?, proteinGrams?, fatGrams?, carbGrams?}`,
+        e.g. `[{"name": "lunch", "items": [{"food": "香蕉", "portion": "1 根", "kcal": 105}]}]`.
+        Everything but `food` is optional so a rushed "just log 香蕉" still works;
+        when you DO estimate nutrition at logging time, put the numbers in the
+        structured fields (snake_case aliases like `protein_g` are accepted) — they
+        persist for later sessions instead of being re-guessed each read.
+
+        ESTIMATING FROM A PHOTO: look for something of known size in the frame
+        first — a utensil, a hand, a coin, the rim of a standard plate — and
+        calibrate the portion against it. With no such reference an image cannot
+        settle portion size, and portion size is what the whole estimate rests on.
+        In that case say so in your reply and give a range rather than a
+        precise-looking number. These values are persisted and summed into daily
+        totals later, so a confident "650 kcal" that is wrong does more damage than
+        "roughly 500-700, nothing in frame to judge size by" — the first silently
+        poisons a week of trends, the second invites a correction.
+        [keep the photo-estimation paragraph above in sync with log_food_entry's copy]
+
+        This tool deliberately cannot set the day's note: that field is
+        replace-only, and a tool that promises to delete nothing must not carry an
+        exception. Use `log_food_entry` to change it.
+
+        The result is the same shape `log_food_entry` returns. `replaced_meals` is
+        always `[]` here — that empty list is the receipt that this call deleted
+        nothing. Encrypted end-to-end before it ever leaves this machine.
+        """
+
+        return await service.log_food_entry(date=date, meals=meals, note=None, merge=True)
+
+    @tool(title="Log note (replaces note)", annotations=_mutating_tool(destructive=True))
     async def log_note(
         text: str, kind: str = "general", date: str | None = None, merge: bool = False
     ) -> dict[str, Any]:
@@ -456,19 +784,24 @@ def run_mcp_server(
         `kind="general"` for day events worth joining against sleep/HRV later.
         (sleep/menstrual notes stay iOS-authored — this tool refuses them.)
 
-        ⚠️ DEFAULT IS REPLACE-THE-WHOLE-NOTE: there is one note per (kind, day),
-        and with `merge=False` your `text` becomes its ENTIRE contents — anything
-        already written for that kind+day is silently deleted. To ADD to a day
-        that already has a note, pass `merge=True`: your text is appended on a
-        new line and nothing already logged can be lost.
+        ⚠️ THIS TOOL DELETES. There is one note per (kind, day), and your `text`
+        becomes its ENTIRE contents — anything already written for that kind+day
+        is silently deleted. If you meant to ADD to a day rather than replace it,
+        STOP and call `log_note_append` instead; it cannot delete anything.
+
+        (`merge=True` still does the same thing as `log_note_append` and keeps
+        working for callers that already use it. New callers should use the
+        separate tool: which one you called is visible to the owner, a flag
+        buried in the arguments is not.)
 
         The result carries `replaced_text` — the note this call deleted. If it is
         non-null and you did not intend to replace, you just destroyed that text;
         re-send it with `merge=True`.
 
-        Use `merge=True` for symptoms. Discomfort shows up in installments
+        For symptoms, use `log_note_append`. Discomfort shows up in installments
         across a day (nausea at noon, dizziness at night), so the second write
-        of the day is the normal case, not the exception.
+        of the day is the normal case, not the exception — and this tool would
+        replace the morning's entry with the evening's.
 
         `date` = LOCAL calendar day "YYYY-MM-DD" (default today). Read back via
         `get_notes` (optionally `target_kind="mood"`/`"general"`). Encrypted
@@ -477,7 +810,44 @@ def run_mcp_server(
 
         return await service.log_note(text=text, kind=kind, date=date, merge=merge)
 
-    @mcp.tool()
+    @tool(title="Add to note", annotations=_mutating_tool(destructive=False))
+    async def log_note_append(
+        text: str,
+        kind: str = "general",
+        date: str | None = None,
+    ) -> dict[str, Any]:
+        """Add a line to a day's note WITHOUT erasing what is already there (agent write).
+
+        There is one note per (kind, day). This tool appends your `text` to it on a
+        new line and cannot delete what is already written.
+
+        USE THIS FOR SYMPTOMS. Discomfort arrives in installments across a day —
+        nausea at noon, dizziness at night — so the second write of the day is the
+        normal case, not the exception. `log_note` would replace the morning's
+        entry with the evening's.
+
+        Reach for `log_note` ONLY when you intend your text to become the note's
+        ENTIRE contents and whatever is there now to be deleted (e.g. correcting
+        something you yourself wrote a minute ago).
+
+        `kind="general"` for day events worth joining against sleep/HRV later,
+        `kind="mood"` for emotional state. (sleep/menstrual notes stay iOS-authored
+        — this tool refuses them.) `date` = LOCAL calendar day "YYYY-MM-DD"
+        (default today). Read back via `get_notes`.
+
+        The result is the same shape `log_note` returns. `replaced_text` is always
+        `null` here — that null is the receipt that this call deleted nothing.
+        Encrypted end-to-end before it ever leaves this machine.
+        """
+
+        return await service.log_note(text=text, kind=kind, date=date, merge=True)
+
+    # Found by the generalised rule in `test_destructive_titles_name_their_
+    # consequence`, not by anyone auditing this line: its own docstring says
+    # "re-logging the same day overwrites", so it is a same-day replace exactly
+    # like the three tools that already say so in their titles. Third offender
+    # of a class that had been described as two.
+    @tool(title="Log weight (replaces day)", annotations=_mutating_tool(destructive=True))
     async def log_weight_entry(weight_kg: float, date: str | None = None) -> dict[str, Any]:
         """Log the owner's weight (kg) on their behalf (agent write, 2026-07-21).
 
@@ -503,7 +873,7 @@ def run_mcp_server(
 
         return await service.log_weight_entry(weight_kg=weight_kg, date=date)
 
-    @mcp.tool()
+    @tool(title="Menstrual cycle", annotations=_read_only_tool())
     async def get_menstrual_cycle(
         limit: int = 60, owner: str | None = None, fresh: bool = False
     ) -> dict[str, Any]:
@@ -516,7 +886,14 @@ def run_mcp_server(
 
         return await service.menstrual_cycle_summary(limit=limit, owner=owner, fresh=fresh)
 
-    @mcp.tool()
+    # Same family, milder: since 2026-08-11 this leaves credentials alone (see
+    # its docstring), but it still overwrites `poll_id` — which invalidates a QR
+    # code already on screen, the exact hazard `vaultbeat_poll_binding` warns
+    # about. The hint stays True; the title now says what for.
+    @tool(
+        title="Start pairing (invalidates any open QR)",
+        annotations=_mutating_tool(destructive=True),
+    )
     def vaultbeat_start_binding(server_name: str = "Local AI Server") -> dict[str, Any]:
         """Initialize a binding session: generates a keypair (if needed) and returns a
         QR payload that the user scans in the Vaultbeat iOS app to authorize this AI server.
@@ -545,7 +922,18 @@ def run_mcp_server(
             "qr_payload_json": session.qr_payload_json,
         }
 
-    @mcp.tool()
+    # "Check pairing status" until 2026-08-20, which pointed the opposite way to
+    # this tool's own `destructiveHint: True` — and the annotation is right. Its
+    # SUCCESS branch is the write: `store.update` replaces server_id, server_token
+    # (rotated even when the identity is unchanged), the owner identity and
+    # bound_at, and on a new identity also clears last_sync_at and the decrypted
+    # cache. A title that says "Check" invites the reflexive approval that a
+    # destructive hint exists to prevent. House style is `verb (consequence)`,
+    # as in "Log food (replaces day)".
+    @tool(
+        title="Finish pairing (replaces this binding)",
+        annotations=_mutating_tool(destructive=True),
+    )
     async def vaultbeat_poll_binding() -> dict[str, Any]:
         """Check whether the user has scanned the QR code and authorized this server.
 
@@ -585,7 +973,7 @@ def run_mcp_server(
             "owner_user_id": result.owner_user_id,
         }
 
-    @mcp.tool()
+    @tool(title="Sleep stage detail", annotations=_read_only_tool())
     async def get_sleep_detail(
         limit: int = 2,
         owner: str | None = None,
@@ -610,7 +998,7 @@ def run_mcp_server(
 
         Returns `stage_intervals` (contiguous stage bands with start/end),
         `stage_minutes`, and `stage_vitals` (per-stage HR/RR min/mean/max). Use
-        `owner` prefix to filter by person (e.g. "dce9" for linyou, "f835" for
+        `owner` prefix to filter by person (e.g. "a1a1" for linyou, "b2b2" for
         partner).
 
         ⚠️ SIZE: each night is ~1-2k characters as returned. Setting
@@ -632,7 +1020,7 @@ def run_mcp_server(
             limit=limit, owner=owner, fresh=fresh, include_timeline=include_timeline
         )
 
-    @mcp.tool()
+    @tool(title="Activity rings", annotations=_read_only_tool())
     async def get_activity(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent daily activity rings (steps, active energy kcal, exercise minutes,
         stand hours, distance km). One entry per day, newest first.
@@ -644,21 +1032,21 @@ def run_mcp_server(
             "days",
         )
 
-    @mcp.tool()
+    @tool(title="Resting heart rate", annotations=_read_only_tool())
     async def get_resting_hr(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent resting heart rate samples (bpm). Returns per-day records
         plus average over the window. Use `owner` prefix to filter by person."""
 
         return await service.resting_hr_records(limit=limit, owner=owner, fresh=fresh)
 
-    @mcp.tool()
+    @tool(title="Workouts", annotations=_read_only_tool())
     async def get_workouts(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent workout sessions (type, duration, calories, distance).
         Use `owner` prefix to filter by person."""
 
         return await service.workout_records(limit=limit, owner=owner, fresh=fresh)
 
-    @mcp.tool()
+    @tool(title="Heart rate variability", annotations=_read_only_tool())
     async def get_hrv(
         limit: int = 30,
         owner: str | None = None,
@@ -693,7 +1081,7 @@ def run_mcp_server(
         was retracted 2026-07-22 after an adversarial review pointed out
         the window mismatch.
 
-        Use `owner` prefix to filter by person (e.g. `"dce9"` / `"f835"`).
+        Use `owner` prefix to filter by person (e.g. `"a1a1"` / `"b2b2"`).
         """
 
         if granularity == "raw":
@@ -727,7 +1115,7 @@ def run_mcp_server(
         )
         return raw
 
-    @mcp.tool()
+    @tool(title="Wrist temperature", annotations=_read_only_tool())
     async def get_wrist_temp(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent sleeping wrist temperature samples — ABSOLUTE °C.
 
@@ -740,12 +1128,20 @@ def run_mcp_server(
 
         return await service.wrist_temp_records(limit=limit, owner=owner, fresh=fresh)
 
-    @mcp.tool()
+    @tool(title="Basal energy (BMR)", annotations=_read_only_tool())
     async def get_basal_energy(limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent basal-energy-burned samples (Apple Watch BMR estimate, kcal).
         Watch typically emits hourly samples; unlimited limit + daily aggregation
         returns per-day BMR (~1500-2000 kcal for active young adults) + average.
-        Use `owner` prefix to filter by person."""
+        Use `owner` prefix to filter by person.
+
+        READ `hours_covered` BEFORE QUOTING ANY SINGLE DAY. Basal arrives as one
+        blob per hour, so a day the Watch spent off the wrist comes back as a
+        real-looking row that is short in exact proportion — 883 kcal at 12 of
+        24 hours is half a day of data, NOT a collapsed metabolism. Rows with
+        `incomplete: true` are already excluded from `average_daily_basal_kcal`
+        (`average_over_days` is its denominator); if you quote such a day, say
+        how many hours it covers."""
 
         return _annotate_if_empty(
             await service.basal_energy_records(limit=limit, owner=owner, fresh=fresh),
@@ -753,21 +1149,28 @@ def run_mcp_server(
             "daily",
         )
 
-    @mcp.tool()
+    @tool(title="Total energy burned (TDEE)", annotations=_read_only_tool())
     async def get_total_energy_burned(days: int = 7, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """TDEE (total daily energy expenditure) = basal + active per day, last N days.
 
         The truthful daily calorie burn from Watch's actual measurements — not
         a formula. Diet targets need to aim BELOW this to lose weight (e.g.
         eating avg_tdee - 500 = ~0.5 kg/week loss). Returns per-day breakdown
-        {day, basal_kcal, active_kcal, total_kcal, basal_missing, partial} +
-        average TDEE. Today's row is flagged `partial` (still accumulating)
-        and excluded from the average — quote complete days for targets.
+        {day, basal_kcal, active_kcal, total_kcal, basal_missing, partial,
+        basal_hours_covered, basal_hours_expected, basal_incomplete} + average
+        TDEE. Three kinds of day are excluded from the average and each is
+        listed with its reason in `average_excluded_days`: today (`partial`,
+        still accumulating), days with no basal data (`basal_missing`), and
+        days whose Watch coverage was short (`basal_incomplete` — e.g. 16 of 24
+        hours). A short day's kcal is low in proportion to the hours it missed,
+        so including it drags the average down and, since the error is
+        one-directional, never cancels out. Quote `average_tdee_kcal` for diet
+        targets, and if you quote a single day, check `basal_incomplete` first.
         Use `owner` prefix to filter by person."""
 
         return await service.total_energy_burned(days=days, owner=owner, fresh=fresh)
 
-    @mcp.tool()
+    @tool(title="VO₂ max", annotations=_read_only_tool())
     async def get_vo2max(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent VO2Max samples (Apple Watch cardiorespiratory fitness).
         Unit: mL/(kg·min); higher = better. Male 20-29 reference: <35 poor,
@@ -783,7 +1186,7 @@ def run_mcp_server(
             "records",
         )
 
-    @mcp.tool()
+    @tool(title="Mindfulness", annotations=_read_only_tool())
     async def get_mindfulness(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent daily mindfulness summaries (session count, total minutes).
         Use `owner` prefix to filter by person."""
