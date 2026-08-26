@@ -298,6 +298,20 @@ def handle_bind(args: argparse.Namespace) -> int:
         return 2
 
     print(f"Bound local MCP server: {result.server_id}")
+    # vb-003 (2026-08-26): binding succeeds, but the AGENT still cannot reach
+    # this server until it is registered with the MCP client — and this success
+    # message used to say "Go ask your AI" while omitting that step entirely.
+    # A user who did as told found Claude listing zero vaultbeat tools and
+    # concluded the product was broken. The registration command belongs HERE,
+    # at the exact moment the user is looking at a terminal that just said
+    # everything worked.
+    print()
+    print("One last step — register this server with your MCP client.")
+    print("For Claude Code, run:")
+    print()
+    print("  claude mcp add vaultbeat-health -- uvx vaultbeat-mcp@latest serve --transport stdio")
+    print()
+    print("(Other clients: see https://vaultbeat.app/mcp for setup lines.)")
     # ⚠️ Informational, NOT a sales line. The acquisition copy above deliberately
     # says nothing about plans; this is the other side of that rule — once the
     # thing is working, the user is entitled to know what they have. So it states
@@ -311,7 +325,7 @@ def handle_bind(args: argparse.Namespace) -> int:
     if result.trial_ends_at:
         print()
         print(f"Full access to your health data is on until {result.trial_ends_at[:10]}.")
-        print("Go ask your AI something — that is what this was for.")
+        print("Once registered above, go ask your AI something — that is what this was for.")
     return 0
 
 

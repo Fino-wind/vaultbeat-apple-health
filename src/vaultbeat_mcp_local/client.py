@@ -36,11 +36,20 @@ class VaultbeatTrialExpiredError(VaultbeatCloudError):
     def __init__(self, trial_ended_at: str | None = None) -> None:
         self.trial_ended_at = trial_ended_at
         when = f" on {trial_ended_at[:10]}" if trial_ended_at else ""
+        # vb-005 (2026-08-26): the old sentence said "open the app and
+        # subscribe" without a location or a price — and the app's own
+        # settings row was not tappable, so the user stood at the door with
+        # money in hand and no till. Name the exact path and the prices here
+        # (client-side literals, never echoed from the server — Anti-pattern
+        # 23 still holds), so the highest-intent moment this product ever
+        # produces carries everything needed to act on it.
         super().__init__(
             f"Your 3-day Vaultbeat Pro trial ended{when}. "
-            "Open the Vaultbeat app on your iPhone and subscribe to Pro to restore "
-            "access. Nothing was deleted — your health data is still encrypted in "
-            "your account and reappears the moment Pro is active."
+            "To restore access: open the Vaultbeat app on your iPhone → "
+            "Settings → Membership, and pick a Pro plan ($9.99/month, "
+            "$79.99/year, or $149.99 once, forever). Nothing was deleted — "
+            "your health data is still encrypted in your account and "
+            "reappears the moment Pro is active."
         )
 
 
