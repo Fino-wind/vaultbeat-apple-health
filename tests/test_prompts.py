@@ -175,6 +175,41 @@ def test_an_omitted_argument_leaves_a_grammatical_sentence() -> None:
             assert defect not in rendered, f"{prompt.name}: {defect!r} after substitution"
 
 
+def test_a_supplied_argument_leaves_a_grammatical_sentence() -> None:
+    """The mirror of the test above — and the half that was missing.
+
+    The test above only ever exercises the FALLBACK, so the path a real caller
+    takes had nothing checking it, and the two cannot both come out right by
+    accident: an aside's sentence is authored to read correctly with the slot
+    EMPTY, which is exactly what leaves a supplied value nothing to separate it
+    from the next word. `why_is_this_empty` rendered "…out of date.
+    get_sleep_detail returned zero nights.Work out which cause" for every caller
+    who did the natural thing its argument description asks for and said which
+    tool came back empty (2026-08-27). It was also the likeliest prompt in the
+    library to be called WITH an argument, and the only one whose fallback is
+    empty — the rare path was the proof-read one.
+
+    The probe ends in a full stop for an aside and does not for the inline kind,
+    because that is the shape each is documented to receive: a window length is
+    a noun phrase dropped mid-sentence, an aside is a whole sentence.
+    """
+
+    for prompt in PROMPTS:
+        for argument in prompt.arguments:
+            probe = "PROBE ENDING IN A FULL STOP." if argument.is_aside else "PROBE VALUE"
+            rendered = render_prompt(prompt, {argument.name: probe})
+            where = f"{prompt.name}/{argument.name}"
+
+            assert probe in rendered, f"{where}: was not substituted"
+            for defect in ("  ", " .", " ,", "()"):
+                assert defect not in rendered, f"{where}: {defect!r} after substitution"
+
+            tail = rendered.split(probe, 1)[1]
+            assert tail[:1] in ("", " ", ",", ".", ";", ")", "\n"), (
+                f"{where}: the value runs straight into {tail[:24]!r}"
+            )
+
+
 @pytest.mark.parametrize("blank", ["", "   ", None])
 def test_a_blank_argument_is_treated_as_missing(blank: Any) -> None:
     """An empty string is a client sending nothing, not a value of nothing."""

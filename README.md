@@ -1,215 +1,356 @@
-# Vaultbeat MCP Server
+# Vaultbeat Local MCP Server
 
-**Let your own AI agent read your health data — without the cloud ever seeing it.**
+Local service program for Vaultbeat's encrypted health-data recipient flow.
+Published externally as [`Fino-wind/vaultbeat-mcp`](https://github.com/Fino-wind/vaultbeat-mcp)
+(public package name `vaultbeat-mcp`; `vaultbeat-mcp-local` remains a back-compat console
+script). This directory is the source of truth — after any user-visible change here,
+re-export the public repo and update its README tool table + the website `/mcp` page
+(see AGENTS.md "Sync duty").
 
-> ⚠️ **Skip the `pip install vaultbeat-mcp` box PyPI puts at the top of this
-> page.** Every PyPI package page gets one automatically — it isn't a
-> recommendation. Use `uvx` from Quick Start below: no separate install step,
-> and with `@latest` it always runs the current release. A bare `pip
-> install` (or a bare `uvx` without `@latest`) gets pinned to whatever was
-> current the moment you ran it and will not update itself.
+It runs on the user's computer, generates the Curve25519 keypair used by the iOS app,
+shows a QR binding payload, receives a one-time server token from the cloud API, and
+then exposes decrypted health data — sleep, water, weight, cycle, activity, vitals —
+through either a CLI or a stdio MCP server. Read-only: data is written by the iOS app.
 
-This is the official local [MCP](https://modelcontextprotocol.io) server for [Vaultbeat — AI Health Sync](https://apps.apple.com/app/id6759241985) (formerly named *Tether*), the iOS app that syncs Apple Health data (sleep, heart rate, menstrual cycle, weight, water, symptoms) between partners and to your own AI — end-to-end encrypted.
-
-Vaultbeat embeds no AI and runs no model on your phone. Intelligence lives where you control it: Claude Code, Claude Desktop, or any MCP-capable agent running on your own machine. This server is the bridge — it holds a private key that never leaves your computer, pulls ciphertext from the cloud, and decrypts **only locally**.
-
-```
-iPhone (Apple Health) ──E2EE──▶ cloud (ciphertext only) ──E2EE──▶ this server (your machine) ──▶ your AI agent
-```
-
-## Requirements
-
-- [Vaultbeat — AI Health Sync](https://apps.apple.com/app/id6759241985) on iOS, **version 1.2.3 or later** — 1.2.3 opened AI-server connections to every account; older builds restricted them, so update the app before pairing.
-- Python 3.11+ on the machine where your agent runs (macOS / Linux / Windows)
-
-## Quick start
-
-### 1. Install
-
-With [uv](https://docs.astral.sh/uv/) (recommended — no clone needed):
+## Commands
 
 ```bash
-uvx vaultbeat-mcp@latest status
+python -m pip install -e './mcp-local-server[qr]'
+# try every read tool against synthetic data — no pairing, no cloud, no Apple Health
+vaultbeat-mcp --demo sleep --limit 5
+vaultbeat-mcp --demo doctor
+
+vaultbeat-mcp bind
+vaultbeat-mcp status
+
+# read decrypted health data — every data subcommand accepts
+# --owner <user-id prefix> to filter to one person (omitting it mixes
+# both partners' records into one pool; aggregates become meaningless)
+vaultbeat-mcp sleep --limit 5 --owner a1a1        # sleep sessions + provenance
+vaultbeat-mcp sleep-detail --limit 1 --owner a1a1 # HR+RR+stage timeline
+vaultbeat-mcp water --limit 30 --owner a1a1       # water intake + daily average
+vaultbeat-mcp weight --limit 90 --owner b2b2      # weight trend (latest/avg/weekly rate)
+vaultbeat-mcp menstrual --limit 60 --owner b2b2   # menstrual cycle (sensitive)
+vaultbeat-mcp activity --limit 30 --owner a1a1    # daily activity rings
+vaultbeat-mcp resting-hr --limit 30 --owner a1a1  # resting heart rate
+vaultbeat-mcp workouts --limit 20 --owner a1a1    # workout records
+vaultbeat-mcp mindfulness --limit 30 --owner a1a1 # mindful minutes
+vaultbeat-mcp hrv --limit 30 --owner a1a1         # HRV / SDNN (hourly buckets by default; --granularity raw for per-sample)
+vaultbeat-mcp wrist-temp --limit 30 --owner a1a1  # sleeping wrist temperature
+vaultbeat-mcp symptoms --limit 30                 # symptom days (grouped by owner)
+vaultbeat-mcp notes --kind sleep --limit 30       # free-text day annotations
+
+# run as an MCP server
+vaultbeat-mcp serve --transport stdio
+vaultbeat-mcp serve --transport http --host 127.0.0.1 --port 8000 --path /mcp
+vaultbeat-mcp --demo serve --transport stdio   # same synthetic dataset, wired into a client
 ```
 
-The `@latest` matters: without it, `uvx` only fetches the newest version the
-*first* time you run the tool on a machine, then reuses its local cache on
-every run after that — same as `pip`, which never updates once installed.
-Keep `@latest` on every command below.
+`--demo` is a **global flag**, not a subcommand: it goes before the subcommand
+(`vaultbeat-mcp --demo sleep`), and `VAULTBEAT_DEMO=1` does the same thing. It serves a
+deterministic synthetic dataset — the same records on every machine, every run — so demo
+output can be pasted into a bug report as a shared baseline. Nothing is fetched and nothing
+is decrypted; there is no private key involved at all. Every payload carries `demo_mode:
+true` plus a `[SYNTHETIC DEMO DATA]` banner, the tool descriptions say so, and the server
+lists itself as `Vaultbeat Health [DEMO — SYNTHETIC DATA]`, so demo output cannot pass for a
+real export. **Read tools only** — the `log_*` write tools refuse, because writing needs a
+real key and a real account, and a write that pretends to succeed is worse than one that says
+it needs pairing. It applies to that one invocation and is never written to the config file.
 
-Or with pip (installs once, at whatever version is current right now — run
-`pip install --upgrade vaultbeat-mcp` yourself to pick up new releases):
+`http` is a CLI alias for MCP's `streamable-http` transport.
+The default transport remains `stdio` for local desktop MCP clients.
+
+The config file defaults to `~/.tether/mcp-local/config.json` and is written with
+`0600` permissions. It contains the cloud-issued server token and your **public**
+key; do not commit or share it.
+
+### Where the private key lives
+
+Not in `config.json`. It is looked for in three places, in order:
+
+1. **`VAULTBEAT_PRIVATE_KEY`** — read if set, never written back, for operators
+   who inject it from systemd-creds / a vault / a KMS.
+2. **The system keyring** — the normal case on a desktop.
+3. **`~/.tether/mcp-local/identity.key`**, mode `0600` — the automatic fallback
+   on a machine with no keyring backend at all.
+
+Keeping it out of `config.json` is a boundary, not tidiness: the server token
+alone can download your ciphertext but not read it, and the private key alone
+has nothing to decrypt. `config.json` is the file people `cat` into bug reports.
+
+> 🔴 **Never delete `config.json` to "start clean".** The private key is not in
+> it, so deleting does not clear a bad key — it mints a brand-new identity, and
+> every record already encrypted for the old one becomes permanently unreadable.
+> If a command reports missing key material, the error names all three locations
+> and what was found in each; read that before removing anything.
+
+**Headless servers**: if the keyring is unreachable, do *not* set
+`PYTHON_KEYRING_BACKEND` to the null backend. That backend accepts writes and
+stores nothing, so the key is discarded silently. Either let layer 3 handle it
+(automatic when no backend exists) or, if a D-Bus session exists but this
+process cannot see it, pass `DBUS_SESSION_BUS_ADDRESS` through explicitly —
+`XDG_RUNTIME_DIR` on its own is not enough.
+
+> **`.tether`, not `.vaultbeat` — that is deliberate, do not "fix" it.** The app
+> was renamed but this path is frozen at the pre-rename location, because the
+> Keychain username embeds the resolved config path (`_keychain_username` in
+> `store.py`). Moving the directory orphans the bound config *and* its
+> private-key Keychain entry for every existing install. Until 2026-07-28 this
+> README wrote `~/.vaultbeat/...`, which does not exist — so anyone who came here
+> to destroy their credentials `rm -rf`'d an empty path, got no error, and left
+> the real key in place.
+
+When using HTTP transport, the server binds to `127.0.0.1:8000` and serves MCP at
+`/mcp` by default, and requires a bearer token (see "Authenticating HTTP transport"
+below). Binding a non-loopback address fails closed unless you pass both a token and
+`--allow-remote`; always front a network-exposed server with TLS (a reverse proxy).
+
+## Binding Flow
+
+1. `vaultbeat-mcp bind` generates a fresh `pollID` and prints a QR payload:
+   `{"pollID":"...","publicKeyBase64":"...","serverName":"..."}`
+2. The iOS app scans that payload and calls the `mcp-bind-local` Edge Function.
+3. The local service polls the `mcp-poll-binding` Edge Function.
+4. Once bound, the local config stores `serverID` and `serverToken`.
+5. All read commands call the `mcp-sync` Edge Function, decrypt the returned envelopes
+   locally, and return plaintext JSON. (All privileged routes are Supabase Edge
+   Functions at `/functions/v1/<name>`.)
+
+### Troubleshooting: `vaultbeat-mcp doctor`
+
+If binding or reads fail, run the self-diagnosis:
 
 ```bash
-pip install 'vaultbeat-mcp[qr]'
+vaultbeat-mcp doctor          # human-readable [OK]/[FAIL] checklist with hints
+vaultbeat-mcp doctor --json   # machine-readable, for agents
 ```
 
-> Upgrading from the old `tether-mcp` package? Same code, new name — your existing binding and config carry over unchanged. Just swap the package name in your install command and MCP client config.
+It checks, in order: config file → identity key (Keychain) → cloud reachability →
+binding state → a real fetch-and-decrypt round trip, and prints a targeted hint for
+the first thing that's broken (e.g. "codes expire after 10 minutes — re-run bind for
+a fresh QR", or "the stored key can no longer decrypt your data — delete this server
+in the iOS app and bind again"). Exit code 0 = all healthy, 1 = something needs the
+hint above.
 
-### Try it first — no app, no pairing, no key
+## MCP Tools (29)
+
+`vaultbeat-mcp serve` can start either a stdio MCP server or a streamable HTTP MCP
+server. Every data tool accepts `owner` (user-ID prefix) to filter to one person and
+`fresh` to bypass the local cache — omit `owner` and both partners' records mix into
+one pool, so per-person analysis must always pass it. The tool names dropped the old
+misleading `get_partner_*` prefix in the 16-tool release (2026-07-16): the tools
+return whichever owners' envelopes this server holds, not specifically "the partner".
+
+Binding / status:
+
+- `vaultbeat_status` — local binding state (no keys/tokens in the result)
+- `vaultbeat_start_binding` — generate a fresh QR binding payload
+- `vaultbeat_poll_binding` — poll once for the iOS authorization
+- `vaultbeat_doctor` — diagnose this install end to end, and report which data types
+  are unavailable and why. Call it before telling a user their data is missing.
+
+Health data:
+
+- `vaultbeat_sync_sleep` — recent sleep records (incl. heart-rate samples) with per-day
+  primary-session selection matching the iOS app
+- `get_sleep_detail` — per-night HR+RR+stage timeline with stage intervals
+- `get_water_intake` — recent daily intake + computed `average_daily_intake_liters`
+- `get_weight_trend` — daily weights + latest/avg/min/max + OLS weekly rate
+- `get_menstrual_cycle` — recent cycle samples + a next-period prediction (sensitive)
+- `get_symptoms` — recent HealthKit symptom days grouped by data owner (sensitive)
+- `get_notes` — free-text sleep/menstrual day annotations with their writer (sensitive)
+- `get_strength_log` — strength-training sessions with exercise-level sets × reps and
+  per-session `total_volume_kg` (owner's own sessions only; logged manually in the app)
+- `get_food_log` — per-day meals and items, with optional per-item kcal/protein/fat/carbs
+- `get_activity` — daily activity rings (steps/energy/exercise/stand/distance)
+- `get_resting_hr` — resting heart rate records + mean
+- `get_workouts` — workout records (type/duration/calories/distance)
+- `get_mindfulness` — mindful sessions per day
+- `get_hrv` — HRV/SDNN records + mean. `granularity="hourly"` (default, `hrv_hourly` kind, one bucket/UTC hour w/ `sample_count`, 30-day window) or `"raw"` (`hrv` kind, per-sample, 3-day window)
+- `get_wrist_temp` — sleeping wrist-temperature baseline deviation
+- `get_vo2max` — cardiorespiratory fitness. Sparse by design: Apple only computes it
+  during outdoor walk/run/hike, so a handful of samples across a year is normal
+- `get_basal_energy` — basal metabolism (BMR) kcal, hourly buckets
+- `get_total_energy_burned` — basal + active = TDEE, with a 7-day average
+
+**Every read tool also returns a `coverage` block**, and an agent that wants to say
+"this is based on N days" has nothing else to read. Fields: `days_covered`, `first_day`,
+`last_day`, `span_days`, `days_missing_in_span`, `rows_counted`, `requested`,
+`requested_unit`, `window_satisfied`. Two things it exists to stop: counting the returned
+array instead (`limit` has already cut it, so the length answers a different question),
+and reading a long `span_days` as coverage — `days_covered: 12` with `span_days: 200` is
+twelve scattered days, not seven months. Quote `days_covered` beside any average, trend
+or comparison drawn from a result: an average over 3 days and one over 30 are the same
+shape and the same number of digits, and this is the only field that tells them apart.
+
+Writes (all scoped to the account that paired this machine — none takes an `owner`
+argument, so an agent can write to its own account and nowhere else):
+
+- `log_weight_entry` — record a weigh-in. Carries that day's existing body composition
+  forward instead of erasing it. No `_append` twin: a day has one weight.
+- `log_strength_entry` / `log_food_entry` / `log_note` — **replace that whole day**. Each
+  returns a `replaced_*` field naming exactly what it removed, so an agent can notice and
+  re-send. `merge=True` appends instead, kept for existing callers.
+- `log_strength_append` / `log_food_append` / `log_note_append` — add to a day and
+  **cannot delete anything**.
+
+> ⚠️ **`log_*` and `log_*_append` are different operations, and the names are the whole
+> point.** An agent picks a tool by name, and `log_food_entry` reads as "record something I
+> ate" while it actually means "overwrite this day with what I pass" — a default that lives
+> in a schema nobody re-reads. **When a day may already have entries, `log_*_append` is
+> almost always the one you want**, and it is the safe default for an agent that cannot see
+> what is already there. The split also lets the two be annotated differently
+> (`destructiveHint` true vs false), which a boolean argument structurally cannot be.
+
+(The health-memory fact tools — `health_recall_*` / `health_remember` — were deleted with
+the fact system in `491c850`, 2026-06-29: long-lived health knowledge lives in local
+markdown managed by the user's agent, not in an E2EE cloud round trip.)
+
+Every health kind shares one decryption path (Curve25519 ECDH + HKDF-SHA256 + AES-GCM);
+the server routes on `encrypted_sleep_blobs.metric_type` (the live kind list is whatever `check_metric_type_contract.py` prints — see
+`KNOWN_METRIC_TYPES` in `service.py`) and only the per-kind JSON decode/aggregate
+differs. The same service-layer functions back both the MCP tools and the matching CLI
+subcommands — no duplicated logic.
+
+**Local record cache (2026-07-09):** all reads are cache-first. Decrypted records are
+kept per metric type under `~/.tether/mcp-local/cache/` (owner-only 0600 files, 0700
+dir, stamped with server_id + fetch time + the fetch's decrypt-error list). Default TTL
+600 s — override with `VAULTBEAT_MCP_CACHE_TTL` (0 disables). Within the TTL a repeat query
+is answered locally with zero network (~0.2 s vs 5-35 s); pass `--fresh` (CLI) or
+`fresh=true` (MCP tools) to force a cloud round trip. (Re)binding clears the cache.
+`mcp-sync` also accepts `?metric_type=` so single-metric fetches stop paying for every
+other kind's ciphertext; the client keeps its own post-decrypt filter, so older edge
+deployments stay correct.
+
+Menstrual data is **sensitive**: it only reaches this server when the user explicitly
+opted in on iOS (absent otherwise), is decrypted locally, and is never re-exported.
+
+The MCP server never exposes the private key or server token through tool results.
+
+## MCP Prompts (8)
+
+`prompts/list` is the only channel through which an agent can ask what this server is
+*for*, rather than what it can call. Without it every client invents its own analysis
+routine, and the two mistakes that do real damage with health data — reporting an
+association as a cause, and reading a gap as a zero — are left to whichever agent
+happened to connect. Each entry names the tools it should call, and every one of them
+ends with the same two shared constants: a style rule (say what the data covers before
+concluding; describe, do not prescribe; no invented scores, grades or verdicts) and,
+wherever a read can legitimately come back empty, the absence rule (an empty result has
+four different causes that need opposite fixes — call `vaultbeat_doctor`, which is the
+tool that tells them apart).
+
+Every argument is optional. Omitted ones are filled with a default written into the
+prompt, so a client that sends nothing still gets a whole sentence rather than a hole.
+
+| Prompt | Argument | What it asks for |
+| --- | --- | --- |
+| `daily_brief` | — | The most recent day, set against the fortnight behind it, with the newest date named up front |
+| `sleep_review` | `nights` | Duration and stages across recent nights — keeping the nights that were never measured out of the average instead of folding them in as zeros |
+| `energy_balance` | `days` | Calories in against calories out, with the hours-incomplete days excluded rather than quietly dragging the average down |
+| `training_block_review` | `days` | Lifting and cardio volume beside the recovery signals from the same weeks, as context rather than a verdict |
+| `cycle_aware_read` | `metric` | A metric read against the same phase of earlier cycles, instead of against last week — which mixes phases and manufactures a trend |
+| `partner_check_in` | `days` | Both people's shared data side by side, read once per owner rather than averaged across two bodies, and never turned into a judgement of either |
+| `log_from_conversation` | `entry` | Turn something said in passing into an entry, asking for the parts that were left out rather than filling them in |
+| `why_is_this_empty` | `context` | Work out which of the four causes is behind an empty or stale result, and give the one next action for that one |
+
+## Transport Options
+
+Stdio transport, for local MCP clients that launch the server as a subprocess:
 
 ```bash
-uvx vaultbeat-mcp@latest --demo doctor
-uvx vaultbeat-mcp@latest --demo sleep --limit 5
-uvx vaultbeat-mcp@latest --demo serve --transport stdio   # same dataset, wired into your agent
+vaultbeat-mcp-local serve --transport stdio
 ```
 
-`--demo` is a **global flag**: it goes *before* the subcommand, and `VAULTBEAT_DEMO=1` does the
-same thing. It serves a deterministic synthetic dataset covering every data type this server can
-read — the same records on every machine and every run, so demo output can be pasted into a bug
-report as a shared baseline. Nothing is fetched, nothing is decrypted, and there is no private
-key involved at all, so you can see exactly what your agent would be able to answer before
-installing anything on your phone.
-
-Demo output is built so it cannot be mistaken for a real export: every MCP tool result carries
-`demo_mode: true` and a `[SYNTHETIC DEMO DATA]` banner, each tool's description says so, and the
-server introduces itself to your client as `Vaultbeat Health [DEMO — SYNTHETIC DATA]`. The
-`log_*` write tools deliberately **refuse** in demo mode — writing needs a real key and a real
-account, and a write that pretends to succeed is worse than one that says it needs pairing.
-The flag applies to that one invocation only and is never written to your config.
-
-⚠️ **Synthetic numbers are not health observations.** They are generated locally and belong to
-no real person — don't save them into a note or file, and don't let an agent reason about anyone's
-health from them.
-
-### 2. Bind your phone
+HTTP transport, for MCP clients that connect over a network or reverse proxy:
 
 ```bash
-uvx vaultbeat-mcp@latest bind
+vaultbeat-mcp-local serve --transport http --host 127.0.0.1 --port 8000 --path /mcp
 ```
 
-`bind` is the command that draws the QR code, and it waits while you scan.
-`serve` (step 3) prints nothing at all — it is the stdio protocol loop — so
-don't start that one first and sit waiting for a code.
+Optional HTTP flags:
 
-(The `[qr]` extra was required until 0.3.10, which made `qrcode` a hard
-dependency. The extra is still declared, empty, so older published commands
-keep resolving; you no longer need it.)
+- `--sse-response` to use SSE-style HTTP responses instead of JSON responses.
+- `--stateful-http` to disable stateless HTTP mode for clients that require sessions.
+- `--generate-token` to mint and persist a bearer token, print client config, then exit.
+- `--show-token` to print the stored bearer token and exit.
+- `--allow-remote` to permit a non-loopback bind (requires a token; confirms intent).
+- `--no-token` to serve loopback HTTP without bearer auth.
 
-This generates a keypair on your machine and prints a QR code. In the Vaultbeat iOS app, open **Settings → Data & AI → Connect an AI server** and scan it (or import a QR screenshot from Photos). The app authorizes this machine and starts sealing your health envelopes to its public key. Config lives in `~/.tether/mcp-local/` with owner-only `0600` permissions. (The directory keeps its original pre-rename path so existing bindings survive upgrades.)
+## Authenticating HTTP transport
 
-**Where the private key is kept — it is never uploaded anywhere, but *where* it sits depends on the machine:**
+The HTTP tool surface exposes **decrypted** health data, so it is gated by a static
+bearer token and refuses to bind a network-reachable address without explicit opt-in.
 
-| Layer | When it is used |
-|---|---|
-| `VAULTBEAT_PRIVATE_KEY` environment variable | If set, it wins. Read only — never written back, because an injected key belongs to whoever injected it |
-| System keyring | The default on any machine that has one (macOS Keychain, GNOME Keyring, Windows Credential Locker) |
-| `identity.key`, `0600`, next to `config.json` | **Only** when the platform has no keyring backend at all — a headless server, a container |
-
-The file fallback is deliberately narrow: a *locked* keychain, a denied prompt, or a D-Bus hiccup all raise instead of quietly writing a plaintext key to disk. It is a separate file from `config.json` on purpose — that file holds your server token, and `config.json` is what people `cat` into bug reports. The token alone can download ciphertext it cannot read; the key alone has nothing to decrypt. Keeping them apart means one careless paste is not total exposure.
-
-Run `uvx vaultbeat-mcp@latest doctor` to see which of the three your machine is actually using (it reports the *layer*, never the key).
-
-> **Headless Linux**: if the keyring errors out even though a desktop session exists, the usual cause is that the process was launched without `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`. Add both to the MCP server's launch environment. On a truly headless box with no keyring at all, do nothing — the `identity.key` fallback handles it. Never set `PYTHON_KEYRING_BACKEND` to the null backend to silence the warning: it accepts writes and stores nothing.
-
-### 3. Connect your agent
-
-**Claude Code** (one line):
+Generate (and persist) a token, then print ready-to-paste client config:
 
 ```bash
-claude mcp add vaultbeat-health -- uvx vaultbeat-mcp@latest serve --transport stdio
+vaultbeat-mcp-local serve --generate-token
 ```
 
-**Claude Desktop** (`claude_desktop_config.json`):
+Serve over HTTP on loopback. Auth is on by default; the token is read from
+`VAULTBEAT_MCP_HTTP_TOKEN` (preferred, keeps it out of shell history) or the stored config:
+
+```bash
+vaultbeat-mcp-local serve --transport http              # 127.0.0.1, bearer required
+vaultbeat-mcp-local serve --transport http --no-token   # loopback only, no auth
+```
+
+Clients send the token as a request header:
+
+```
+Authorization: Bearer <token>
+```
+
+Example `mcp.json` (VS Code / Cursor style):
 
 ```json
 {
-  "mcpServers": {
-    "vaultbeat-health": {
-      "command": "uvx",
-      "args": ["vaultbeat-mcp@latest", "serve", "--transport", "stdio"]
+  "servers": {
+    "vaultbeat-local": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
     }
   }
 }
 ```
 
-Any other MCP client: run `uvx vaultbeat-mcp@latest serve --transport stdio`, or `--transport http` for a loopback streamable-HTTP endpoint with bearer-token auth.
-
-> **Claude Desktop note**: it does not inherit your shell `PATH`. If `uvx` isn't found, use the absolute path (`which uvx`) as `command`.
-
-Debugging: `npx @modelcontextprotocol/inspector uvx vaultbeat-mcp@latest serve --transport stdio`
-
-Then just ask your agent: *“How did we sleep last night?”*
-
-<!-- Keep this count in step with the table below: 19 read + 7 write + 2 bind + doctor = 29.
-     The get_hrv_hourly row is a granularity argument to get_hrv, not a registered tool, so the
-     table always has one more row than the heading counts.
-     This said (16) until 2026-07-31 while the table already listed all 26 — directory listings
-     render the heading, not the table, so the stale number was the public-facing one.
-     0.5.0 took write from 4 to 7 by splitting the `_append` tools out of the `merge=True` flag.
-     Source of truth is the code, not this comment: `grep -cE '^    @tool' mcp_server.py`. -->
-## MCP tools (29)
-
-| Tool | Returns |
-|---|---|
-| `vaultbeat_status` | Local binding state (never exposes keys or tokens) |
-| `vaultbeat_doctor` | Full self-diagnosis: install/binding chain **plus** which data types have data and which need a newer iOS build — call this before concluding data is missing |
-| `vaultbeat_start_binding` | A fresh QR binding payload for the iOS app to scan |
-| `vaultbeat_poll_binding` | One poll for the iOS authorization to complete binding |
-| `vaultbeat_sync_sleep` | Recent sleep sessions incl. heart-rate samples, per-day primary-session selection matching the iOS app |
-| `get_sleep_detail` | Per-night heart-rate + respiratory-rate + sleep-stage timeline |
-| `get_water_intake` | Daily water intake + computed daily average |
-| `get_weight_trend` | Daily weights + latest/avg/min/max + weekly trend rate, plus body composition (`body_fat_percent` 0–100, `bmi`, `lean_body_mass_kg`) when a smart scale wrote it into Apple Health |
-| `get_menstrual_cycle` | Cycle samples + next-period prediction *(sensitive — explicit iOS opt-in required)* |
-| `get_symptoms` | HealthKit symptom days grouped by data owner *(sensitive)* |
-| `get_notes` | Free-text day annotations with their writer *(sensitive)* |
-| `get_activity` | Daily activity rings: steps / energy / exercise minutes / stand hours / distance |
-| `get_resting_hr` | Resting heart-rate records + window mean |
-| `get_workouts` | Workout records: type / duration / calories / distance |
-| `get_mindfulness` | Mindful sessions and minutes per day |
-| `get_hrv` | Heart-rate variability (SDNN) records + window mean |
-| `get_wrist_temp` | Sleeping wrist-temperature baseline deviation |
-| `get_hrv_hourly` *(via `get_hrv(granularity="hourly")`)* | Hour-bucketed HRV averages over 30 days — the context-cheap default; `granularity="raw"` keeps minute-level spike precision |
-| `get_vo2max` | VO₂ max records + latest / peak / trough / window average |
-| `get_basal_energy` | Basal (resting) energy burned, per hour bucket |
-| `get_total_energy_burned` | **TDEE** — basal + active per day, measured rather than estimated, with today flagged partial and excluded from the average |
-| `get_strength_log` | Structured strength training: exercise, sets, reps, weight per day |
-| `get_food_log` | Meals as free text with optional portions and timing |
-| `log_weight_entry` | **Write** a weight entry (optionally mirrored into Apple Health when the user opts in). Carries over that day's existing body composition instead of erasing it — an agent cannot supply fat/BMI/lean mass, so a bare weight log must not wipe what the scale recorded |
-| `log_strength_entry` | **Write** a strength session for a day — **replaces that whole day**. Use `log_strength_append` unless you mean to delete what is already there |
-| `log_strength_append` | **Write** exercises onto a day *without deleting anything*; sets are appended to a matching exercise name. The tool for "log the set I forgot", or for logging a session in installments while the owner is still in the gym |
-| `log_food_entry` | **Write** a day's meals — **replaces that whole day**. Use `log_food_append` unless you mean to delete what is already there |
-| `log_food_append` | **Write** extra meals onto a day *without deleting anything* — the right tool whenever the day may not be empty |
-| `log_note` | **Write** a mood or general note for a day — **replaces that day's note** |
-| `log_note_append` | **Write** one more line onto a day's note *without erasing what is there*. Use this for symptoms: discomfort arrives in installments, so a second write the same day is the normal case |
-
-> ⚠️ **`log_strength_entry` / `log_food_entry` / `log_note` replace the WHOLE DAY.** Passing only
-> what you want to add deletes everything else recorded that day. Since 0.5.0 each one has an
-> `_append` twin — `log_strength_append` / `log_food_append` / `log_note_append` — that only adds
-> and *cannot* delete. **Prefer the `_append` form whenever the day may not be empty**, which an
-> agent generally cannot tell without reading it back first. (The three replace-tools still accept
-> `merge=True` for the same effect; the `_append` tools make the safe option reachable by name
-> instead of by remembering a flag.) Every write returns a `replaced_*` field naming exactly what
-> it deleted — from an `_append` call that field is always `[]` / `null`, which is the receipt
-> that nothing was. `log_weight_entry` has no twin: a day has one weight.
-
-Every data tool accepts `owner` (a user-ID prefix) to filter to one person — the server may hold both your and your partner's shared records, and omitting `owner` mixes them into one pool, so per-person questions should always pass it. (Earlier releases named some tools `get_partner_*` / `tether_*`; they were renamed in the 16-tool and Vaultbeat releases.)
-
-Reads are cache-first: decrypted records are cached locally (owner-only files, 600 s TTL, `VAULTBEAT_MCP_CACHE_TTL` to override — the pre-rename `TETHER_MCP_*` spellings still work) so repeat queries answer in ~0.2 s with zero network; pass `fresh=true` to force a cloud round trip. The same service layer backs a full CLI (`uvx vaultbeat-mcp@latest sleep / water / weight / …` — every data subcommand takes `--owner` too) if you prefer scripts over MCP.
-
-## Privacy & security model
-
-- **End-to-end encryption**: Curve25519 ECDH + HKDF-SHA256 + AES-GCM. Every health record is sealed on-device to each authorized recipient's public key (your partner, and this server once bound).
-- **The cloud only ever holds ciphertext.** Vaultbeat's backend cannot read your health data — architecturally, not just by policy.
-- **Decryption happens here**, on hardware you own. The private key and server token are never exposed through any tool result.
-- **Sensitive kinds** (menstrual cycle, symptoms, notes) reach this server only if explicitly opted in inside the iOS app, and are never re-exported by the server.
-- HTTP transport binds to loopback by default and requires a bearer token; binding a non-loopback address fails closed unless explicitly allowed — front it with TLS if you must expose it.
-
-You can audit all of the above in this repository — that is why it is open source.
-
-## Development
+**Binding beyond loopback** (e.g. `--host 0.0.0.0` for LAN/VPS) fails closed: it
+requires both a token *and* the explicit `--allow-remote` flag. The token crosses the
+wire in clear text, so you must terminate TLS in front of it (e.g. Caddy / Cloudflare /
+nginx):
 
 ```bash
-pip install -e '.[dev,qr]'
-pytest
+VAULTBEAT_MCP_HTTP_TOKEN=<token> vaultbeat-mcp-local serve \
+  --transport http --host 0.0.0.0 --allow-remote
 ```
 
-## License
+Claude Desktop's config only speaks stdio, so bridge it to the HTTP server with
+[`mcp-remote`](https://github.com/geelen/mcp-remote):
 
-[MIT](LICENSE). The Vaultbeat iOS app and cloud service are separate proprietary components; this repository covers the local MCP server only.
+```json
+{
+  "mcpServers": {
+    "vaultbeat-local": {
+      "command": "npx",
+      "args": [
+        "-y", "mcp-remote", "http://127.0.0.1:8000/mcp",
+        "--header", "Authorization: Bearer <token>"
+      ]
+    }
+  }
+}
+```
 
----
+Reveal the stored token any time with `vaultbeat-mcp-local serve --show-token`.
 
-*Website: [vaultbeat.app](https://vaultbeat.app) · App Store: [Vaultbeat — AI Health Sync](https://apps.apple.com/app/id6759241985) · Bugs & feedback: [vaultbeat-community](https://github.com/Fino-wind/vaultbeat-community/issues)*
+## Verification
+
+```bash
+python -m pytest -q mcp-local-server/tests
+python -m ruff check mcp-local-server/src mcp-local-server/tests
+python -m mypy mcp-local-server/src
+```
 
 <!-- mcp-name: io.github.Fino-wind/vaultbeat-apple-health -->

@@ -1381,17 +1381,24 @@ _BARE_DAY_LENGTH = 10
 
 _COVERAGE_NOTE = (
     "How much data this answer rests on. `days_covered` is the number of DISTINCT "
-    "local calendar days present in the rows this result reports — NOT the length of "
-    "any list, which `limit` has already cut. Quote it beside any average, trend or "
-    "comparison drawn from this result: an average over 3 days and one over 30 are "
-    "the same shape and the same number of digits, and only this field tells them "
-    "apart. `rows_counted` is how many rows those days came from — when it exceeds "
-    "`days_covered` the rows are intra-day samples, not days. `span_days` is the "
-    "inclusive first_day..last_day distance, so days_covered=12 with span_days=200 "
-    "is a sparse history and not a fortnight. `days_missing_in_span` counts days "
-    "inside that span with no row here; a missing day means EITHER nothing was "
-    "recorded, OR `requested_unit` is not \"days\" and the limit cut those rows off — "
-    "it NEVER means nothing happened. `window_satisfied` is false when fewer rows "
+    "local calendar days this result's numbers are computed over — NOT the length "
+    "of any list, which `limit` has already cut. Quote it beside any average, trend "
+    "or comparison drawn from this result: an average over 3 days and one over 30 "
+    "are the same shape and the same number of digits, and only this field tells "
+    "them apart. `days_in_payload` is how many of those days you can actually find "
+    "a row for in this response; it normally equals `days_covered`, and when it is "
+    "SMALLER the remainder was cut by a display cap — those days are already inside "
+    "the aggregates and inside `first_day`..`last_day`, so the oldest day named may "
+    "have no row printed below. Do not report them as gaps and do not re-read hoping "
+    "they appear. `rows_counted` is how many rows those days came from — when it "
+    "exceeds `days_covered` the rows are intra-day samples, not days. `span_days` is "
+    "the inclusive first_day..last_day distance, so days_covered=12 with "
+    "span_days=200 is a sparse history and not a fortnight. `days_missing_in_span` "
+    "counts days inside that span this result has NO data for — it is measured "
+    "against `days_covered`, never against what is printed; a missing day means "
+    "EITHER nothing was recorded, OR `requested_unit` is not \"days\" and the limit "
+    "cut those rows off — it NEVER means nothing happened. "
+    "`window_satisfied` is false when fewer rows "
     "than requested came back, which usually means that is all the history this "
     "server holds (a freshly paired server is still sealing its copy, so re-check "
     "after a re-sync rather than concluding the data does not exist); it is null "
@@ -1441,6 +1448,7 @@ def _attach_coverage(
     requested: int | None,
     unit: str,
     cut_count: int | None = None,
+    displayed: Any = None,
 ) -> dict[str, Any]:
     """Attach a `coverage` block stating how many days this result rests on.
 
@@ -1464,6 +1472,17 @@ def _attach_coverage(
     while its average is not (the sibling bug in Invariant 62). Pass the
     uncapped list there.
 
+    *displayed* is the list the summary actually PRINTS, and is only needed when
+    that is a display-capped subset of *rows*; it defaults to *rows*, which is
+    the truth for all but one reader. It exists because with only one of the two
+    sets the block could not tell them apart, and every field silently described
+    the wider one: `basal_energy_records` reported `first_day` a day older than
+    anything in `daily` and `days_missing_in_span: 0` beside it, so an agent was
+    told a day was present, could not find it anywhere in the response, and was
+    told by the note not to go looking. `days_in_payload` is the separation —
+    coverage still MEASURES past the cap (Invariant 64), it now also says how
+    far the printing stops short.
+
     *cut_count* overrides what `window_satisfied` compares against. It defaults
     to the row count, which is the honest denominator almost everywhere: when a
     summary dedups after the cut (water/weight/menstrual by dayID, symptom by
@@ -1483,6 +1502,14 @@ def _attach_coverage(
     # from the second — a coverage block that contradicts itself.
     row_list = list(rows)
     days = sorted({d for d in (_coverage_day_of(row) for row in row_list) if d})
+    # Counted off the list that really ships rather than re-deriving it from a
+    # cap: a cap read a second time is a second chance to read it wrong, which
+    # is the whole shape of the bug this field exists to close.
+    days_in_payload = (
+        len(days)
+        if displayed is None
+        else len({d for d in (_coverage_day_of(row) for row in displayed) if d})
+    )
     first_day = days[0] if days else None
     last_day = days[-1] if days else None
 
@@ -1499,6 +1526,7 @@ def _attach_coverage(
     counted = cut_count if cut_count is not None else len(row_list)
     summary["coverage"] = {
         "days_covered": len(days),
+        "days_in_payload": days_in_payload,
         "first_day": first_day,
         "last_day": last_day,
         "span_days": span_days,
@@ -3714,9 +3742,19 @@ class VaultbeatLocalService:
         # averages actually rest on. Reading the capped list here would repeat the
         # sibling bug in Invariant 62, where consuming a display cap as if it were
         # the data reported 60 present days as missing.
+        # ⚠️ This is the ONLY reader where the two sets differ, which is exactly why
+        # it needs `displayed`: measuring past the cap is right, but saying nothing
+        # about the cap left `first_day` naming a day that is nowhere in `daily` and
+        # `days_missing_in_span: 0` telling the reader not to look for it. Pass the
+        # list off `summary`, not `daily[:day_limit]` — the shipped list is the fact.
         # `requested`/`cut_count` describe `limit`, which caps SAMPLES, not days.
         _attach_coverage(
-            summary, rows=daily, requested=limit, unit="samples", cut_count=len(parsed)
+            summary,
+            rows=daily,
+            displayed=summary["daily"],
+            requested=limit,
+            unit="samples",
+            cut_count=len(parsed),
         )
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)

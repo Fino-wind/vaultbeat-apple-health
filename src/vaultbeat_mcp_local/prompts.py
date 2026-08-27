@@ -38,6 +38,15 @@ HOUSE RULES FOR ADDING ONE
   for when the caller omits it — never a dangling `{{...}}` left in the text for
   the model to read as literal content. Write the fallback and the surrounding
   sentence together; they have to make one grammatical sentence.
+· Write the SUPPLIED value together with them too — the half this rule left out
+  until 2026-08-27, and the half every real caller takes. `why_is_this_empty`
+  read "…out of date. Work out which cause" with its aside omitted and "…out of
+  date. get_sleep_detail returned zero nights.Work out which cause" with it
+  given: the proof-read path was the rare one. An ASIDE (an argument whose
+  fallback is empty — see `PromptArg.is_aside`) is written into the template as
+  `sentence. {{aside}}Next sentence`: the space belongs BEFORE the slot, because
+  the template has to read correctly with the slot empty, and `render_prompt`
+  adds the one after it only when there is something to separate.
 """
 
 from __future__ import annotations
@@ -130,6 +139,21 @@ class PromptArg:
     description: str
     fallback: str
     """Substituted verbatim when the caller omits the argument. May be empty."""
+
+    @property
+    def is_aside(self) -> bool:
+        """True for the second kind named above: an aside, not a default value.
+
+        Derived from the fallback rather than declared beside it, because they
+        are one fact stated twice — a fallback of `""` IS "when this is missing,
+        nothing stands here" — and a second field could come to disagree with
+        the first. What follows from it is a rendering rule rather than a
+        cosmetic one: the text around an aside is authored for its ABSENCE, so
+        it has no separator to spare on the far side of the slot and a supplied
+        value has to bring its own (see `render_prompt`).
+        """
+
+        return not self.fallback
 
 
 @dataclass(frozen=True)
@@ -351,6 +375,11 @@ def render_prompt(prompt: VaultbeatPrompt, arguments: dict[str, Any] | None = No
     binding for it, and both look like the prompt worked. Every argument here is
     optional by design (the MCP `prompts/get` spec lets a client omit them), so
     this path is the normal one, not the error one.
+
+    A SUPPLIED value gets the same care: an aside carries its own trailing
+    separator, because the sentence it lands in was written to read correctly
+    without it. Both paths are pinned by tests — they cannot both be right by
+    accident, and for eight days only one of them was.
     """
 
     text = prompt.template
@@ -358,7 +387,19 @@ def render_prompt(prompt: VaultbeatPrompt, arguments: dict[str, Any] | None = No
     for argument in prompt.arguments:
         value = supplied.get(argument.name)
         # A blank string is a client sending nothing, not a value of nothing.
-        rendered = str(value).strip() if value is not None and str(value).strip() else argument.fallback
+        given = str(value).strip() if value is not None and str(value).strip() else ""
+        if not given:
+            rendered = argument.fallback
+        elif argument.is_aside:
+            # 🔴 An aside's surroundings are written for the omitted case
+            # (`…out of date. {{context}}Work out…`), so the slot has a space in
+            # front of it and nothing behind: a value dropped in plain fuses the
+            # two sentences at `…zero nights.Work out`. The value is stripped one
+            # line up, deliberately, so a client cannot fix this from its side —
+            # which leaves it to the one place that knows the slot is an aside.
+            rendered = given + " "
+        else:
+            rendered = given
         text = text.replace("{{" + argument.name + "}}", rendered)
     return (DEMO_PREFIX + text) if demo else text
 
