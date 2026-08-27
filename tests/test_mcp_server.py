@@ -709,22 +709,35 @@ def test_demo_mode_renames_the_server(monkeypatch: Any, tmp_path: Path) -> None:
     assert "DEMO" in meta["__server__"]["name"]
 
 
-def test_without_demo_the_tools_are_not_wrapped_at_all(
+def test_without_demo_the_tools_carry_no_demo_marks(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
-    """Production must be byte-identical to before this feature existed.
+    """Production must be free of every DEMO mark — absent, not inert.
 
-    Not a performance point: an unconditional wrapper is a second place every
-    result passes through, on the path that handles real health data. Off means
-    absent, not inert.
+    Until vb-016 this asserted the tools were not wrapped at all. That stopped
+    being true when the trial-expiry `access_note` (a deliberate production
+    feature) moved onto the same registration choke point, so the assertion
+    narrowed to what still must hold: no demo description prefix, no demo
+    fields in a real result, and the published signature stays the real
+    function's — the access wrapper uses `functools.wraps`, which is what
+    FastMCP's schema builder follows, so `__wrapped__` existing is now correct
+    rather than a leak.
     """
+    import inspect
+
     monkeypatch.delenv("VAULTBEAT_DEMO", raising=False)
     tools = _capture_tools(monkeypatch)
     run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
 
     for name, function in tools.items():
-        assert not hasattr(function, "__wrapped__"), name
         assert not (function.__doc__ or "").startswith("⚠️ DEMO MODE"), name
+
+    result = tools["vaultbeat_status"]()
+    assert "demo_mode" not in result
+    assert "demo_warning" not in result
+
+    params = inspect.signature(tools["get_hrv"]).parameters
+    assert sorted(params) == ["fresh", "granularity", "limit", "owner"]
 
 
 def test_destructive_titles_name_their_consequence(monkeypatch: Any, tmp_path: Path) -> None:

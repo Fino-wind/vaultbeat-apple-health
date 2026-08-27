@@ -26,7 +26,13 @@ from vaultbeat_mcp_local.crypto import (
     decrypt_blob_payload,
     encrypt_blob_payload,
 )
-from vaultbeat_mcp_local.store import ConfigError, ConfigStore, LocalServerConfig, now_iso
+from vaultbeat_mcp_local.store import (
+    PAIRING_GUIDANCE,
+    ConfigError,
+    ConfigStore,
+    LocalServerConfig,
+    now_iso,
+)
 
 
 _LOG = logging.getLogger("vaultbeat_mcp_local.service")
@@ -2064,12 +2070,136 @@ class VaultbeatLocalService:
         # while ALSO disarming itself in production, where `run_mcp_server`
         # passes the flag explicitly.
         self._demo_env_at_start = demo_enabled()
+        # Trial-deadline snapshot from the config of the LAST successful
+        # require_bound() in this process — a zero-I/O stash so the per-tool
+        # `access_note` annotation (vb-016) never adds a config/Keychain read
+        # of its own on top of the one every read already performs. None until
+        # a bound call has run; never set in demo mode (demo returns before
+        # require_bound).
+        self._last_bound_trial_ends_at: str | None = None
 
     @property
     def cache(self) -> LocalRecordCache:
         if self._cache is None:
             self._cache = LocalRecordCache(self.store.path.parent / "cache")
         return self._cache
+
+    def _require_bound_config(self) -> LocalServerConfig:
+        """`store.require_bound()` plus the trial-snapshot stash.
+
+        Every read and write path goes through here rather than calling the
+        store directly, so `access_note_if_expiring` can answer from memory —
+        the funnel discipline (Invariant 58's shape): a stash set at four of
+        five call sites is a note that silently never fires on the fifth.
+        """
+        config = self.store.require_bound()
+        self._last_bound_trial_ends_at = config.trial_ends_at
+        return config
+
+    # ── Trial-access snapshot (vb-016) ───────────────────────────────────────
+    #
+    # Everything here reads the trial deadline RECORDED AT PAIRING — a snapshot,
+    # never a live entitlement. The one rule: these sentences may only describe
+    # what was observed at bind time and must say so, because a Pro purchase
+    # made in the iOS app afterwards is invisible to this machine (the cloud
+    # enforces the real rule on every request; iOS asks `mcp_access_verdict`
+    # for its own display). Saying less beats guessing.
+
+    @staticmethod
+    def _trial_deadline(trial_ends_at: str) -> datetime | None:
+        try:
+            parsed = _parse_iso8601(trial_ends_at)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    @classmethod
+    def access_snapshot(
+        cls, config: LocalServerConfig, *, now: datetime | None = None
+    ) -> dict[str, Any] | None:
+        """The `access` block for status/doctor, or None when there is nothing
+        honest to say.
+
+        None on an unbound config, and None when no deadline was recorded at
+        pairing — mirroring the iOS Settings row, which shows nothing for a
+        grandfathered/lifetime account rather than a reassuring sentence nobody
+        needed. Absence of a deadline is NOT knowledge of unlimited access
+        (it also covers an edge too old to report one), so no block is the
+        only claim-free rendering of it.
+        """
+        if not config.is_bound or not config.trial_ends_at:
+            return None
+        moment = now or datetime.now(timezone.utc)
+        deadline = cls._trial_deadline(config.trial_ends_at)
+        block: dict[str, Any] = {
+            "phase_at_pairing": "trial",
+            "trial_ends_at": config.trial_ends_at,
+            "recorded_at_pairing": config.bound_at,
+        }
+        if deadline is None:
+            # Unparseable date — carry the raw string and the caveat, never crash
+            # a status call over it and never invent a day count.
+            block["note"] = (
+                "A trial deadline was recorded when this server paired but its "
+                f"date could not be parsed ({config.trial_ends_at!r}). The cloud "
+                "enforces the real entitlement on every request; a purchase made "
+                "in the iOS app since pairing is not reflected in this snapshot."
+            )
+            return block
+        if deadline >= moment:
+            days_left = max(0, (deadline.date() - moment.date()).days)
+            block["days_left"] = days_left
+            when = "today" if days_left == 0 else f"in {days_left} day(s)"
+            block["note"] = (
+                "A 3-day full-access trial was running when this server paired; "
+                f"it ends {deadline.date().isoformat()} ({when}). This is a "
+                "snapshot from pairing time — a Pro purchase made in the iOS app "
+                "since then is not visible here, and the cloud enforces the real "
+                "entitlement on every request. If it is about to expire, tell the "
+                "user now rather than letting the first notice be a refusal; "
+                "expiry deletes nothing, and Pro in the app (Settings → "
+                "Membership) restores access with no re-pairing."
+            )
+            return block
+        block["note"] = (
+            "The trial deadline recorded when this server paired "
+            f"({deadline.date().isoformat()}) has passed. That snapshot does not "
+            "update: if reads are working, this account has active access (for "
+            "example Pro was purchased, which this machine cannot see); if they "
+            "fail with a trial-expired message, that message carries the current "
+            "state and the fix. Nothing is deleted either way."
+        )
+        return block
+
+    def access_note_if_expiring(self, *, now: datetime | None = None) -> str | None:
+        """One sentence for read/write tool results when the pairing-time trial
+        deadline falls within the NEXT 24 hours — else None.
+
+        Reads only the in-process stash (no config/Keychain I/O), so it costs
+        nothing on the paths that run it after every tool call. Deliberately
+        silent once the deadline has passed: the server's own refusal is the
+        authoritative message then, and a stale "your trial ended" beside a
+        working read would be wrong for a user who purchased Pro after pairing.
+        """
+        if self._demo or not self._last_bound_trial_ends_at:
+            return None
+        deadline = self._trial_deadline(self._last_bound_trial_ends_at)
+        if deadline is None:
+            return None
+        moment = now or datetime.now(timezone.utc)
+        if not (moment <= deadline <= moment + timedelta(hours=24)):
+            return None
+        return (
+            "Heads-up worth passing to the user: the 3-day full-access trial "
+            "recorded when this Vaultbeat server paired ends within the next "
+            f"day ({self._last_bound_trial_ends_at}). After that, reads return "
+            "a trial-expired refusal until Pro is active in the Vaultbeat iOS "
+            "app (Settings → Membership) — nothing gets deleted. This is a "
+            "pairing-time snapshot: if Pro was already purchased since, ignore "
+            "this note."
+        )
 
     def start_binding(
         self,
@@ -2131,6 +2261,14 @@ class VaultbeatLocalService:
                 owner_user_id=result.owner_user_id,
                 owner_public_key_base64=result.owner_public_key_base64,
                 owner_device_id=result.owner_device_id,
+                # Bind-time SNAPSHOT of the trial deadline, overwritten on every
+                # successful pairing — including with None, which means "the
+                # cloud reported no deadline at THIS pairing" (grandfathered,
+                # currently paid, or an older edge). Stored so status/doctor can
+                # warn about an approaching expiry instead of the first notice
+                # being a mid-conversation 403 (vb-016). Never a gate: the
+                # server enforces the real entitlement on every request.
+                trial_ends_at=result.trial_ends_at,
                 poll_id=None,
                 bound_at=now_iso(),
                 # A different identity's sync history says nothing about this
@@ -2293,13 +2431,15 @@ class VaultbeatLocalService:
         if self._demo:
             return demo_sync_result(metric_type=metric_type, limit=limit)
 
-        config = self.store.require_bound()
+        config = self._require_bound_config()
         server_token = config.server_token
         server_id = config.server_id or ""
         if not server_token:
+            # Unreachable in practice (is_bound requires server_token), kept as
+            # defence in depth — with the same two-sided guidance as the real
+            # refusal above it, so no path ever prints the old tool-only text.
             raise RuntimeError(
-                "Local MCP server is not bound; call `vaultbeat_start_binding` then "
-                "`vaultbeat_poll_binding` (CLI equivalent: `vaultbeat-mcp bind`)"
+                f"This Vaultbeat MCP server has no usable pairing. {PAIRING_GUIDANCE}"
             )
 
         if not fresh:
@@ -3699,7 +3839,7 @@ class VaultbeatLocalService:
         if self._demo:
             return _demo_write_refusal("log_strength_entry")
 
-        config = self.store.require_bound()
+        config = self._require_bound_config()
         server_token = config.server_token
         if not (
             server_token
@@ -3891,7 +4031,7 @@ class VaultbeatLocalService:
         if self._demo:
             return _demo_write_refusal("log_food_entry")
 
-        config = self.store.require_bound()
+        config = self._require_bound_config()
         server_token = config.server_token
         if not (
             server_token
@@ -4049,7 +4189,7 @@ class VaultbeatLocalService:
         if self._demo:
             return _demo_write_refusal("log_weight_entry")
 
-        config = self.store.require_bound()
+        config = self._require_bound_config()
         server_token = config.server_token
         if not (
             server_token
@@ -4242,7 +4382,7 @@ class VaultbeatLocalService:
         if self._demo:
             return _demo_write_refusal("log_note")
 
-        config = self.store.require_bound()
+        config = self._require_bound_config()
         server_token = config.server_token
         if not (
             server_token
@@ -4638,6 +4778,16 @@ class VaultbeatLocalService:
             if config.owner_user_id and config.owner_public_key_base64
             else "owner identity missing (legacy binding — reads unaffected)",
         )
+        # Informational, always ok=True: the pairing-time trial snapshot
+        # (vb-016). It never fails the doctor — the LIVE answer is the
+        # data_roundtrip below, which surfaces a real trial_expired refusal
+        # with its own hint; this row exists so an approaching deadline is
+        # visible BEFORE the first refusal, and the wording keeps naming
+        # itself a snapshot because a purchase made since pairing is
+        # invisible to this machine. Absent when no deadline was recorded.
+        access = self.access_snapshot(config)
+        if access:
+            add("access", True, access["note"])
 
         if config.is_bound and reachable:
             try:
@@ -4985,6 +5135,8 @@ class VaultbeatLocalService:
                 ),
             }
 
+        access = self.access_snapshot(config)
+
         return {
             **demo_block,
             "initialized": True,
@@ -5013,6 +5165,10 @@ class VaultbeatLocalService:
             "public_key_base64": config.public_key_base64,
             "bound_at": config.bound_at,
             "last_sync_at": config.last_sync_at,
+            # Pairing-time trial snapshot (vb-016). ADD-ONLY and absent when no
+            # deadline was recorded — absence is the claim-free rendering of
+            # "grandfathered / paid / unknown", same as the iOS Settings row.
+            **({"access": access} if access else {}),
             "owner_identity_bound": bool(config.owner_user_id and config.owner_public_key_base64),
             "owner_device_bound": bool(config.owner_device_id),
             "config_path": str(self.store.path),

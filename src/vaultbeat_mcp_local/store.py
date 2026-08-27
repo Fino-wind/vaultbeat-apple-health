@@ -16,6 +16,34 @@ from vaultbeat_mcp_local.crypto import generate_x25519_keypair, public_key_from_
 
 DEFAULT_API_BASE_URL = "https://wjpnyxglgtmtgjuuhwru.supabase.co/functions/v1"
 CONFIG_ENV = "VAULTBEAT_MCP_CONFIG"
+
+# Slug-free id-only form — survives any future App Store rename (the slugged
+# URL rotted once already when tether became vaultbeat).
+APP_STORE_URL = "https://apps.apple.com/app/id6759241985"
+
+# The tail of every "not paired" refusal, written for the SERVER-FIRST user:
+# someone who found this package on the MCP Registry or PyPI, ran
+# `claude mcp add`, and asked their agent a question — without ever hearing
+# that an iPhone app exists. The old message ("call `vaultbeat_start_binding`
+# then `vaultbeat_poll_binding`") sent that person's agent off to print a QR
+# code they had nothing to scan with; the two-sided structure only surfaced
+# in the timeout text five minutes later. So the FIRST sentence states the
+# structure, the app link comes before any tool name, and the demo mode this
+# package already ships is offered at the exact moment it is most useful.
+# Every word here is client-side (Anti-pattern 23) — nothing is echoed from
+# any server.
+PAIRING_GUIDANCE = (
+    "Pairing needs the free Vaultbeat iOS app on an iPhone — the app is where "
+    "the health data comes from, and scanning a QR code with it is the only "
+    f"way to authorize this server. Install it from {APP_STORE_URL}, then run "
+    "`uvx vaultbeat-mcp@latest bind` in a real terminal and scan the QR it "
+    "prints (in the app: Settings → Data & AI → Connect an AI server). The "
+    "`vaultbeat_start_binding` / `vaultbeat_poll_binding` tools do the same, "
+    "but a QR relayed through an agent's output often does not render — the "
+    "terminal command is the reliable path. No iPhone or no app yet? Restart "
+    "this MCP server with VAULTBEAT_DEMO=1 in its environment (CLI flag: "
+    "--demo) to explore every read tool on synthetic data."
+)
 # Pre-rename env var, honored as a fallback so existing setups keep working.
 _LEGACY_CONFIG_ENV = "TETHER_MCP_CONFIG"
 
@@ -48,6 +76,14 @@ class LocalServerConfig:
     owner_user_id: str | None = None
     owner_public_key_base64: str | None = None
     owner_device_id: str | None = None
+    # ISO8601 trial deadline the cloud reported at the MOST RECENT successful
+    # pairing — a bind-time SNAPSHOT, not a live entitlement. None means "no
+    # deadline was reported then" (grandfathered / already paid / an edge older
+    # than 2026-08-17), and a stored value never updates when the user later
+    # subscribes or buys lifetime in the iOS app: the server enforces the real
+    # rule on every request, this field only lets status/doctor say what was
+    # known at pairing instead of nothing at all (vb-016).
+    trial_ends_at: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
     bound_at: str | None = None
@@ -421,6 +457,7 @@ class ConfigStore:
             owner_user_id=raw.get("owner_user_id"),
             owner_public_key_base64=raw.get("owner_public_key_base64"),
             owner_device_id=raw.get("owner_device_id"),
+            trial_ends_at=raw.get("trial_ends_at"),
             created_at=raw.get("created_at"),
             updated_at=raw.get("updated_at"),
             bound_at=raw.get("bound_at"),
@@ -524,12 +561,16 @@ class ConfigStore:
         return token
 
     def require_bound(self) -> LocalServerConfig:
+        # This raise is the FIRST error a server-first user (MCP Registry /
+        # PyPI → `claude mcp add` → first question) ever sees, so both branches
+        # carry the full two-sided-structure guidance — see PAIRING_GUIDANCE.
         current = self.load()
         if not current:
-            raise ConfigError("Local MCP server is not initialized")
+            raise ConfigError(
+                f"This Vaultbeat MCP server is not paired with anyone's data yet. {PAIRING_GUIDANCE}"
+            )
         if not current.is_bound:
             raise ConfigError(
-                "Local MCP server is not bound; call `vaultbeat_start_binding` then "
-                "`vaultbeat_poll_binding` (CLI equivalent: `vaultbeat-mcp bind`)"
+                f"This Vaultbeat MCP server has keys but no iPhone has authorized it yet. {PAIRING_GUIDANCE}"
             )
         return current

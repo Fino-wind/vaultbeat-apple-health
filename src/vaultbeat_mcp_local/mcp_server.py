@@ -201,6 +201,59 @@ def _prefix_doc(wrapper: Any, original: Any) -> None:
     wrapper.__doc__ = f"{_DEMO_DOC_PREFIX}\n\n{doc}" if doc else _DEMO_DOC_PREFIX
 
 
+# ── Trial-expiry note (vb-016) ───────────────────────────────────────────────
+
+
+def _annotate_access(result: Any, service: VaultbeatLocalService) -> Any:
+    """Attach a one-line trial-expiry heads-up to a tool result, add-only.
+
+    Same discipline as `_annotate_if_empty` / `_watermark_demo`: never reads,
+    edits or drops an existing key, and does nothing at all outside the last
+    24 hours of a pairing-time trial deadline. The sentence is generated
+    entirely client-side (Anti-pattern 23) from a timestamp this machine
+    already holds — the point is that the agent can say "your trial ends
+    tomorrow" BEFORE the first notice the user gets is a mid-conversation
+    refusal.
+
+    Results that already carry an `access` block (`vaultbeat_status`,
+    `vaultbeat_doctor`) are left alone — they say the same thing with more
+    context. `access_note_if_expiring` reads an in-process stash set by the
+    bound call the tool just made, so this costs no config or Keychain I/O.
+    """
+
+    if not isinstance(result, dict) or "access" in result or "access_note" in result:
+        return result
+    note = service.access_note_if_expiring()
+    if note is None:
+        return result
+    return {**result, "access_note": note}
+
+
+def _access_wrap(function: _F, service: VaultbeatLocalService) -> _F:
+    """Wrap one tool so its dict results pick up the trial-expiry note.
+
+    Mirrors `_demo_wrap`'s two shapes (this server has both sync and async
+    tools) including `functools.wraps`, which FastMCP's schema builder relies
+    on. Applied to every tool at the registration choke point rather than per
+    call site — an annotation added at 29 call sites is 29 chances to forget
+    the one that matters.
+    """
+
+    if inspect.iscoroutinefunction(function):
+
+        @functools.wraps(function)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            return _annotate_access(await function(*args, **kwargs), service)
+
+        return cast(_F, async_wrapper)
+
+    @functools.wraps(function)
+    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+        return _annotate_access(function(*args, **kwargs), service)
+
+    return cast(_F, sync_wrapper)
+
+
 def _annotate_if_empty(result: dict[str, Any], kind: str, rows_key: str) -> dict[str, Any]:
     """Explain an empty result for a kind that older apps never wrote.
 
@@ -426,7 +479,13 @@ def run_mcp_server(
         """
 
         def decorator(function: _F) -> _F:
-            prepared = _demo_wrap(function) if demo_active else function
+            # Access note innermost (it inspects the plain result), demo
+            # watermark outermost. In demo mode the note is inert anyway —
+            # the stash it reads is only ever set by a bound call, which demo
+            # mode returns before reaching.
+            prepared = _access_wrap(function, service)
+            if demo_active:
+                prepared = _demo_wrap(prepared)
             return cast(_F, mcp.tool(title=title, annotations=annotations)(prepared))
 
         return decorator
