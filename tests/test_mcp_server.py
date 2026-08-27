@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
-import types
 from pathlib import Path
 from typing import Any
 
@@ -177,9 +175,20 @@ def test_run_mcp_server_stdio_uses_mcp_run(monkeypatch: Any, tmp_path: Path) -> 
         def run(self, **kwargs: Any) -> None:
             captured["run_kwargs"] = kwargs
 
-    fake_module = types.ModuleType("mcp.server.fastmcp")
-    fake_module.FastMCP = FakeFastMCP
-    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_module)
+        def add_prompt(self, prompt: Any) -> None:
+            # Prompts are registered on the same object as tools. A fake that
+            # cannot hold one is no longer a fake of FastMCP — it fails with an
+            # AttributeError from inside `register_prompts`, which reads as a
+            # bug in the code under test. What prompts CONTAIN is asserted
+            # against the real server in `test_prompts.py`; here they only have
+            # to be accepted.
+            pass
+
+    # Patch the ATTRIBUTE, not the whole module: `run_mcp_server` reads
+    # `FastMCP` at call time, and replacing `mcp.server.fastmcp` wholesale left
+    # it a non-package, so any sibling the code imports (`prompts.base`) became
+    # unimportable while the stub was in place.
+    monkeypatch.setattr("mcp.server.fastmcp.FastMCP", FakeFastMCP)
 
     run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
 
@@ -206,9 +215,20 @@ def test_run_mcp_server_registers_water_and_menstrual_tools(
         def run(self, **kwargs: Any) -> None:
             pass
 
-    fake_module = types.ModuleType("mcp.server.fastmcp")
-    fake_module.FastMCP = FakeFastMCP
-    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_module)
+        def add_prompt(self, prompt: Any) -> None:
+            # Prompts are registered on the same object as tools. A fake that
+            # cannot hold one is no longer a fake of FastMCP — it fails with an
+            # AttributeError from inside `register_prompts`, which reads as a
+            # bug in the code under test. What prompts CONTAIN is asserted
+            # against the real server in `test_prompts.py`; here they only have
+            # to be accepted.
+            pass
+
+    # Patch the ATTRIBUTE, not the whole module: `run_mcp_server` reads
+    # `FastMCP` at call time, and replacing `mcp.server.fastmcp` wholesale left
+    # it a non-package, so any sibling the code imports (`prompts.base`) became
+    # unimportable while the stub was in place.
+    monkeypatch.setattr("mcp.server.fastmcp.FastMCP", FakeFastMCP)
 
     run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
 
@@ -244,9 +264,20 @@ def test_get_hrv_falls_back_to_raw_when_hourly_is_empty(
         def run(self, **kwargs: Any) -> None:
             pass
 
-    fake_module = types.ModuleType("mcp.server.fastmcp")
-    fake_module.FastMCP = FakeFastMCP
-    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_module)
+        def add_prompt(self, prompt: Any) -> None:
+            # Prompts are registered on the same object as tools. A fake that
+            # cannot hold one is no longer a fake of FastMCP — it fails with an
+            # AttributeError from inside `register_prompts`, which reads as a
+            # bug in the code under test. What prompts CONTAIN is asserted
+            # against the real server in `test_prompts.py`; here they only have
+            # to be accepted.
+            pass
+
+    # Patch the ATTRIBUTE, not the whole module: `run_mcp_server` reads
+    # `FastMCP` at call time, and replacing `mcp.server.fastmcp` wholesale left
+    # it a non-package, so any sibling the code imports (`prompts.base`) became
+    # unimportable while the stub was in place.
+    monkeypatch.setattr("mcp.server.fastmcp.FastMCP", FakeFastMCP)
 
     hourly_empty = {"records": [], "count": 0, "average_sdnn_ms": None}
     raw_present = {
@@ -303,9 +334,20 @@ def test_get_hrv_prefers_hourly_when_available(monkeypatch: Any, tmp_path: Path)
         def run(self, **kwargs: Any) -> None:
             pass
 
-    fake_module = types.ModuleType("mcp.server.fastmcp")
-    fake_module.FastMCP = FakeFastMCP
-    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_module)
+        def add_prompt(self, prompt: Any) -> None:
+            # Prompts are registered on the same object as tools. A fake that
+            # cannot hold one is no longer a fake of FastMCP — it fails with an
+            # AttributeError from inside `register_prompts`, which reads as a
+            # bug in the code under test. What prompts CONTAIN is asserted
+            # against the real server in `test_prompts.py`; here they only have
+            # to be accepted.
+            pass
+
+    # Patch the ATTRIBUTE, not the whole module: `run_mcp_server` reads
+    # `FastMCP` at call time, and replacing `mcp.server.fastmcp` wholesale left
+    # it a non-package, so any sibling the code imports (`prompts.base`) became
+    # unimportable while the stub was in place.
+    monkeypatch.setattr("mcp.server.fastmcp.FastMCP", FakeFastMCP)
 
     async def fake_hourly(**_: Any) -> dict[str, Any]:
         return {"records": [{"avg_sdnn_ms": 40.0}], "count": 1, "average_sdnn_ms": 40.0}
@@ -347,9 +389,20 @@ def _capture_tools(monkeypatch: Any) -> dict[str, Any]:
         def run(self, **kwargs: Any) -> None:
             pass
 
-    fake_module = types.ModuleType("mcp.server.fastmcp")
-    fake_module.FastMCP = FakeFastMCP
-    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_module)
+        def add_prompt(self, prompt: Any) -> None:
+            # Prompts are registered on the same object as tools. A fake that
+            # cannot hold one is no longer a fake of FastMCP — it fails with an
+            # AttributeError from inside `register_prompts`, which reads as a
+            # bug in the code under test. What prompts CONTAIN is asserted
+            # against the real server in `test_prompts.py`; here they only have
+            # to be accepted.
+            pass
+
+    # Patch the ATTRIBUTE, not the whole module: `run_mcp_server` reads
+    # `FastMCP` at call time, and replacing `mcp.server.fastmcp` wholesale left
+    # it a non-package, so any sibling the code imports (`prompts.base`) became
+    # unimportable while the stub was in place.
+    monkeypatch.setattr("mcp.server.fastmcp.FastMCP", FakeFastMCP)
     return tools
 
 
@@ -454,9 +507,20 @@ def _capture_tool_meta(monkeypatch: Any) -> dict[str, dict[str, Any]]:
         def run(self, **kwargs: Any) -> None:
             pass
 
-    fake_module = types.ModuleType("mcp.server.fastmcp")
-    fake_module.FastMCP = FakeFastMCP
-    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_module)
+        def add_prompt(self, prompt: Any) -> None:
+            # Prompts are registered on the same object as tools. A fake that
+            # cannot hold one is no longer a fake of FastMCP — it fails with an
+            # AttributeError from inside `register_prompts`, which reads as a
+            # bug in the code under test. What prompts CONTAIN is asserted
+            # against the real server in `test_prompts.py`; here they only have
+            # to be accepted.
+            pass
+
+    # Patch the ATTRIBUTE, not the whole module: `run_mcp_server` reads
+    # `FastMCP` at call time, and replacing `mcp.server.fastmcp` wholesale left
+    # it a non-package, so any sibling the code imports (`prompts.base`) became
+    # unimportable while the stub was in place.
+    monkeypatch.setattr("mcp.server.fastmcp.FastMCP", FakeFastMCP)
     return meta
 
 

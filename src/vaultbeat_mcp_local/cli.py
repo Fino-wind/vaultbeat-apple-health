@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from vaultbeat_mcp_local import __version__
+from vaultbeat_mcp_local.demo import DEMO_BANNER, DEMO_ENV, demo_enabled
+from vaultbeat_mcp_local.demo_watermark import watermark_demo_result
 from vaultbeat_mcp_local.service import (
     KNOWN_METRIC_TYPES,
     READABLE_NOTE_KINDS,
@@ -27,6 +29,76 @@ def _service(args: argparse.Namespace) -> VaultbeatLocalService:
 
 def _print_json(payload: Any) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _health_json(payload: Any) -> str:
+    """Serialise a health payload, stamping it when this is a demo run.
+
+    Paired with `_emit_decrypted`: that function decides WHERE the bytes go,
+    this one decides what they say. Kept separate so the `--output` file and
+    stdout cannot drift apart — before 2026-08-27 they were two `json.dumps`
+    calls in two functions, and adding the stamp to one of them would have been
+    the whole bug again one level down.
+
+    🔴 `sort_keys` is OFF for a stamped payload and ON otherwise, and that
+    asymmetry is the point rather than an oversight. `watermark_demo_result`
+    puts `demo_warning` first so the banner is literally the first thing in the
+    text; sorting moves it behind `count` and `daily_summary` — behind an array
+    long enough that a truncated paste loses it entirely. Sorting buys stability
+    of key order across future code edits, which is worth something for a real
+    export used as a diff baseline and worth nothing set against the one
+    guarantee demo output exists to make. Determinism is unaffected either way:
+    the generator is seeded and the dicts are built in a fixed order, so two
+    runs still emit identical bytes (`test_demo.py` asserts that directly).
+    """
+
+    if not demo_enabled():
+        return json.dumps(payload, indent=2, sort_keys=True)
+    return json.dumps(watermark_demo_result(payload), indent=2, sort_keys=False)
+
+
+def _warn_demo_on_stderr() -> None:
+    """Put the banner beside a JSON payload that is going to stdout.
+
+    stderr, not stdout, because stdout here IS a JSON document: a banner line
+    printed into it breaks `vaultbeat-mcp --demo sleep | jq` and every other
+    consumer that parses this output. (`doctor` can print its `[DEMO]` line to
+    stdout precisely because its human rendering is not JSON.)
+
+    ⚠️ This is the SECOND marker and never the only one. stderr is exactly what
+    disappears under `> out.json`, which is the case Invariant 61
+    (demo-is-a-boundary-not-a-flag) cares about most — so the in-band stamp from
+    `_health_json` is the load-bearing one, and this exists for the human who
+    has the terminal in front of them and will not read a key in the middle of
+    200 lines.
+    """
+
+    if demo_enabled():
+        print(DEMO_BANNER, file=sys.stderr)
+
+
+def _wrote_message(output_path: Path, label: str) -> str:
+    """Describe the file just written — differently, when nothing was decrypted.
+
+    The real-run sentence ("holds unencrypted health data — treat it as
+    sensitive") is a false statement about a demo file: nothing was fetched,
+    nothing was decrypted, and no real person is in it. Telling an operator to
+    handle synthetic output as sensitive is the mirror of the bug this whole
+    change is about — a claim rendered with the confidence of a fact when the
+    code knows better.
+    """
+
+    if demo_enabled():
+        return (
+            f"Wrote SYNTHETIC {label} to {output_path} (file mode 0600). "
+            "This is demo output: nothing was decrypted and it belongs to no real "
+            "person. The payload says so in its own first key, so it stays labelled "
+            "if this file is pasted somewhere else."
+        )
+    return (
+        f"Wrote DECRYPTED {label} to {output_path} (file mode 0600). "
+        "This file holds unencrypted health data — treat it as sensitive."
+    )
 
 
 _QR_RELAY_WARNING = """\
@@ -352,30 +424,43 @@ def handle_sync(args: argparse.Namespace) -> int:
         "records": [record.to_dict() for record in records],
         "errors": errors,
     }
-    if args.output:
-        output_path = Path(args.output).expanduser()
-        write_secret_file(output_path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        print(
-            f"Wrote {len(records)} DECRYPTED records to {output_path} (file mode 0600). "
-            "This file holds unencrypted health data — treat it as sensitive."
-        )
-    else:
-        _print_json(payload)
+    # Routed through the same funnel as every other data subcommand rather than
+    # writing the file itself: this branch used to be a second `json.dumps` and a
+    # second "DECRYPTED" sentence, i.e. one of the two places the demo stamp would
+    # have had to be added twice or be wrong once.
+    _emit_decrypted(payload, args, label=f"{len(records)} raw records")
     return 0 if not errors else 3
 
 
 def _emit_decrypted(payload: dict[str, Any], args: argparse.Namespace, *, label: str) -> None:
-    """Print or persist a decrypted-health summary, mirroring `handle_sync` output rules."""
+    """THE place health data leaves this CLI — stdout or a 0600 file.
 
+    Every data subcommand ends here, `sync` included since 2026-08-27. That
+    matters beyond tidiness: the demo watermark is a judgement, and a judgement
+    with two exits gets remembered at one of them (Invariant 58
+    (one-funnel-per-event)). This function had a near-twin inside `handle_sync`
+    doing the same two things slightly differently — exactly the shape that lets
+    a fix look complete while covering half the surface, which is how the
+    watermark itself came to cover the MCP exit only.
+
+    The file branch deliberately gets the SAME bytes as the stdout branch, out of
+    one `_health_json` call. `--output` is the case that matters most in demo
+    mode (a file outlives the session that could explain it), so it must not be
+    the branch that is easier to forget.
+
+    ⚠️ `label` now carries its own noun ("… summary", "43 raw records"); the
+    sentence around it no longer appends one, because `sync` writes records
+    rather than a summary and the old wording called them a summary anyway.
+    """
+
+    text = _health_json(payload)
     if args.output:
         output_path = Path(args.output).expanduser()
-        write_secret_file(output_path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        print(
-            f"Wrote DECRYPTED {label} summary to {output_path} (file mode 0600). "
-            "This file holds unencrypted health data — treat it as sensitive."
-        )
-    else:
-        _print_json(payload)
+        write_secret_file(output_path, text + "\n")
+        print(_wrote_message(output_path, label))
+        return
+    print(text)
+    _warn_demo_on_stderr()
 
 
 def handle_sleep(args: argparse.Namespace) -> int:
@@ -383,7 +468,7 @@ def handle_sleep(args: argparse.Namespace) -> int:
         limit=args.limit, fresh=args.fresh,
         owner=getattr(args, "owner", None),
     ))
-    _emit_decrypted(result, args, label="sleep sessions")
+    _emit_decrypted(result, args, label="sleep sessions summary")
     return 0 if not result.get("errors") else 3
 
 
@@ -397,13 +482,13 @@ def handle_sleep_detail(args: argparse.Namespace) -> int:
         # This subcommand's own help text promises the timeline.
         include_timeline=True,
     ))
-    _emit_decrypted(result, args, label="sleep detail (HR+RR+stage timeline)")
+    _emit_decrypted(result, args, label="sleep detail summary (HR+RR+stage timeline)")
     return 0 if not result.get("errors") else 3
 
 
 def handle_water(args: argparse.Namespace) -> int:
     summary = asyncio.run(_service(args).water_intake_summary(limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)))
-    _emit_decrypted(summary, args, label="water intake")
+    _emit_decrypted(summary, args, label="water intake summary")
     return 0 if not summary.get("errors") else 3
 
 
@@ -411,7 +496,7 @@ def handle_weight(args: argparse.Namespace) -> int:
     summary = asyncio.run(
         _service(args).weight_trend_summary(limit=args.limit, goal_kg=args.goal_kg, fresh=args.fresh, owner=getattr(args, "owner", None))
     )
-    _emit_decrypted(summary, args, label="weight trend")
+    _emit_decrypted(summary, args, label="weight trend summary")
     return 0 if not summary.get("errors") else 3
 
 
@@ -421,31 +506,31 @@ def handle_menstrual(args: argparse.Namespace) -> int:
         "It only appears if the user explicitly opted in on iOS."
     )
     summary = asyncio.run(_service(args).menstrual_cycle_summary(limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)))
-    _emit_decrypted(summary, args, label="menstrual cycle")
+    _emit_decrypted(summary, args, label="menstrual cycle summary")
     return 0 if not summary.get("errors") else 3
 
 
 def handle_activity(args: argparse.Namespace) -> int:
     summary = asyncio.run(_service(args).activity_summary(limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)))
-    _emit_decrypted(summary, args, label="activity rings")
+    _emit_decrypted(summary, args, label="activity rings summary")
     return 0 if not summary.get("errors") else 3
 
 
 def handle_resting_hr(args: argparse.Namespace) -> int:
     result = asyncio.run(_service(args).resting_hr_records(limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)))
-    _emit_decrypted(result, args, label="resting heart rate")
+    _emit_decrypted(result, args, label="resting heart rate summary")
     return 0 if not result.get("errors") else 3
 
 
 def handle_workouts(args: argparse.Namespace) -> int:
     result = asyncio.run(_service(args).workout_records(limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)))
-    _emit_decrypted(result, args, label="workouts")
+    _emit_decrypted(result, args, label="workouts summary")
     return 0 if not result.get("errors") else 3
 
 
 def handle_mindfulness(args: argparse.Namespace) -> int:
     result = asyncio.run(_service(args).mindfulness_summary(limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)))
-    _emit_decrypted(result, args, label="mindfulness")
+    _emit_decrypted(result, args, label="mindfulness summary")
     return 0 if not result.get("errors") else 3
 
 
@@ -458,21 +543,21 @@ def handle_hrv(args: argparse.Namespace) -> int:
                 limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)
             )
         )
-        label = "HRV (SDNN raw samples)"
+        label = "HRV summary (SDNN raw samples)"
     else:
         result = asyncio.run(
             service_obj.hrv_hourly_records(
                 limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)
             )
         )
-        label = "HRV (SDNN hourly averages)"
+        label = "HRV summary (SDNN hourly averages)"
     _emit_decrypted(result, args, label=label)
     return 0 if not result.get("errors") else 3
 
 
 def handle_wrist_temp(args: argparse.Namespace) -> int:
     result = asyncio.run(_service(args).wrist_temp_records(limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)))
-    _emit_decrypted(result, args, label="wrist temperature")
+    _emit_decrypted(result, args, label="wrist temperature summary")
     return 0 if not result.get("errors") else 3
 
 
@@ -483,7 +568,7 @@ def handle_notes(args: argparse.Namespace) -> int:
     summary = asyncio.run(
         _service(args).notes_summary(limit=args.limit, target_kind=args.kind, fresh=args.fresh)
     )
-    _emit_decrypted(summary, args, label="notes")
+    _emit_decrypted(summary, args, label="notes summary")
     return 0 if not summary.get("errors") else 3
 
 
@@ -491,7 +576,7 @@ def handle_strength(args: argparse.Namespace) -> int:
     summary = asyncio.run(
         _service(args).strength_summary(limit=args.limit, limit_days=args.days, fresh=args.fresh)
     )
-    _emit_decrypted(summary, args, label="strength sessions")
+    _emit_decrypted(summary, args, label="strength sessions summary")
     return 0 if not summary.get("errors") else 3
 
 
@@ -501,7 +586,7 @@ def handle_symptoms(args: argparse.Namespace) -> int:
         "It only appears if a user explicitly opted in on iOS."
     )
     summary = asyncio.run(_service(args).symptom_summary(limit=args.limit, fresh=args.fresh))
-    _emit_decrypted(summary, args, label="symptoms")
+    _emit_decrypted(summary, args, label="symptoms summary")
     return 0 if not summary.get("errors") else 3
 
 
@@ -996,8 +1081,6 @@ def main(argv: list[str] | None = None) -> int:
     # means "whatever the environment already said", so a wrapper that exports
     # VAULTBEAT_DEMO keeps working.
     if getattr(args, "demo", False):
-        from vaultbeat_mcp_local.demo import DEMO_ENV
-
         os.environ[DEMO_ENV] = "1"
 
     try:

@@ -8,7 +8,9 @@ import json
 from typing import Any, Callable, TypeVar, cast
 
 from vaultbeat_mcp_local import __version__
-from vaultbeat_mcp_local.demo import DEMO_BANNER, demo_enabled
+from vaultbeat_mcp_local.demo import demo_enabled
+from vaultbeat_mcp_local.demo_watermark import watermark_demo_result
+from vaultbeat_mcp_local.prompts import register_prompts
 from vaultbeat_mcp_local.service import VaultbeatLocalService
 from vaultbeat_mcp_local.store import ConfigStore
 
@@ -98,68 +100,13 @@ _DEMO_DOC_PREFIX = (
 )
 
 
-def _watermark_demo(result: Any) -> Any:
-    """Stamp a synthetic-data marker onto a tool result.
-
-    Add-only and non-destructive, same discipline as `_annotate_if_empty`: it
-    never reads, edits or drops an existing key. The marker goes FIRST in the
-    dict so it survives a client that truncates a long payload from the end.
-
-    🔴 `demo_warning` is the FIRST key, ahead of the boolean. The result is
-    serialised with `json.dumps`, which preserves insertion order, so the first
-    key is literally the first thing in the text an agent receives — and
-    `"demo_mode": true` is a flag someone has to already know to look for,
-    while the banner is a sentence that acts on a reader who does not. Ordering
-    is free; which of the two goes first is not.
-
-    A result that already carries `demo_mode` (`vaultbeat_status`,
-    `vaultbeat_doctor`, which build a richer block of their own) is returned
-    untouched rather than double-stamped — those two order their own keys the
-    same way.
-    """
-
-    if not isinstance(result, dict) or "demo_mode" in result:
-        return result
-    return {
-        "demo_warning": DEMO_BANNER,
-        "demo_mode": True,
-        **_mark_demo_rows(result),
-    }
-
-
-def _mark_demo_rows(result: dict[str, Any]) -> dict[str, Any]:
-    """Tag each row of a top-level list-of-dicts with `synthetic: True`.
-
-    The top-level banner covers a result quoted whole; it does NOT survive a row
-    being lifted out of it. Most read tools self-identify anyway because their
-    rows carry `owner_user_id`, which in demo mode reads `demo0001-…` — but the
-    two aggregating tools build brand-new dicts (`{"day": …, "basal_kcal": …}`)
-    and drop that field on the way, so `get_basal_energy` and
-    `get_total_energy_burned` were the only two whose rows were, taken alone,
-    indistinguishable from real ones (verified 2026-08-20: 17 of 19 read tools
-    self-identify, those two did not).
-
-    Done HERE rather than in those two methods on purpose — one site, so a third
-    aggregating tool is covered on the day it is written rather than on the day
-    someone notices. It is also structurally absent from a real run: the wrapper
-    is only installed when demo mode is on.
-
-    One level deep, deliberately. Recursing would reach into `sleep`'s per-night
-    `stages` and similar, which is noise for no gain — a stage array is not
-    something anyone lifts out and quotes as a health fact. Non-dict rows
-    (`errors` is a list of strings) are left alone.
-    """
-
-    marked: dict[str, Any] = {}
-    for key, value in result.items():
-        if isinstance(value, list) and any(isinstance(row, dict) for row in value):
-            marked[key] = [
-                {**row, "synthetic": True} if isinstance(row, dict) else row
-                for row in value
-            ]
-        else:
-            marked[key] = value
-    return marked
+# `_watermark_demo` / `_mark_demo_rows` used to live here. They moved to
+# `demo_watermark.py` on 2026-08-27 because the CLI's data subcommands need the
+# same stamp and cannot import this module — `cli.py` keeps `mcp_server` behind a
+# lazy import inside `handle_serve` precisely so the MCP SDK's import chain stays
+# off the data path (verified: importing `cli` loads no `mcp.*` module). A
+# judgement with one home that only one of two callers can reach is the
+# Invariant 58 (one-funnel-per-event) failure, not the fix.
 
 
 def _demo_wrap(function: _F) -> _F:
@@ -181,14 +128,14 @@ def _demo_wrap(function: _F) -> _F:
 
         @functools.wraps(function)
         async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-            return _watermark_demo(await function(*args, **kwargs))
+            return watermark_demo_result(await function(*args, **kwargs))
 
         _prefix_doc(async_wrapper, function)
         return cast(_F, async_wrapper)
 
     @functools.wraps(function)
     def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-        return _watermark_demo(function(*args, **kwargs))
+        return watermark_demo_result(function(*args, **kwargs))
 
     _prefix_doc(sync_wrapper, function)
     return cast(_F, sync_wrapper)
@@ -207,7 +154,7 @@ def _prefix_doc(wrapper: Any, original: Any) -> None:
 def _annotate_access(result: Any, service: VaultbeatLocalService) -> Any:
     """Attach a one-line trial-expiry heads-up to a tool result, add-only.
 
-    Same discipline as `_annotate_if_empty` / `_watermark_demo`: never reads,
+    Same discipline as `_annotate_if_empty` / `watermark_demo_result`: never reads,
     edits or drops an existing key, and does nothing at all outside the last
     24 hours of a pairing-time trial deadline. The sentence is generated
     entirely client-side (Anti-pattern 23) from a timestamp this machine
@@ -489,6 +436,14 @@ def run_mcp_server(
             return cast(_F, mcp.tool(title=title, annotations=annotations)(prepared))
 
         return decorator
+
+    # Prompts. `demo_active` is handed down rather than re-read for the reason
+    # recorded above the FastMCP construction: every surface that can say "demo"
+    # has to learn it from the same frozen value, or they disagree mid-session.
+    #
+    # Registered here rather than beside `mcp.run` so that "what this server
+    # exposes" reads as one block. Nothing below depends on it.
+    register_prompts(mcp, demo=demo_active)
 
     @tool(title="Connection status", annotations=_read_only_tool())
     def vaultbeat_status() -> dict[str, Any]:

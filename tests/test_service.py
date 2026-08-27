@@ -3686,3 +3686,398 @@ def test_demo_mode_does_not_claim_a_private_key_exists(
     where = service._scope_report()["private_key_location"]
     assert "keyring" not in where.lower()
     assert "nowhere" in where.lower()
+
+
+# ── coverage: how many DAYS is this answer built on? ─────────────────────────
+#
+# Invariant 62 (coverage-before-average) generalised from hourly buckets to
+# calendar days. The harm this pins is 2026-08-02: a conclusion drawn from two
+# isolated weigh-ins was acted on the same afternoon. The statistics were wrong,
+# but what let a wrong statistic be acted on is that "how many points is this?"
+# never appeared next to the answer. `days_covered` cannot be recovered from the
+# payload by counting rows — `limit` has already cut them (Invariant 38) and for
+# the sample kinds one day holds many rows.
+
+
+def _hrv_payload(day_id: str, day_start: str, sdnn_ms: float) -> bytes:
+    return json.dumps(
+        {"dayID": day_id, "dayStartDate": day_start, "sdnnMilliseconds": sdnn_ms}
+    ).encode()
+
+
+def test_coverage_counts_distinct_days_not_rows(tmp_path: Path) -> None:
+    """The headline case: 12 HRV samples, 2 days.
+
+    `get_hrv` returns raw samples and `limit` counts SAMPLES, so an agent that
+    infers a day count from the array length is wrong by a factor of six here —
+    and "average HRV" over 2 days and over 30 has the same shape and the same
+    number of digits. This is the only field that separates them.
+    """
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            # Six samples on each of two local days (UTC+8-safe: mid-day UTC).
+            _hrv_payload(f"hrv-{day}-{i}", f"2026-08-{day}T{6 + i}:00:00Z", 40.0 + i),
+            metric_type="hrv",
+            envelope_id=f"env-hrv-{day}-{i}",
+            blob_id=f"hrv-{day}-{i}",
+            owner_user_id=_TEST_OWNER,
+        )
+        for day in ("10", "11")
+        for i in range(6)
+    ]
+
+    result = asyncio.run(service.hrv_records(limit=12, owner="a1a1"))
+    coverage = result["coverage"]
+
+    assert len(result["records"]) == 12
+    assert coverage["rows_counted"] == 12
+    assert coverage["days_covered"] == 2, "12 rows, 2 days — the whole point"
+    assert coverage["requested_unit"] == "samples", (
+        "without the unit, days_covered=2 against requested=12 reads as 10 missing days"
+    )
+    assert coverage["first_day"] == "2026-08-10"
+    assert coverage["last_day"] == "2026-08-11"
+    assert coverage["span_days"] == 2
+    assert coverage["days_missing_in_span"] == 0
+    assert coverage["window_satisfied"] is True
+
+
+def test_coverage_span_exposes_a_sparse_history(tmp_path: Path) -> None:
+    """3 days over a 63-day span is not "three days of data" and not a fortnight.
+
+    VO2Max is the real instance — the Watch only computes it during outdoor
+    brisk bouts, so a peak/trough drawn from three readings months apart looks
+    identical to one drawn from three consecutive mornings.
+    """
+    service, cloud, public_key = _bound_service(tmp_path)
+    days = ["2026-06-01", "2026-07-04", "2026-08-02"]  # inclusive span = 63
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _vo2max_payload(f"vo2-{i}", f"{day}T04:00:00Z", 39.0 + i),
+            metric_type="vo2max",
+            envelope_id=f"env-vo2-{i}",
+            blob_id=f"vo2-{i}",
+            owner_user_id=_TEST_OWNER,
+        )
+        for i, day in enumerate(days)
+    ]
+
+    coverage = asyncio.run(service.vo2max_records(owner="a1a1"))["coverage"]
+
+    assert coverage["days_covered"] == 3
+    assert coverage["first_day"] == "2026-06-01"
+    assert coverage["last_day"] == "2026-08-02"
+    assert coverage["span_days"] == 63
+    assert coverage["days_missing_in_span"] == 60
+    # No limit was passed, so there is no window to satisfy — reporting True
+    # here would be a claim nobody made.
+    assert coverage["window_satisfied"] is None
+    assert coverage["requested"] is None
+
+
+def test_coverage_window_satisfied_is_false_when_history_is_short(tmp_path: Path) -> None:
+    """Asked for 30 days of weight, this account holds 2.
+
+    `window_satisfied=False` is the machine-readable form of "your question was
+    wider than the data". Note it says nothing about WHY — a freshly paired
+    server is still sealing its copy, which is why the note sends the reader to
+    a re-sync rather than to a conclusion (Invariant 57).
+    """
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _body_payload(f"body-{i}", day, 82.0 + i),
+            metric_type="body",
+            envelope_id=f"env-body-{i}",
+            blob_id=f"body-{i}",
+            owner_user_id=_TEST_OWNER,
+        )
+        for i, day in enumerate(["2026-07-10T16:00:00Z", "2026-07-20T16:00:00Z"])
+    ]
+
+    coverage = asyncio.run(
+        service.weight_trend_summary(limit=30, owner="a1a1")
+    )["coverage"]
+
+    assert coverage["days_covered"] == 2
+    assert coverage["requested"] == 30
+    assert coverage["window_satisfied"] is False
+    # And the span is what makes the two-point trend legible as a 11-day slope
+    # rather than a 30-day one — the exact 2026-08-02 shape.
+    assert coverage["span_days"] == 11
+
+
+def test_coverage_survives_the_dedup_that_runs_after_the_cut(tmp_path: Path) -> None:
+    """Four blobs, two dayIDs → two days, and the window is NOT satisfied.
+
+    `limit` cuts blobs; `summarize_water_intake` then dedups by dayID. Measuring
+    `window_satisfied` against the pre-dedup cut would answer "yes, you got your
+    4 days" to a result holding 2. The safe direction for a field whose job is
+    to stop an answer being over-trusted is to under-claim.
+    """
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _water_payload(f"w-{day_id}", day_start, 0.5, 4),
+            metric_type="water",
+            envelope_id=f"env-w-{day_id}-{i}",
+            blob_id=f"w-{day_id}-{i}",
+            owner_user_id=_TEST_OWNER,
+        )
+        for i, (day_id, day_start) in enumerate(
+            [
+                ("d1", "2026-08-10T16:00:00Z"),
+                ("d1", "2026-08-10T16:00:00Z"),
+                ("d2", "2026-08-11T16:00:00Z"),
+                ("d2", "2026-08-11T16:00:00Z"),
+            ]
+        )
+    ]
+
+    result = asyncio.run(service.water_intake_summary(limit=4, owner="a1a1"))
+    coverage = result["coverage"]
+
+    assert result["day_count"] == 2
+    assert coverage["days_covered"] == 2
+    assert coverage["rows_counted"] == 2, "must agree with day_count, not with limit"
+    assert coverage["window_satisfied"] is False
+
+
+def test_coverage_ignores_a_target_kind_filter_when_judging_the_window(
+    tmp_path: Path,
+) -> None:
+    """Asking for ONE kind of note is not a scarcity signal.
+
+    `target_kind` filters AFTER the cut, so a post-filter count compared against
+    `limit` would report `window_satisfied=False` on every single-kind query —
+    an alarm that fires when nothing is wrong teaches the reader to ignore it.
+    """
+    service, cloud, public_key = _bound_service(tmp_path)
+    kinds = ["general", "general", "sleep", "sleep"]
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _note_payload(f"n-{i}", kind, f"2026-08-1{i}", f"note {i}"),
+            metric_type="note",
+            envelope_id=f"env-n-{i}",
+            blob_id=f"n-{i}",
+            owner_user_id=_TEST_OWNER,
+        )
+        for i, kind in enumerate(kinds)
+    ]
+
+    filtered = asyncio.run(service.notes_summary(limit=4, target_kind="sleep"))
+    coverage = filtered["coverage"]
+
+    assert filtered["total_note_count"] == 2
+    assert coverage["days_covered"] == 2, "coverage describes the rows you got"
+    assert coverage["window_satisfied"] is True, (
+        "all 4 notes were available; 2 were filtered out by the caller's own request"
+    )
+
+
+def test_basal_coverage_is_measured_past_the_daily_display_cap(tmp_path: Path) -> None:
+    """`daily` is display-capped by `day_limit`; the average is not.
+
+    Measuring coverage off the capped list would repeat the sibling bug in
+    Invariant 62 — consuming a display cap as if it were the data, which once
+    reported 60 present days as missing.
+    """
+    from datetime import date as _date_type, timedelta as _td
+
+    service, cloud, public_key = _bound_service(tmp_path)
+    today = _date_type.today()
+    envelopes: list[dict[str, Any]] = []
+    for offset in range(1, 6):  # five distinct days
+        envelopes.extend(
+            _basal_day_envelopes(
+                public_key,
+                today - _td(days=offset),
+                2000.0,
+                tag=f"cov{offset}",
+                with_activity=False,
+            )
+        )
+    cloud.envelopes = envelopes
+
+    capped = asyncio.run(
+        service.basal_energy_records(owner="a1a1", day_limit=2)
+    )
+
+    assert len(capped["daily"]) == 2, "the display cap is still in force"
+    assert capped["day_count"] == 5
+    assert capped["coverage"]["days_covered"] == 5, (
+        "coverage follows the average's denominator, not the truncated list"
+    )
+    assert capped["coverage"]["rows_counted"] == 5 * 24, "one blob per hour"
+    assert capped["coverage"]["requested_unit"] == "samples"
+
+
+def test_total_energy_burned_coverage_shows_the_window_was_wider_than_the_data(
+    tmp_path: Path,
+) -> None:
+    """`days=30` on a 3-day account: the average is over 3 days, and says so.
+
+    This is the one reader whose parameter really is a window, and the one whose
+    output feeds a standing action (a diet target at `average_tdee_kcal - 500`).
+    """
+    from datetime import date as _date_type, timedelta as _td
+
+    service, cloud, public_key = _bound_service(tmp_path)
+    today = _date_type.today()
+    envelopes: list[dict[str, Any]] = []
+    for offset in (1, 2, 3):
+        envelopes.extend(
+            _basal_day_envelopes(
+                public_key, today - _td(days=offset), 1800.0, tag=f"tdee{offset}"
+            )
+        )
+    cloud.envelopes = envelopes
+
+    result = asyncio.run(service.total_energy_burned(days=30, owner="a1a1"))
+    coverage = result["coverage"]
+
+    assert result["days_returned"] == 3
+    assert coverage["days_covered"] == 3
+    assert coverage["requested"] == 30
+    assert coverage["requested_unit"] == "days"
+    assert coverage["window_satisfied"] is False
+    assert coverage["span_days"] == 3
+
+
+def test_coverage_is_empty_but_present_when_there_is_no_data(tmp_path: Path) -> None:
+    """An empty read still carries the block.
+
+    Dropping it on empty would make "no data" and "an older server that does not
+    report coverage" indistinguishable — and the caller cannot tell a missing
+    key from a key that means zero.
+    """
+    service, cloud, _ = _bound_service(tmp_path)
+    cloud.envelopes = []
+
+    coverage = asyncio.run(service.activity_summary(limit=7))["coverage"]
+
+    assert coverage["days_covered"] == 0
+    assert coverage["first_day"] is None
+    assert coverage["last_day"] is None
+    assert coverage["span_days"] is None
+    assert coverage["days_missing_in_span"] is None
+    assert coverage["window_satisfied"] is False
+
+
+def test_coverage_reads_a_bare_local_day_without_reparsing_it(monkeypatch: Any) -> None:
+    """A bare "YYYY-MM-DD" is already local and must never be reparsed as UTC.
+
+    🔴 **This test pins its own timezone on purpose and the pin is the test.**
+    `_local_date_fields` reads its input as a UTC instant, so round-tripping
+    "2026-08-27" yields 2026-08-27T00:00Z — which is still the 27th anywhere at
+    or east of Greenwich, and the 26th everywhere west of it. Deleting the
+    guarded branch was measured against three zones: Asia/Shanghai and
+    Europe/Lisbon stayed fully green, America/New_York failed three tests.
+    Both zones this project is developed in are non-negative, so a test that
+    trusted the ambient TZ would be inert on every machine that runs it —
+    a guard nobody can read is not a guard.
+
+    The blast radius is wider than the hand-built rows: `local_date` is itself a
+    bare day, so this branch is on the path for EVERY row from a `to_dict()`.
+    """
+    import time
+
+    from vaultbeat_mcp_local.service import _coverage_day_of
+
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        assert _coverage_day_of({"day": "2026-08-27"}) == "2026-08-27"
+        assert _coverage_day_of({"date": "2026-08-27"}) == "2026-08-27"
+        # The same value arriving as `local_date` — the common case, since every
+        # `to_dict()` emits one.
+        assert _coverage_day_of({"local_date": "2026-08-27"}) == "2026-08-27"
+        # A real instant IS converted, and `local_date` still wins when both are
+        # present, so coverage never disagrees with the day printed in its row.
+        assert (
+            _coverage_day_of(
+                {"local_date": "2026-08-27", "date": "2026-08-27T02:00:00Z"}
+            )
+            == "2026-08-27"
+        )
+        assert _coverage_day_of({"date": "2026-08-27T02:00:00Z"}) == "2026-08-26", (
+            "02:00Z really is the previous day in New York — the conversion "
+            "itself must stay, only bare days are exempt from it"
+        )
+        # Degrade, never raise (same contract as `_cut_newest_by`).
+        assert _coverage_day_of({"day": "not-a-date"}) is None
+        assert _coverage_day_of({}) is None
+        assert _coverage_day_of("nonsense") is None
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
+def test_every_read_tool_reports_coverage() -> None:
+    """A new read tool must not ship without it.
+
+    Demo mode drives every reader through the same code path with synthetic
+    data, so this catches an omission without any fixture per kind. Nothing here
+    asserts a VALUE — demo numbers are synthetic by design; it asserts the block
+    exists and is internally consistent.
+    """
+    import os
+    import tempfile
+
+    from vaultbeat_mcp_local.service import _COVERAGE_NOTE
+
+    calls = [
+        ("sleep_records", {"limit": 7}),
+        ("sleep_detail_records", {"limit": 3}),
+        ("water_intake_summary", {"limit": 10}),
+        ("weight_trend_summary", {"limit": 10}),
+        ("menstrual_cycle_summary", {"limit": 30}),
+        ("activity_summary", {"limit": 14}),
+        ("resting_hr_records", {"limit": 30}),
+        ("workout_records", {"limit": 10}),
+        ("mindfulness_summary", {"limit": 10}),
+        ("hrv_records", {"limit": 50}),
+        ("hrv_hourly_records", {"limit": 50}),
+        ("wrist_temp_records", {"limit": 20}),
+        ("basal_energy_records", {}),
+        ("total_energy_burned", {"days": 14}),
+        ("vo2max_records", {"limit": 10}),
+        ("symptom_summary", {"limit": 20}),
+        ("notes_summary", {"limit": 20}),
+        ("strength_summary", {"limit": 20}),
+        ("food_summary", {"limit": 20}),
+    ]
+
+    previous = os.environ.get("VAULTBEAT_DEMO")
+    os.environ["VAULTBEAT_DEMO"] = "1"
+    try:
+        service = VaultbeatLocalService(
+            ConfigStore(Path(tempfile.mkdtemp()) / "config.json")
+        )
+        for name, kwargs in calls:
+            result = asyncio.run(getattr(service, name)(**kwargs))
+            coverage = result.get("coverage")
+            assert coverage is not None, f"{name} returns no coverage block"
+            assert coverage["note"] == _COVERAGE_NOTE, f"{name} must not reword the note"
+            assert coverage["days_covered"] >= 0
+            assert coverage["requested_unit"], f"{name} must name what `limit` counts"
+            if coverage["days_covered"]:
+                # Arithmetic that has to hold on its own: a span can never be
+                # shorter than the number of distinct days inside it.
+                assert coverage["span_days"] >= coverage["days_covered"], name
+                assert (
+                    coverage["days_missing_in_span"]
+                    == coverage["span_days"] - coverage["days_covered"]
+                ), name
+                assert coverage["first_day"] <= coverage["last_day"], name
+    finally:
+        if previous is None:
+            os.environ.pop("VAULTBEAT_DEMO", None)
+        else:
+            os.environ["VAULTBEAT_DEMO"] = previous
