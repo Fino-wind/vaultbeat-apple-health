@@ -57,6 +57,9 @@ class FakeCloudClient:
         self.owner_user_id: str | None = None
         self.owner_public_key_base64: str | None = None
         self.owner_device_id: str | None = None
+        # Trial deadline the bind handshake would report (`trialEndsAt`). None
+        # models a grandfathered/paid user or an edge older than 2026-08-17.
+        self.trial_ends_at: str | None = None
         # Every write_strength_blob call, in order — lets tests assert what
         # was actually sent (ownership, recipients, ciphertext presence)
         # without a real network round trip.
@@ -80,6 +83,7 @@ class FakeCloudClient:
             owner_user_id=self.owner_user_id,
             owner_public_key_base64=self.owner_public_key_base64,
             owner_device_id=self.owner_device_id,
+            trial_ends_at=self.trial_ends_at,
         )
 
     async def sync(
