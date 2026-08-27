@@ -3917,6 +3917,32 @@ def test_basal_coverage_is_measured_past_the_daily_display_cap(tmp_path: Path) -
     assert capped["coverage"]["rows_counted"] == 5 * 24, "one blob per hour"
     assert capped["coverage"]["requested_unit"] == "samples"
 
+    # The other half, and the one that was missing until 2026-08-27: measuring
+    # past the cap is only safe if the block also SAYS the printing stops short.
+    # Without this the reader was handed `first_day` = a day with no row in
+    # `daily` and `days_missing_in_span: 0` beside it — told the day was present,
+    # unable to find it, and told by the note not to look.
+    assert capped["coverage"]["days_in_payload"] == 2, (
+        "days_in_payload counts what `daily` actually prints"
+    )
+    assert capped["coverage"]["days_missing_in_span"] == 0, (
+        "0 is correct and must stay correct: it is measured against days_covered "
+        "(the data), never against the display cap"
+    )
+    printed_days = {row["day"] for row in capped["daily"]}
+    assert capped["coverage"]["first_day"] not in printed_days, (
+        "the exact confusion this pins: first_day names a day the payload omits"
+    )
+
+    uncapped = asyncio.run(service.basal_energy_records(owner="a1a1", day_limit=None))
+    assert uncapped["coverage"]["days_in_payload"] == 5, (
+        "with no cap the two sets are the same set"
+    )
+    assert (
+        uncapped["coverage"]["days_in_payload"]
+        == uncapped["coverage"]["days_covered"]
+    )
+
 
 def test_total_energy_burned_coverage_shows_the_window_was_wider_than_the_data(
     tmp_path: Path,
@@ -4019,8 +4045,143 @@ def test_coverage_reads_a_bare_local_day_without_reparsing_it(monkeypatch: Any) 
         time.tzset()
 
 
+def test_attach_coverage_materialises_a_generator_before_counting() -> None:
+    """`rows` is iterated TWICE, so a generator must be consumed into a list first.
+
+    Deliberately a test on the helper rather than through a tool: every one of
+    the 19 call sites passes a list or a list comprehension today, so nothing in
+    the suite exercises this. Measured 2026-08-27 by mutation — of six targeted
+    changes to `_attach_coverage`, `list(rows)` -> `rows` was the ONE the whole
+    suite passed, which makes the explanatory comment beside it the only thing
+    defending it, and a comment loses that argument the first time someone reads
+    it as a redundant copy.
+
+    The failure it prevents is silent and self-contradictory rather than loud:
+    the first pass would count the days, the second would find the generator
+    exhausted, and the block would ship `days_covered: 2` beside
+    `rows_counted: 0` and `window_satisfied: False` — a coverage block that
+    disagrees with itself, on the one field whose entire job is to say how much
+    to trust the numbers next to it.
+    """
+    from vaultbeat_mcp_local.service import _attach_coverage
+
+    rows = [{"local_date": "2026-08-01"}, {"local_date": "2026-08-02"}]
+    summary: dict[str, Any] = {}
+    _attach_coverage(summary, rows=(row for row in rows), requested=2, unit="days")
+
+    coverage = summary["coverage"]
+    assert coverage["days_covered"] == 2
+    assert coverage["rows_counted"] == 2, (
+        "0 here means the second pass saw an exhausted generator"
+    )
+    assert coverage["days_in_payload"] == 2
+    assert coverage["window_satisfied"] is True, (
+        "a lost row count drags this to False, i.e. tells the agent to distrust "
+        "a result that is in fact complete"
+    )
+    # `displayed` is read exactly ONCE, so it needs no materialising and a
+    # generator is legitimate there — asserted so that a future reader does not
+    # "fix" the asymmetry by wrapping it in `list()` too, or by assuming both
+    # arguments have the same constraint.
+    other: dict[str, Any] = {}
+    _attach_coverage(
+        other,
+        rows=list(rows),
+        displayed=(row for row in rows[:1]),
+        requested=2,
+        unit="days",
+    )
+    assert other["coverage"]["days_in_payload"] == 1
+
+
+# Which service coroutines are NOT read tools. The readers themselves are
+# DERIVED (see `_service_read_tool_names`); what is written down is only the
+# complement, and the inversion is the whole point.
+#
+# Until 2026-08-27 the test below carried a literal 19-name reader list under a
+# docstring promising "a new read tool must not ship without it" — a promise a
+# hardcoded list structurally cannot keep. Measured: adding a
+# `blood_pressure_records` coroutine to service.py with no `_attach_coverage`
+# call left the entire suite green, because nothing named it. That is the same
+# "record by count, not by rule" shape this project blames for Invariant 38
+# regressing three times, and docs/roadmap.md says so in the very entry that
+# shipped `coverage`.
+#
+# Inverted, forgetting fails: an unlisted coroutine is ASSUMED to be a reader
+# and must produce a coverage block, so the only way to be skipped is for
+# somebody who knows it is not a reader to type it here.
+#
+# ⚠️ Deriving from the SERVICE and not from mcp_server's `@tool` list is
+# deliberate and was checked: every read tool in mcp_server.py delegates to one
+# of these coroutines, and `_attach_coverage` lives in this layer, so a tool
+# that builds its own payload would be the hole — there is none today.
+_NON_READ_SERVICE_COROUTINES = frozenset(
+    {
+        "doctor",  # a self-diagnosis report; owns no health rows
+        "log_food_entry",
+        "log_note",
+        "log_strength_entry",
+        "log_weight_entry",
+        "poll_once",  # binding lifecycle
+        "poll_until_bound",
+        "sync_decrypted_records",  # the layer every reader is built ON
+    }
+)
+
+# Overrides ONLY where a reader's own defaults would skip the `limit` path.
+# A reader absent from here is called with its defaults, so a NEW reader needs
+# no entry — which is what keeps the derivation from quietly becoming a list
+# again.
+_READ_TOOL_KWARGS: dict[str, dict[str, Any]] = {
+    "sleep_records": {"limit": 7},
+    "sleep_detail_records": {"limit": 3},
+    "water_intake_summary": {"limit": 10},
+    "weight_trend_summary": {"limit": 10},
+    "menstrual_cycle_summary": {"limit": 30},
+    "activity_summary": {"limit": 14},
+    "resting_hr_records": {"limit": 30},
+    "workout_records": {"limit": 10},
+    "mindfulness_summary": {"limit": 10},
+    "hrv_records": {"limit": 50},
+    "hrv_hourly_records": {"limit": 50},
+    "wrist_temp_records": {"limit": 20},
+    "total_energy_burned": {"days": 14},
+    "vo2max_records": {"limit": 10},
+    "symptom_summary": {"limit": 20},
+    "notes_summary": {"limit": 20},
+    "strength_summary": {"limit": 20},
+    "food_summary": {"limit": 20},
+}
+
+
+def _service_read_tool_names() -> list[str]:
+    """Every public coroutine on the service that must report `coverage`."""
+    import inspect
+
+    from vaultbeat_mcp_local.service import VaultbeatLocalService as _Service
+
+    public = {
+        name
+        for name in dir(_Service)
+        if not name.startswith("_")
+        and inspect.iscoroutinefunction(getattr(_Service, name))
+    }
+    stale = _NON_READ_SERVICE_COROUTINES - public
+    assert not stale, (
+        f"exemptions naming coroutines that no longer exist: {sorted(stale)}. "
+        "A renamed or deleted method must not leave its exemption behind — that "
+        "is how an exemption outlives the reason for it and silently covers "
+        "whatever takes the name next."
+    )
+    return sorted(public - _NON_READ_SERVICE_COROUTINES)
+
+
 def test_every_read_tool_reports_coverage() -> None:
     """A new read tool must not ship without it.
+
+    The reader list is derived from the service, not typed out here — see
+    `_service_read_tool_names` for why the previous hardcoded version could not
+    enforce this docstring.
 
     Demo mode drives every reader through the same code path with synthetic
     data, so this catches an omission without any fixture per kind. Nothing here
@@ -4032,27 +4193,15 @@ def test_every_read_tool_reports_coverage() -> None:
 
     from vaultbeat_mcp_local.service import _COVERAGE_NOTE
 
-    calls = [
-        ("sleep_records", {"limit": 7}),
-        ("sleep_detail_records", {"limit": 3}),
-        ("water_intake_summary", {"limit": 10}),
-        ("weight_trend_summary", {"limit": 10}),
-        ("menstrual_cycle_summary", {"limit": 30}),
-        ("activity_summary", {"limit": 14}),
-        ("resting_hr_records", {"limit": 30}),
-        ("workout_records", {"limit": 10}),
-        ("mindfulness_summary", {"limit": 10}),
-        ("hrv_records", {"limit": 50}),
-        ("hrv_hourly_records", {"limit": 50}),
-        ("wrist_temp_records", {"limit": 20}),
-        ("basal_energy_records", {}),
-        ("total_energy_burned", {"days": 14}),
-        ("vo2max_records", {"limit": 10}),
-        ("symptom_summary", {"limit": 20}),
-        ("notes_summary", {"limit": 20}),
-        ("strength_summary", {"limit": 20}),
-        ("food_summary", {"limit": 20}),
-    ]
+    names = _service_read_tool_names()
+    # A floor, NOT the enumeration. Its only job is to catch the introspection
+    # above breaking and returning nothing, which would leave this test green
+    # while testing zero tools — the failure mode a derived list adds.
+    assert len(names) >= 19, f"read-tool derivation returned only {names}"
+    stale_kwargs = sorted(set(_READ_TOOL_KWARGS) - set(names))
+    assert not stale_kwargs, (
+        f"kwargs supplied for things that are not read tools: {stale_kwargs}"
+    )
 
     previous = os.environ.get("VAULTBEAT_DEMO")
     os.environ["VAULTBEAT_DEMO"] = "1"
@@ -4060,13 +4209,19 @@ def test_every_read_tool_reports_coverage() -> None:
         service = VaultbeatLocalService(
             ConfigStore(Path(tempfile.mkdtemp()) / "config.json")
         )
-        for name, kwargs in calls:
+        for name in names:
+            kwargs = _READ_TOOL_KWARGS.get(name, {})
             result = asyncio.run(getattr(service, name)(**kwargs))
             coverage = result.get("coverage")
             assert coverage is not None, f"{name} returns no coverage block"
             assert coverage["note"] == _COVERAGE_NOTE, f"{name} must not reword the note"
             assert coverage["days_covered"] >= 0
             assert coverage["requested_unit"], f"{name} must name what `limit` counts"
+            # A result can print fewer days than it computes over (a display
+            # cap) but never more — more would mean coverage is describing a
+            # narrower set than the rows beside it, which is the one direction
+            # that makes an agent under-trust real data.
+            assert coverage["days_in_payload"] <= coverage["days_covered"], name
             if coverage["days_covered"]:
                 # Arithmetic that has to hold on its own: a span can never be
                 # shorter than the number of distinct days inside it.
