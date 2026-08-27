@@ -133,15 +133,23 @@ _WRITE_TOOLS: dict[str, str] = {
 #:
 #: ⚠️ Precisely: this did NOT mean `cli.py status` lost a banner LINE. That
 #: handler is `_print_json(...)` and has no banner-printing code at all under
-#: either key — a separate gap, deliberately left for its own change. What the
-#: split cost was one key name that three surfaces agree on and a fourth did
-#: not. Stating it exactly because the looser version ("status printed no
-#: banner") is true for an unrelated reason and would send the next reader to
-#: fix the wrong thing. Unified 2026-08-20; this tuple
+#: either key — a separate gap. What the split cost was one key name that three
+#: surfaces agree on and a fourth did not. Stating it exactly because the looser
+#: version ("status printed no banner") is true for an unrelated reason and
+#: would send the next reader to fix the wrong thing. Unified 2026-08-20; this tuple
 #: stays a tuple only so `_banner` keeps its shape, and the single entry is now
 #: itself an assertion — a regression that reintroduces `demo_banner` makes
 #: `test_the_banner_travels_under_exactly_one_key` go red rather than silently
 #: passing through a fallback.
+#:
+#: 📌 2026-08-27 closed the CLI half for the DATA subcommands only — they now
+#: stamp the payload and print the banner to stderr (`_emit_decrypted` →
+#: `_health_json` / `_warn_demo_on_stderr` in `cli.py`). `status` and
+#: `poll` still go through the bare `_print_json`; `status` gets away with it
+#: because `demo_status()` builds `demo_warning` into the payload itself, and
+#: `poll` is a network call that has no demo form at all. So the remaining gap
+#: is narrower than "the CLI has no banner": it is that `status` prints its
+#: banner as a JSON value a reader must notice rather than as a line.
 _BANNER_KEYS = ("demo_warning",)
 
 
@@ -901,14 +909,23 @@ def test_every_demo_result_leads_with_the_warning_sentence(
     First key matters because `demo_mode: true` is a flag a reader has to
     already know to look for, while the banner is a sentence that acts on one
     who does not — and four separate surfaces build this block by hand
-    (`_watermark_demo`, `_demo_write_refusal`, `doctor()`, `demo_status()`), so
+    (`watermark_demo_result`, `_demo_write_refusal`, `doctor()`, `demo_status()`), so
     "we put it first" was true of one of them and not the others.
 
     ⚠️ Scope: this is the MCP wire, where the SDK serialises with `json.dumps`
-    and insertion order survives. It is NOT a universal guarantee — `cli.py`'s
-    `_print_json` sorts keys, so the CLI shows the banner alphabetically. That
-    is fine (a human reading a terminal sees the whole payload), and it is the
-    reason this asserts through the MCP handler rather than anywhere cheaper.
+    and insertion order survives, which is why this asserts through the MCP
+    handler rather than anywhere cheaper. The CLI's half of the same guarantee
+    is asserted separately, in `test_cli.py` — it reaches the identical
+    ordering by a different route (`_health_json` turns `sort_keys` off for a
+    stamped payload), so one test cannot cover both.
+
+    ⚠️ This paragraph used to end "`cli.py`'s `_print_json` sorts keys, so the
+    CLI shows the banner alphabetically. That is fine (a human reading a
+    terminal sees the whole payload)" — wrong twice, and worth keeping as a
+    warning. The CLI showed no banner at all under any ordering (the data path
+    never called the watermark), and "a human reading a terminal" assumed the
+    reader this output most needs to reach, which is a file, an issue comment
+    or another agent. Fixed 2026-08-27.
     """
 
     server = _build_server(tmp_path, monkeypatch)
@@ -981,7 +998,7 @@ def test_row_marking_leaves_everything_else_exactly_as_it_was(
     fact, so marking it is noise.
     """
 
-    from vaultbeat_mcp_local.mcp_server import _mark_demo_rows
+    from vaultbeat_mcp_local.demo_watermark import mark_demo_rows
 
     payload = {
         "count": 3,
@@ -990,7 +1007,7 @@ def test_row_marking_leaves_everything_else_exactly_as_it_was(
         "rows": [{"a": 1}, {"b": 2}],
         "nested": [{"outer": 1, "inner": [{"deep": True}]}],
     }
-    marked = _mark_demo_rows(payload)
+    marked = mark_demo_rows(payload)
 
     assert marked["count"] == 3
     assert marked["average"] == 1.5
@@ -1052,7 +1069,7 @@ def _unreadable_key_config(tmp_path: Path) -> ConfigStore:
 def test_status_survives_a_config_whose_key_cannot_be_read(tmp_path: Path) -> None:
     """`status` is the FIRST thing a stuck user runs, and it used to raise.
 
-    Uncaught, the ConfigError escaped `_watermark_demo` (which only wraps
+    Uncaught, the ConfigError escaped `watermark_demo_result` (which only wraps
     returns) and surfaced as a bare ToolError — no binding facts, no demo
     stamp, nothing. `doctor` had already been hardened for exactly this on the
     grounds that a diagnostic may not decline to produce a diagnosis; `status`

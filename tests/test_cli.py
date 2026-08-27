@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import sys
-import types
 from pathlib import Path
 from typing import Any
 
@@ -111,9 +109,20 @@ def test_run_mcp_server_configures_http_transport_on_fastmcp_init(
         def run(self, **kwargs: Any) -> None:
             captured["run_kwargs"] = kwargs
 
-    fake_fastmcp_module = types.ModuleType("mcp.server.fastmcp")
-    fake_fastmcp_module.FastMCP = FakeFastMCP
-    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_fastmcp_module)
+        def add_prompt(self, prompt: Any) -> None:
+            # Prompts are registered on the same object as tools. A fake that
+            # cannot hold one is no longer a fake of FastMCP — it fails with an
+            # AttributeError from inside `register_prompts`, which reads as a
+            # bug in the code under test. What prompts CONTAIN is asserted
+            # against the real server in `test_prompts.py`; here they only have
+            # to be accepted.
+            pass
+
+    # Patch the ATTRIBUTE, not the whole module: `run_mcp_server` reads
+    # `FastMCP` at call time, and replacing `mcp.server.fastmcp` wholesale left
+    # it a non-package, so any sibling the code imports (`prompts.base`) became
+    # unimportable while the stub was in place.
+    monkeypatch.setattr("mcp.server.fastmcp.FastMCP", FakeFastMCP)
 
     import uvicorn
 
@@ -326,3 +335,179 @@ def test_bind_can_always_render_a_qr_code(capsys: pytest.CaptureFixture[str]) ->
     assert "install the qr extra" not in out
     # print_ascii uses half-block glyphs; any of them means a real code was drawn.
     assert any(ch in out for ch in "▀▄█"), "no QR was rendered"
+
+
+# ── Demo watermark on the CLI exit (2026-08-27) ─────────────────────────────
+#
+# The MCP exit has carried the synthetic-data stamp since demo mode shipped; the
+# CLI exit did not, and the CLI is the one whose output gets redirected into a
+# file, pasted into an issue, or handed to a second agent. These assert the
+# CLI half of Invariant 61 (demo-is-a-boundary-not-a-flag).
+
+
+def _data_subcommands() -> list[str]:
+    """Every subcommand that emits health data, derived from the parser.
+
+    Keyed off `--output`, which is exactly the set that goes through
+    `_emit_decrypted` — control subcommands (`init` / `bind` / `poll` /
+    `status` / `doctor` / `serve`) have no such flag. Derived rather than typed
+    out so a data subcommand written next is covered on the day it is written,
+    not on the day someone notices. `_read_tool_names` in `test_demo.py` exists
+    for the same reason on the MCP side.
+    """
+
+    parser = cli.build_parser()
+    action = next(a for a in parser._subparsers._group_actions if hasattr(a, "choices"))
+    return sorted(
+        name
+        for name, sub in action.choices.items()
+        if any("--output" in act.option_strings for act in sub._actions)
+    )
+
+
+@pytest.fixture
+def demo_cli(monkeypatch: Any) -> None:
+    """Demo mode on, memoized dataset dropped — mirrors `test_demo.py::demo_on`."""
+
+    import vaultbeat_mcp_local.demo as demo_module
+
+    monkeypatch.setenv(demo_module.DEMO_ENV, "1")
+    demo_module.reset_cache()
+
+
+def _stdout_payload(out: str) -> list[tuple[str, Any]]:
+    """Parse the JSON document out of stdout, preserving key order.
+
+    `menstrual` / `notes` / `symptoms` print a prose sensitivity note ahead of
+    the payload, so stdout is not a bare JSON document for those three — a
+    pre-existing wart this change neither introduces nor fixes. Slicing from the
+    first brace is what the existing subcommand tests already do.
+    """
+
+    return json.loads(out[out.index("{"):], object_pairs_hook=list)
+
+
+@pytest.mark.parametrize("subcommand", _data_subcommands())
+def test_every_data_subcommand_leads_its_payload_with_the_warning(
+    subcommand: str, tmp_path: Path, capsys: Any, demo_cli: None
+) -> None:
+    """`demo_warning` must be the FIRST key of what the CLI prints.
+
+    First key, not merely present: `demo_mode: true` is a flag a reader has to
+    already know to look for, while the banner is a sentence that acts on one
+    who does not — and this payload's likeliest reader is a diff, an issue
+    comment or another agent, none of which was told what it is looking at.
+
+    Asserted on the serialised text via `object_pairs_hook`, never on a dict:
+    a dict is an intermediate nobody outside this process sees, and the thing
+    under test is precisely that `_health_json` stops sorting keys once the
+    payload is stamped (sorted, `count` wins and the banner lands mid-document,
+    behind an array long enough for a truncated paste to lose it).
+    """
+
+    assert cli.main(["--config", str(tmp_path / "config.json"), subcommand, "--limit", "2"]) == 0
+
+    pairs = _stdout_payload(capsys.readouterr().out)
+    assert pairs[0][0] == "demo_warning", f"{subcommand}: first key was {pairs[0][0]!r}"
+    assert str(pairs[0][1]).startswith("[SYNTHETIC DEMO DATA]")
+    assert dict(pairs)["demo_mode"] is True
+
+
+@pytest.mark.parametrize("subcommand", _data_subcommands())
+def test_every_data_subcommand_stamps_the_output_file_too(
+    subcommand: str, tmp_path: Path, capsys: Any, demo_cli: None
+) -> None:
+    """`--output` is the branch that matters most and the easier one to forget.
+
+    A file outlives the session that could have explained it, which is the whole
+    case Invariant 61 exists for. It used to be a second `json.dumps` in a
+    second function, so the stamp would have had to be remembered twice.
+    """
+
+    out_path = tmp_path / f"{subcommand}.json"
+    args = ["--config", str(tmp_path / "config.json"), subcommand, "--limit", "2", "--output", str(out_path)]
+    assert cli.main(args) == 0
+
+    pairs = json.loads(out_path.read_text(encoding="utf-8"), object_pairs_hook=list)
+    assert pairs[0][0] == "demo_warning", f"{subcommand}: file led with {pairs[0][0]!r}"
+
+    # And the sentence about the file must not claim a decryption that never
+    # happened — telling an operator to treat synthetic output as sensitive is
+    # the same defect pointing the other way.
+    printed = capsys.readouterr().out
+    assert "SYNTHETIC" in printed
+    assert "DECRYPTED" not in printed
+
+
+def test_the_banner_line_goes_to_stderr_so_stdout_stays_a_json_document(
+    tmp_path: Path, capsys: Any, demo_cli: None
+) -> None:
+    """Two markers, two channels, on purpose.
+
+    stdout carries the in-band stamp because that is what survives `> out.json`;
+    stderr carries the human sentence because a person with a terminal in front
+    of them will not notice a key in the middle of 200 lines. Printing the
+    sentence to stdout instead would break every consumer that parses this —
+    `doctor` may print `[DEMO]` to stdout only because its human rendering is
+    not JSON.
+    """
+
+    assert cli.main(["--config", str(tmp_path / "config.json"), "activity", "--limit", "1"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out.lstrip().startswith("{")
+    json.loads(captured.out)  # must parse whole, with nothing prepended
+    assert captured.err.startswith("[SYNTHETIC DEMO DATA]")
+
+
+def test_demo_output_is_byte_identical_across_runs(
+    tmp_path: Path, capsys: Any, demo_cli: None
+) -> None:
+    """Dropping `sort_keys` for stamped payloads must not cost determinism.
+
+    Sorting bought stability of key order across future code EDITS, which is
+    worth something for a real export used as a diff baseline; run-to-run
+    identity comes from the seeded generator and fixed dict construction, and is
+    what makes two people comparing a demo payload in a bug report meaningful.
+    That is the property being traded away, and this is the one being kept.
+    """
+
+    argv = ["--config", str(tmp_path / "config.json"), "sleep", "--limit", "5"]
+    assert cli.main(argv) == 0
+    first = capsys.readouterr().out
+    assert cli.main(argv) == 0
+    assert capsys.readouterr().out == first
+
+
+def test_a_real_run_is_untouched_by_any_of_this(
+    monkeypatch: Any, tmp_path: Path, capsys: Any
+) -> None:
+    """No stamp, keys still sorted, and the file sentence unchanged.
+
+    The inverse failure is quieter than the one this change fixes but no more
+    acceptable: labelling a real reading synthetic would teach a user to ignore
+    the label that matters.
+    """
+
+    async def fake_summary(
+        self: VaultbeatLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
+    ) -> dict[str, Any]:
+        return {"zulu": 1, "alpha": 2, "rows": [{"a": 1}], "errors": []}
+
+    monkeypatch.setattr(VaultbeatLocalService, "water_intake_summary", fake_summary)
+    out_path = tmp_path / "real.json"
+    args = ["--config", str(tmp_path / "config.json"), "water", "--output", str(out_path)]
+    assert cli.main(args) == 0
+
+    text = out_path.read_text(encoding="utf-8")
+    # `object_pairs_hook` recurses, so it is used only for the ordering check —
+    # reading a nested row out of it would compare a list of pairs to a dict.
+    order = [key for key, _ in json.loads(text, object_pairs_hook=list)]
+    assert order == ["alpha", "errors", "rows", "zulu"], "keys must stay sorted"
+    written = json.loads(text)
+    assert "demo_warning" not in written
+    assert written["rows"] == [{"a": 1}], "rows must not gain `synthetic`"
+
+    captured = capsys.readouterr()
+    assert "DECRYPTED" in captured.out and "SYNTHETIC" not in captured.out
+    assert captured.err == "", "no banner on a real run"

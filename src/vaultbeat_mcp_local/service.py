@@ -1352,6 +1352,166 @@ def _attach_owner_guard(
     return summary
 
 
+# ---------------------------------------------------------------------------
+# Coverage (Invariant 62 (coverage-before-average), generalised from hourly
+# buckets to calendar days across every read tool).
+# ---------------------------------------------------------------------------
+
+_COVERAGE_DATE_KEYS = ("local_date", "day", "date")
+
+# A bare local calendar day, already in the caller's timezone. It must NOT be
+# round-tripped through `_local_date_fields`: that function reads its input as a
+# UTC instant, so "2026-08-27" becomes 2026-08-27T00:00Z and lands on the 26th
+# for every negative-offset timezone.
+#
+# ⚠️ This branch applies to `local_date` FIRST, not only to the hand-built rows.
+# `_local_date_fields` emits `local_date` as a bare day, so every row that came
+# from a `to_dict()` hits this line too — skipping the reparse is what keeps
+# coverage agreeing with the day printed in the row beside it, rather than one
+# day earlier. (`basal_energy_records.daily` / `total_energy_burned.days` under
+# "day" and sleep's `daily_summary` under "date" have no `local_date` at all, so
+# for those it is the only handling there is.)
+#
+# ⚠️ Removing it is INVISIBLE from Shanghai and from Lisbon — verified by
+# deleting it and running the suite under three zones: Asia/Shanghai and
+# Europe/Lisbon stay green, America/New_York fails three tests. Both zones this
+# household will ever develop in are non-negative, so the guard test below pins
+# a negative one explicitly instead of trusting the machine it runs on.
+_BARE_DAY_LENGTH = 10
+
+_COVERAGE_NOTE = (
+    "How much data this answer rests on. `days_covered` is the number of DISTINCT "
+    "local calendar days present in the rows this result reports — NOT the length of "
+    "any list, which `limit` has already cut. Quote it beside any average, trend or "
+    "comparison drawn from this result: an average over 3 days and one over 30 are "
+    "the same shape and the same number of digits, and only this field tells them "
+    "apart. `rows_counted` is how many rows those days came from — when it exceeds "
+    "`days_covered` the rows are intra-day samples, not days. `span_days` is the "
+    "inclusive first_day..last_day distance, so days_covered=12 with span_days=200 "
+    "is a sparse history and not a fortnight. `days_missing_in_span` counts days "
+    "inside that span with no row here; a missing day means EITHER nothing was "
+    "recorded, OR `requested_unit` is not \"days\" and the limit cut those rows off — "
+    "it NEVER means nothing happened. `window_satisfied` is false when fewer rows "
+    "than requested came back, which usually means that is all the history this "
+    "server holds (a freshly paired server is still sealing its copy, so re-check "
+    "after a re-sync rather than concluding the data does not exist); it is null "
+    "when no limit was requested. None of these fields is a quality judgement — "
+    "sparse is normal for kinds the Watch only measures occasionally."
+)
+
+
+def _coverage_day_of(row: Any) -> str | None:
+    """The LOCAL calendar day one returned row belongs to, or None.
+
+    Reads the row as it will be serialised rather than the typed object behind
+    it, so coverage can never describe a different set than the numbers printed
+    next to it: every `to_dict()` in this module emits `local_date`, and the
+    three hand-built row shapes (basal `daily`, TDEE `days`, sleep
+    `daily_summary`) carry a bare local day under "day" / "date".
+
+    Both of those are ALREADY local days, which is why the bare-day branch below
+    fires for the common case too and not just the hand-built rows — see the
+    `_BARE_DAY_LENGTH` comment for what reparsing them would cost. Anything
+    unparseable costs that one row its place in the count instead of failing the
+    read, matching `_cut_newest_by`.
+    """
+
+    if not isinstance(row, dict):
+        return None
+    for key in _COVERAGE_DATE_KEYS:
+        value = row.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        if len(value) == _BARE_DAY_LENGTH and value[4] == "-" and value[7] == "-":
+            return value
+        local = _local_date_fields(value).get("local_date")
+        if isinstance(local, str):
+            return local
+    return None
+
+
+def _attach_coverage(
+    summary: dict[str, Any],
+    *,
+    # `Any`, not `Iterable[Any]`: the call sites pass `summary["records"]` and
+    # friends out of heterogeneous dict literals, which mypy infers as `object`.
+    # Tightening this annotation costs eight `cast`s and buys no safety — the
+    # body already tolerates any iterable and any row shape.
+    rows: Any,
+    requested: int | None,
+    unit: str,
+    cut_count: int | None = None,
+) -> dict[str, Any]:
+    """Attach a `coverage` block stating how many days this result rests on.
+
+    ADD-ONLY: introduces one new top-level key and never reads, edits or removes
+    an existing field — the same discipline `_attach_errors` /
+    `_attach_owner_guard` / mcp_server's `_annotate_if_empty` follow, because
+    payload shape is the one contract layer no server can validate.
+
+    Why it exists: a read tool returns records and aggregates, and an agent that
+    wants to say "this is based on 3 days" has nothing to read — the array
+    length has already been cut by `limit` (Invariant 38), so counting it is
+    wrong, and there is no other signal. That is the missing half of the
+    2026-08-02 harm: the statistics were wrong, but what let a wrong statistic
+    be acted on the same afternoon is that "how many points is this?" never
+    appeared beside the answer. This cannot stop an agent reasoning badly; it
+    gives a careful one something to cite.
+
+    *rows* must be the set the summary's own aggregates are computed over — for
+    every tool here that is also the set it returns, except
+    `basal_energy_records`, whose `daily` list is display-capped by `day_limit`
+    while its average is not (the sibling bug in Invariant 62). Pass the
+    uncapped list there.
+
+    *cut_count* overrides what `window_satisfied` compares against. It defaults
+    to the row count, which is the honest denominator almost everywhere: when a
+    summary dedups after the cut (water/weight/menstrual by dayID, symptom by
+    day_id, strength/food by entry_id) the rows that survive ARE how many days
+    the caller actually got, and comparing the pre-dedup count instead would
+    answer "yes you got your 10 days" to a read holding 5. Erring toward
+    `False` is the safe direction for a field whose whole job is to stop an
+    answer being over-trusted. Only two readers override it, both because the
+    row count answers a different question than the limit asked: `notes_summary`
+    (`target_kind` discards kinds the caller did not ask for, which is not
+    scarcity) and `basal_energy_records` (`limit` caps SAMPLES while the rows
+    are days).
+    """
+
+    # Materialised up front: `rows` is iterated twice below, and a caller passing
+    # a generator would otherwise get days from the first pass and rows_counted=0
+    # from the second — a coverage block that contradicts itself.
+    row_list = list(rows)
+    days = sorted({d for d in (_coverage_day_of(row) for row in row_list) if d})
+    first_day = days[0] if days else None
+    last_day = days[-1] if days else None
+
+    span_days: int | None = None
+    missing: int | None = None
+    if first_day is not None and last_day is not None:
+        try:
+            span_days = (date.fromisoformat(last_day) - date.fromisoformat(first_day)).days + 1
+        except ValueError:  # a row carried a day-shaped string that is not a day
+            span_days = None
+        if span_days is not None:
+            missing = max(span_days - len(days), 0)
+
+    counted = cut_count if cut_count is not None else len(row_list)
+    summary["coverage"] = {
+        "days_covered": len(days),
+        "first_day": first_day,
+        "last_day": last_day,
+        "span_days": span_days,
+        "days_missing_in_span": missing,
+        "rows_counted": counted,
+        "requested": requested,
+        "requested_unit": unit,
+        "window_satisfied": None if requested is None else counted >= requested,
+        "note": _COVERAGE_NOTE,
+    }
+    return summary
+
+
 def _merge_food_meals(
     existing: list[dict[str, Any]], new: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -2831,6 +2991,10 @@ class VaultbeatLocalService:
             "sessions": sessions,
             "count": len(sessions),
         }
+        # Coverage counts NIGHTS, not blobs: `sessions` holds 2-3 blobs per night
+        # (Watch stages + iPhone inBed + possibly OtterLife), so `count` above is
+        # not a number of nights and must never be read as one.
+        _attach_coverage(summary, rows=daily_summary, requested=limit, unit="nights")
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3074,6 +3238,7 @@ class VaultbeatLocalService:
             # fresh=True chasing a sync problem that does not exist.
             "timeline_included": include_timeline,
         }
+        _attach_coverage(summary, rows=result_nights, requested=limit, unit="nights")
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3097,6 +3262,9 @@ class VaultbeatLocalService:
         if limit is not None:
             days = days[:limit]
         summary = summarize_water_intake(days)
+        # From the summary's OWN rows, not from `days`: summarize_water_intake
+        # dedups by dayID, so len(days) can exceed what the average divides by.
+        _attach_coverage(summary, rows=summary["days"], requested=limit, unit="days")
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3129,6 +3297,10 @@ class VaultbeatLocalService:
         if limit is not None:
             days = days[:limit]
         summary = summarize_weight_trend(days, goal_kg=goal_kg)
+        # The trend line and `weekly_change_kg` are fitted over these rows, so
+        # coverage has to describe the same set — two weigh-ins 40 days apart and
+        # 40 daily ones produce an identically-shaped slope.
+        _attach_coverage(summary, rows=summary["days"], requested=limit, unit="days")
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3165,6 +3337,7 @@ class VaultbeatLocalService:
         menstrual_owners = {d.owner_user_id for d in days if d.owner_user_id}
         wrist_readings = await self._wrist_readings_for_owner(menstrual_owners, errors, fresh=fresh)
         summary = summarize_menstrual_cycle(days, wrist_readings=wrist_readings)
+        _attach_coverage(summary, rows=summary["days"], requested=limit, unit="days")
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3217,6 +3390,7 @@ class VaultbeatLocalService:
         if limit is not None:
             days = days[:limit]
         summary = {"days": [d.to_dict() for d in days], "count": len(days)}
+        _attach_coverage(summary, rows=summary["days"], requested=limit, unit="days")
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3243,6 +3417,10 @@ class VaultbeatLocalService:
             "count": len(hr_records),
             "average_bpm": round(average_bpm, 1) if average_bpm is not None else None,
         }
+        # `limit` counts SAMPLES here, so days_covered can be far below it without
+        # anything being missing — `requested_unit` is what stops that reading as
+        # a gap.
+        _attach_coverage(summary, rows=summary["records"], requested=limit, unit="samples")
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3268,6 +3446,7 @@ class VaultbeatLocalService:
             "count": len(workouts),
             "total_duration_hours": round(total_duration / 3600, 2),
         }
+        _attach_coverage(summary, rows=summary["workouts"], requested=limit, unit="workouts")
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3293,6 +3472,7 @@ class VaultbeatLocalService:
             "count": len(days),
             "total_minutes": round(total_minutes, 1),
         }
+        _attach_coverage(summary, rows=summary["days"], requested=limit, unit="days")
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3319,6 +3499,10 @@ class VaultbeatLocalService:
             "count": len(hrv_list),
             "average_sdnn_ms": round(average_sdnn, 1) if average_sdnn is not None else None,
         }
+        # The headline case for this whole field: "average HRV" over 3 days and over
+        # 30 days are the same number of digits, and `limit` counts samples, so a
+        # 100-sample read can be a single night.
+        _attach_coverage(summary, rows=summary["records"], requested=limit, unit="samples")
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3371,6 +3555,9 @@ class VaultbeatLocalService:
             "total_sample_count": total_weight,
             "average_sdnn_ms": round(average, 1) if average is not None else None,
         }
+        _attach_coverage(
+            summary, rows=summary["records"], requested=limit, unit="hourly buckets"
+        )
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3397,6 +3584,7 @@ class VaultbeatLocalService:
             "count": len(temp_list),
             "average_delta_celsius": round(average_delta, 2) if average_delta is not None else None,
         }
+        _attach_coverage(summary, rows=summary["records"], requested=limit, unit="samples")
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3521,6 +3709,15 @@ class VaultbeatLocalService:
             ),
             "daily": daily if day_limit is None else daily[:day_limit],
         }
+        # `daily` above is DISPLAY-capped by `day_limit` while `average_over_days`
+        # is not, so coverage is computed over the uncapped list — the set the
+        # averages actually rest on. Reading the capped list here would repeat the
+        # sibling bug in Invariant 62, where consuming a display cap as if it were
+        # the data reported 60 present days as missing.
+        # `requested`/`cut_count` describe `limit`, which caps SAMPLES, not days.
+        _attach_coverage(
+            summary, rows=daily, requested=limit, unit="samples", cut_count=len(parsed)
+        )
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3652,7 +3849,7 @@ class VaultbeatLocalService:
             else None
         )
 
-        return {
+        summary: dict[str, Any] = {
             "days_returned": len(out),
             "average_tdee_kcal": avg_tdee,
             "average_day_count": len(totals_with_basal),
@@ -3670,6 +3867,14 @@ class VaultbeatLocalService:
             "basal_errors": basal.get("errors", []),
             "activity_errors": activity.get("errors", []),
         }
+        # The one reader whose parameter really is a WINDOW: `days=90` asks for 90
+        # days. But `all_days` above takes the newest N days THAT HAVE DATA, so 90
+        # rows can span seven months — `span_days` is what tells those apart, and
+        # `window_satisfied=false` says the history is shorter than the question.
+        # Note this counts days with ANY data; `average_day_count` (fewer) is the
+        # divisor, and `average_excluded_days` says which ones dropped out.
+        _attach_coverage(summary, rows=out, requested=days, unit="days")
+        return summary
 
     async def vo2max_records(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent VO2Max samples with a peak / trough summary.
@@ -3709,6 +3914,10 @@ class VaultbeatLocalService:
             "trough_ml_kg_min": round(trough, 1) if trough is not None else None,
             "average_ml_kg_min": round(average, 1) if average is not None else None,
         }
+        # VO2Max is measured only during outdoor brisk bouts, so a wide span with
+        # few days is NORMAL here rather than a sync failure — which is exactly
+        # why the span has to be visible next to `peak` and `trough`.
+        _attach_coverage(summary, rows=summary["records"], requested=limit, unit="samples")
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3733,6 +3942,17 @@ class VaultbeatLocalService:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
         days = _cut_newest_by(days, limit, key=lambda d: d.day_start_date)
         summary = summarize_symptoms(days)
+        # Rows live one level down, grouped per owner. Flattened here so coverage
+        # describes the days actually reported, which after the per-owner dedup is
+        # also what `window_satisfied` should be measured against.
+        # ⚠️ With both partners tracking, the span blends two people — read it
+        # alongside each owner's own `day_count`.
+        _attach_coverage(
+            summary,
+            rows=[d for o in summary["owners"] for d in o["days"]],
+            requested=limit,
+            unit="days",
+        )
         return _attach_errors(summary, errors)
 
     async def notes_summary(
@@ -3762,6 +3982,17 @@ class VaultbeatLocalService:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
         notes = _cut_newest_by(notes, limit, key=lambda n: n.target_date)
         summary = summarize_notes(notes, target_kind=target_kind)
+        # `target_kind` filters AFTER the cut, so the returned rows can be far
+        # fewer than `limit` for a query that asked for one kind out of several.
+        # `cut_count` is the pre-filter count, or asking for cycle notes only
+        # would report "not enough data" every time.
+        _attach_coverage(
+            summary,
+            rows=[n for k in summary["kinds"] for n in k["notes"]],
+            requested=limit,
+            unit="notes",
+            cut_count=len(notes),
+        )
         return _attach_errors(summary, errors)
 
     async def strength_summary(
@@ -3788,6 +4019,17 @@ class VaultbeatLocalService:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
         entries = _cut_newest_by(entries, limit, key=lambda e: e.date)
         summary = summarize_strength(entries, limit_days=limit_days)
+        # Two caps stack: `limit` cuts blobs, then `limit_days` cuts sessions after
+        # dedup — report whichever is binding. Coverage counts the sessions the
+        # summary actually returned, so a `limit` of 20 blobs that dedups to 18
+        # sessions reports 18 and window_satisfied=False rather than claiming the
+        # window was met.
+        _attach_coverage(
+            summary,
+            rows=summary["sessions"],
+            requested=limit_days if limit_days is not None else limit,
+            unit="sessions",
+        )
         return _attach_errors(summary, errors)
 
     async def log_strength_entry(
@@ -3987,6 +4229,13 @@ class VaultbeatLocalService:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
         entries = _cut_newest_by(entries, limit, key=lambda e: e.date)
         summary = summarize_food(entries, limit_days=limit_days)
+        # Same double cap as strength_summary — see the note there.
+        _attach_coverage(
+            summary,
+            rows=summary["days"],
+            requested=limit_days if limit_days is not None else limit,
+            unit="days",
+        )
         return _attach_errors(summary, errors)
 
     async def log_food_entry(
