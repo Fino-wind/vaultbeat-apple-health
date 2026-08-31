@@ -36,7 +36,7 @@ PAIRING_GUIDANCE = (
     "Pairing needs the free Vaultbeat iOS app on an iPhone — the app is where "
     "the health data comes from, and scanning a QR code with it is the only "
     f"way to authorize this server. Install it from {APP_STORE_URL}, then run "
-    "`uvx vaultbeat-mcp@latest bind` in a real terminal and scan the QR it "
+    "`uvx vaultbeat-apple-health@latest bind` in a real terminal and scan the QR it "
     "prints (in the app: Settings → Data & AI → Connect an AI server). The "
     "`vaultbeat_start_binding` / `vaultbeat_poll_binding` tools do the same, "
     "but a QR relayed through an agent's output often does not render — the "

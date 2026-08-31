@@ -42,7 +42,7 @@ def test_it_forbids_the_specific_false_claim_that_was_observed() -> None:
 
 def test_it_names_the_action_that_always_works() -> None:
     """A warning with no exit turns into "so what do I do" one turn later."""
-    assert "uvx vaultbeat-mcp@latest bind" in _QR_RELAY_WARNING
+    assert "uvx vaultbeat-apple-health@latest bind" in _QR_RELAY_WARNING
     assert "real terminal" in _QR_RELAY_WARNING
 
 
