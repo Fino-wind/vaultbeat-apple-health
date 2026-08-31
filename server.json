@@ -3,15 +3,15 @@
   "name": "io.github.Fino-wind/vaultbeat-apple-health",
   "description": "Your AI agent reads your Apple Health data: sleep, HRV, cycle, workouts. Decrypted on your machine",
   "repository": {
-    "url": "https://github.com/Fino-wind/vaultbeat-mcp",
+    "url": "https://github.com/Fino-wind/vaultbeat-apple-health",
     "source": "github"
   },
-  "version": "0.6.3",
+  "version": "0.6.4",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "vaultbeat-apple-health",
-      "version": "0.6.3",
+      "version": "0.6.4",
       "transport": {
         "type": "stdio"
       }
