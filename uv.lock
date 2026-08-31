@@ -1051,8 +1051,8 @@ wheels = [
 ]
 
 [[package]]
-name = "vaultbeat-mcp"
-version = "0.3.10"
+name = "vaultbeat-apple-health"
+version = "0.6.2"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

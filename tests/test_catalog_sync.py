@@ -336,7 +336,7 @@ def test_doctor_flags_an_outdated_client(tmp_path: Path, monkeypatch) -> None:
     assert "999.0.0 available" in check["detail"]
     # The remedy must be in the hint — a user told "you are behind" with no
     # command to run learns nothing actionable.
-    assert "uvx --refresh vaultbeat-mcp" in check["hint"]
+    assert "uvx --refresh vaultbeat-apple-health" in check["hint"]
 
 
 def test_doctor_passes_when_client_is_current(tmp_path: Path, monkeypatch) -> None:

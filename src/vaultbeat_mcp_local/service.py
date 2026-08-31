@@ -2433,7 +2433,7 @@ class VaultbeatLocalService:
         if not config or not config.poll_id:
             raise RuntimeError(
                 "No active binding session; call `vaultbeat_start_binding` first, then "
-                "`vaultbeat_poll_binding` (CLI equivalent: `vaultbeat-mcp bind`)"
+                "`vaultbeat_poll_binding` (CLI equivalent: `vaultbeat-apple-health bind`)"
             )
 
         result = await self._client(config).poll_binding(config.poll_id)
@@ -4136,7 +4136,7 @@ class VaultbeatLocalService:
                 # was never broken. `vaultbeat-mcp-local` is the back-compat alias;
                 # `vaultbeat-mcp` is the real console script (see pyproject.toml).
                 "Re-pair with `vaultbeat_start_binding`, then `vaultbeat_poll_binding` "
-                "(CLI equivalent: `vaultbeat-mcp bind`)."
+                "(CLI equivalent: `vaultbeat-apple-health bind`)."
             )
 
         existing_summary = await self.strength_summary(fresh=True)
@@ -4335,7 +4335,7 @@ class VaultbeatLocalService:
                 # was never broken. `vaultbeat-mcp-local` is the back-compat alias;
                 # `vaultbeat-mcp` is the real console script (see pyproject.toml).
                 "Re-pair with `vaultbeat_start_binding`, then `vaultbeat_poll_binding` "
-                "(CLI equivalent: `vaultbeat-mcp bind`)."
+                "(CLI equivalent: `vaultbeat-apple-health bind`)."
             )
 
         existing_summary = await self.food_summary(fresh=True)
@@ -4493,7 +4493,7 @@ class VaultbeatLocalService:
                 # was never broken. `vaultbeat-mcp-local` is the back-compat alias;
                 # `vaultbeat-mcp` is the real console script (see pyproject.toml).
                 "Re-pair with `vaultbeat_start_binding`, then `vaultbeat_poll_binding` "
-                "(CLI equivalent: `vaultbeat-mcp bind`)."
+                "(CLI equivalent: `vaultbeat-apple-health bind`)."
             )
 
         if weight_kg <= 0 or weight_kg > 500:
@@ -4686,7 +4686,7 @@ class VaultbeatLocalService:
                 # was never broken. `vaultbeat-mcp-local` is the back-compat alias;
                 # `vaultbeat-mcp` is the real console script (see pyproject.toml).
                 "Re-pair with `vaultbeat_start_binding`, then `vaultbeat_poll_binding` "
-                "(CLI equivalent: `vaultbeat-mcp bind`)."
+                "(CLI equivalent: `vaultbeat-apple-health bind`)."
             )
 
         # Upsert key: an existing agent-authored note for the same (kind, day).
@@ -5029,7 +5029,7 @@ class VaultbeatLocalService:
         if not config:
             add(
                 "config", False, f"no config at {self.store.path}",
-                hint="Run `vaultbeat-mcp bind` to initialize and pair with the iOS app.",
+                hint="Run `vaultbeat-apple-health bind` to initialize and pair with the iOS app.",
             )
             # `scope` rides even the earliest bail-out: "no config" is exactly
             # when a reader is most likely to start hunting on the client side,
@@ -5040,7 +5040,7 @@ class VaultbeatLocalService:
         add(
             "identity_key", bool(config.private_key_base64),
             "private key present" if config.private_key_base64 else "private key missing",
-            hint="The Keychain entry is gone or unreadable. Re-run `vaultbeat-mcp bind` to mint a fresh identity.",
+            hint="The Keychain entry is gone or unreadable. Re-run `vaultbeat-apple-health bind` to mint a fresh identity.",
         )
 
         reachable, probe_detail = self._probe_cloud(config.api_base_url)
@@ -5053,7 +5053,7 @@ class VaultbeatLocalService:
         add(
             "bound", config.is_bound,
             f"server_id={config.server_id}" if config.is_bound else "not bound to an iOS app",
-            hint="Run `vaultbeat-mcp bind`, then scan the QR with Vaultbeat on iOS "
+            hint="Run `vaultbeat-apple-health bind`, then scan the QR with Vaultbeat on iOS "
             "(Settings → Data & AI → Connect an AI server). Codes expire after 10 minutes — "
             "if the phone scanned but this side stayed pending, re-run bind for a fresh code.",
         )
@@ -5107,7 +5107,7 @@ class VaultbeatLocalService:
                         # HealthKit, symptoms ≤120d) or already deleted from
                         # HealthKit. Two different mechanisms, opposite answers.
                         hint="The stored key can no longer decrypt your data. Re-run "
-                        "`vaultbeat-mcp bind` first — it re-binds this machine in place and "
+                        "`vaultbeat-apple-health bind` first — it re-binds this machine in place and "
                         "keeps everything already encrypted for it. Deleting the server in "
                         "the iOS app also works, but costs history: it destroys those keys, "
                         "and re-binding afterwards only re-seals what the phone can still "
@@ -5145,7 +5145,7 @@ class VaultbeatLocalService:
                     # present concludes the diagnosis is wrong — so lead with
                     # the fix that covers both causes.
                     hint="The server token is no longer accepted. Re-run "
-                    "`vaultbeat-mcp bind` — this is expected if you bound this machine "
+                    "`vaultbeat-apple-health bind` — this is expected if you bound this machine "
                     "again since, which replaces the old token. The server still being "
                     "listed in the iOS app does not rule this out. If binding does not "
                     "fix it, check the server is still listed (Settings → Data & AI → "
@@ -5158,7 +5158,7 @@ class VaultbeatLocalService:
             latest is None or not self._version_is_older(installed, latest),
             version_note,
             hint=(
-                f"Run `uvx --refresh vaultbeat-mcp` (or `pip install -U vaultbeat-mcp`) "
+                f"Run `uvx --refresh vaultbeat-apple-health` (or `pip install -U vaultbeat-apple-health`) "
                 f"to move from {installed} to {latest}. Older clients re-download the "
                 f"entire history on every read instead of only what changed."
             ),
@@ -5194,7 +5194,7 @@ class VaultbeatLocalService:
     # If a server-driven notice is ever genuinely needed, send an ENUM, never
     # prose: `{"client_outdated": true, "min_version": "0.2.5"}` — the worst a
     # compromised backend can then do is show a false upgrade prompt.
-    _PYPI_URL = "https://pypi.org/pypi/vaultbeat-mcp/json"
+    _PYPI_URL = "https://pypi.org/pypi/vaultbeat-apple-health/json"
 
     @staticmethod
     def _version_tuple(value: str) -> tuple[int, ...]:
@@ -5389,10 +5389,10 @@ class VaultbeatLocalService:
                 ),
                 "next_step": (
                     f"Nothing to do for demo mode. To diagnose the real install, unset "
-                    f"{DEMO_ENV} and run `vaultbeat-mcp doctor`."
+                    f"{DEMO_ENV} and run `vaultbeat-apple-health doctor`."
                     if self._demo
                     else (
-                        "Run `vaultbeat-mcp doctor` for the full private-key report. "
+                        "Run `vaultbeat-apple-health doctor` for the full private-key report. "
                         "DO NOT delete the config file and DO NOT run `bind` — the key "
                         "is unreadable, not absent, and re-binding mints a new identity "
                         "that cannot decrypt anything already stored."
@@ -5415,7 +5415,7 @@ class VaultbeatLocalService:
                 "data_source": "synthetic" if self._demo else "account",
                 "next_step": (
                     "Not paired yet — this is the expected state before first use. "
-                    "Run: uvx --from 'vaultbeat-mcp[qr]@latest' vaultbeat-mcp bind "
+                    "Run: uvx --from 'vaultbeat-apple-health[qr]@latest' vaultbeat-apple-health bind "
                     "then scan the QR code in the iOS app under "
                     "Settings → Data & AI → Connect an AI server. "
                     "Requires the Vaultbeat iOS app; connecting is open on every plan."

@@ -61,7 +61,7 @@ def _warn_demo_on_stderr() -> None:
     """Put the banner beside a JSON payload that is going to stdout.
 
     stderr, not stdout, because stdout here IS a JSON document: a banner line
-    printed into it breaks `vaultbeat-mcp --demo sleep | jq` and every other
+    printed into it breaks `vaultbeat-apple-health --demo sleep | jq` and every other
     consumer that parses this output. (`doctor` can print its `[DEMO]` line to
     stdout precisely because its human rendering is not JSON.)
 
@@ -113,7 +113,7 @@ code. You cannot detect this from your side.
 So do not tell the user the QR code appeared, and do not ask them to scan
 "the code above". Tell them to run this in a real terminal themselves:
 
-    uvx vaultbeat-mcp@latest bind
+    uvx vaultbeat-apple-health@latest bind
 
 If they say they see nothing, that is the expected outcome — it is your
 rendering layer, not their mistake, and not a bug in Vaultbeat."""
@@ -154,7 +154,7 @@ def _print_qr(payload: str) -> None:
         # sending them away empty-handed.
         print("Could not render a QR code (the `qrcode` package is missing).")
         print("Scan the payload above with the Vaultbeat app, or reinstall with:")
-        print("  uvx --refresh vaultbeat-mcp bind")
+        print("  uvx --refresh vaultbeat-apple-health bind")
         return
 
     qr = qrcode.QRCode(border=2)
@@ -352,10 +352,10 @@ def handle_bind(args: argparse.Namespace) -> int:
         # possible place to get this wrong.
         print("Not scanned yet? The QR above is still good — nothing expires until")
         print("someone scans it. Scan it FIRST, then pick the pairing back up with:")
-        print("  uvx vaultbeat-mcp poll")
+        print("  uvx vaultbeat-apple-health poll")
         print()
         print("Already scanned? You have 10 minutes from the moment you scanned to")
-        print("run that same command. After that, run `uvx vaultbeat-mcp bind` for")
+        print("run that same command. After that, run `uvx vaultbeat-apple-health bind` for")
         print("a fresh code.")
         print()
         # Ordering matters and the failure is counter-intuitive: the pairing row
@@ -381,7 +381,7 @@ def handle_bind(args: argparse.Namespace) -> int:
     print("One last step — register this server with your MCP client.")
     print("For Claude Code, run:")
     print()
-    print("  claude mcp add vaultbeat-health -- uvx vaultbeat-mcp@latest serve --transport stdio")
+    print("  claude mcp add vaultbeat-health -- uvx vaultbeat-apple-health@latest serve --transport stdio")
     print()
     print("(Other clients: see https://vaultbeat.app/mcp for setup lines.)")
     # ⚠️ Informational, NOT a sales line. The acquisition copy above deliberately
@@ -636,7 +636,7 @@ def handle_serve(args: argparse.Namespace) -> int:
         config = store.load()
         stored = config.http_token if config else None
         if not stored:
-            print("No HTTP token set. Run `vaultbeat-mcp serve --generate-token` first.")
+            print("No HTTP token set. Run `vaultbeat-apple-health serve --generate-token` first.")
             return 1
         print(stored)
         return 0

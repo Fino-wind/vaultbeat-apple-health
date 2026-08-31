@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vaultbeat-apple-health"
-# ⚠️ RELEASES GO OUT FROM THE PUBLIC REPO (Fino-wind/vaultbeat-mcp), never from
+# ⚠️ RELEASES GO OUT FROM THE PUBLIC REPO (Fino-wind/vaultbeat-apple-health), never from
 # the monorepo's copy of this file. Only the public README carries the
 # `mcp-name` marker the official MCP Registry validates; the monorepo's README
 # is developer-facing and does not, so a wheel built there reaches PyPI with no
@@ -27,7 +27,7 @@ name = "vaultbeat-apple-health"
 # A comment cannot enforce this. `scripts/ci/check_mcp_registry_current.py`
 # now does, with one rule per failure above; if that guard is ever deleted,
 # this paragraph is what comes back.
-version = "0.6.2"
+version = "0.6.3"
 description = "Local MCP server for Vaultbeat — AI Health Sync: your AI agent reads your end-to-end-encrypted Apple Health data (sleep, cycle, weight, water), decrypted only on your machine"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -88,19 +88,15 @@ qr = []
 # route to the code undercuts the claim.
 [project.urls]
 Homepage = "https://vaultbeat.app"
-Repository = "https://github.com/Fino-wind/vaultbeat-mcp"
+Repository = "https://github.com/Fino-wind/vaultbeat-apple-health"
 Issues = "https://github.com/Fino-wind/vaultbeat-community/issues"
 Documentation = "https://vaultbeat.app/mcp"
 
 [project.scripts]
 # Primary name, deliberately identical to the PyPI distribution name so that
-# `uvx vaultbeat-apple-health <cmd>` resolves without --from. uvx looks for a
-# console script matching the package name; renaming the distribution without
-# adding this entry would break every command we print in the app and on the
-# site (2026-08-31: caught before publishing, not after).
+# `uvx vaultbeat-apple-health <cmd>` resolves without --from (2026-08-31 rename).
 vaultbeat-apple-health = "vaultbeat_mcp_local.cli:main"
-# Back-compat: the name this package shipped under until 0.6.1. Existing
-# installs, older docs and the app builds already in the wild still invoke it.
+# Back-compat: the name this package shipped under until 0.6.1.
 vaultbeat-mcp = "vaultbeat_mcp_local.cli:main"
 # Back-compat alias: pre-rename installs and docs invoke vaultbeat-mcp-local.
 vaultbeat-mcp-local = "vaultbeat_mcp_local.cli:main"

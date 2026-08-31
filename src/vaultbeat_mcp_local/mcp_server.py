@@ -237,7 +237,7 @@ def _annotate_if_empty(result: dict[str, Any], kind: str, rows_key: str) -> dict
             f"(2) Apple Health access for it was never granted — a read denial is "
             f"invisible to the app, so it looks identical to having no data; "
             f"recover via Settings → Data & AI → 'Apple Health access'. (3) it "
-            f"genuinely has not been recorded yet. Run `vaultbeat-mcp doctor` or "
+            f"genuinely has not been recorded yet. Run `vaultbeat-apple-health doctor` or "
             f"call the vaultbeat_doctor tool for a full report.",
         )
         return result
@@ -255,7 +255,7 @@ def _annotate_if_empty(result: dict[str, Any], kind: str, rows_key: str) -> dict
         f"granted — a read denial is invisible to the app, so this looks the same as "
         f"having no data, and the recovery path is the app's Settings → Data & AI → "
         f"'Apple Health access' row, which re-presents the permission sheet; (4) it "
-        f"genuinely has not been recorded yet. Run `vaultbeat-mcp doctor` or call the "
+        f"genuinely has not been recorded yet. Run `vaultbeat-apple-health doctor` or call the "
         f"vaultbeat_doctor tool for a full report.",
     )
     return result
@@ -916,7 +916,7 @@ def run_mcp_server(
         terminals and most agent transcripts drop the block characters it is
         drawn with, so the payload can reach you intact while their screen shows
         a blank gap — do not assert that it is there. Have them run
-        `uvx vaultbeat-mcp bind` in a real terminal instead.
+        `uvx vaultbeat-apple-health bind` in a real terminal instead.
 
         Returns `qr_payload_json` — a JSON string the AI should render as a QR code
         for the user to scan, plus `poll_id` to pass to `vaultbeat_poll_binding`.
@@ -957,7 +957,7 @@ def run_mcp_server(
                        Keep polling with short delays.
         · "bound"    — success. The server can now decrypt health data.
         · "expired"  — TERMINAL. Stop polling; no amount of retrying recovers it.
-                       Run `uvx vaultbeat-mcp bind` for a fresh QR code.
+                       Run `uvx vaultbeat-apple-health bind` for a fresh QR code.
 
         🔴 "pending" is positive evidence that nothing is wrong. The endpoint
         looks the pairing row up by pollID and answers "expired" when it is gone,
