@@ -1,9 +1,9 @@
 # Vaultbeat Local MCP Server
 
 Local service program for Vaultbeat's encrypted health-data recipient flow.
-Published externally as [`Fino-wind/vaultbeat-mcp`](https://github.com/Fino-wind/vaultbeat-mcp)
-(public package name `vaultbeat-mcp`; `vaultbeat-mcp-local` remains a back-compat console
-script). This directory is the source of truth — after any user-visible change here,
+Published externally as [`Fino-wind/vaultbeat-apple-health`](https://github.com/Fino-wind/vaultbeat-apple-health)
+(public package name `vaultbeat-apple-health` since 0.6.2; `vaultbeat-mcp` and
+`vaultbeat-mcp-local` remain back-compat console scripts). This directory is the source of truth — after any user-visible change here,
 re-export the public repo and update its README tool table + the website `/mcp` page
 (see AGENTS.md "Sync duty").
 
@@ -17,37 +17,37 @@ through either a CLI or a stdio MCP server. Read-only: data is written by the iO
 ```bash
 python -m pip install -e './mcp-local-server[qr]'
 # try every read tool against synthetic data — no pairing, no cloud, no Apple Health
-vaultbeat-mcp --demo sleep --limit 5
-vaultbeat-mcp --demo doctor
+vaultbeat-apple-health --demo sleep --limit 5
+vaultbeat-apple-health --demo doctor
 
-vaultbeat-mcp bind
-vaultbeat-mcp status
+vaultbeat-apple-health bind
+vaultbeat-apple-health status
 
 # read decrypted health data — every data subcommand accepts
 # --owner <user-id prefix> to filter to one person (omitting it mixes
 # both partners' records into one pool; aggregates become meaningless)
-vaultbeat-mcp sleep --limit 5 --owner a1a1        # sleep sessions + provenance
-vaultbeat-mcp sleep-detail --limit 1 --owner a1a1 # HR+RR+stage timeline
-vaultbeat-mcp water --limit 30 --owner a1a1       # water intake + daily average
-vaultbeat-mcp weight --limit 90 --owner b2b2      # weight trend (latest/avg/weekly rate)
-vaultbeat-mcp menstrual --limit 60 --owner b2b2   # menstrual cycle (sensitive)
-vaultbeat-mcp activity --limit 30 --owner a1a1    # daily activity rings
-vaultbeat-mcp resting-hr --limit 30 --owner a1a1  # resting heart rate
-vaultbeat-mcp workouts --limit 20 --owner a1a1    # workout records
-vaultbeat-mcp mindfulness --limit 30 --owner a1a1 # mindful minutes
-vaultbeat-mcp hrv --limit 30 --owner a1a1         # HRV / SDNN (hourly buckets by default; --granularity raw for per-sample)
-vaultbeat-mcp wrist-temp --limit 30 --owner a1a1  # sleeping wrist temperature
-vaultbeat-mcp symptoms --limit 30                 # symptom days (grouped by owner)
-vaultbeat-mcp notes --kind sleep --limit 30       # free-text day annotations
+vaultbeat-apple-health sleep --limit 5 --owner a1a1        # sleep sessions + provenance
+vaultbeat-apple-health sleep-detail --limit 1 --owner a1a1 # HR+RR+stage timeline
+vaultbeat-apple-health water --limit 30 --owner a1a1       # water intake + daily average
+vaultbeat-apple-health weight --limit 90 --owner b2b2      # weight trend (latest/avg/weekly rate)
+vaultbeat-apple-health menstrual --limit 60 --owner b2b2   # menstrual cycle (sensitive)
+vaultbeat-apple-health activity --limit 30 --owner a1a1    # daily activity rings
+vaultbeat-apple-health resting-hr --limit 30 --owner a1a1  # resting heart rate
+vaultbeat-apple-health workouts --limit 20 --owner a1a1    # workout records
+vaultbeat-apple-health mindfulness --limit 30 --owner a1a1 # mindful minutes
+vaultbeat-apple-health hrv --limit 30 --owner a1a1         # HRV / SDNN (hourly buckets by default; --granularity raw for per-sample)
+vaultbeat-apple-health wrist-temp --limit 30 --owner a1a1  # sleeping wrist temperature
+vaultbeat-apple-health symptoms --limit 30                 # symptom days (grouped by owner)
+vaultbeat-apple-health notes --kind sleep --limit 30       # free-text day annotations
 
 # run as an MCP server
-vaultbeat-mcp serve --transport stdio
-vaultbeat-mcp serve --transport http --host 127.0.0.1 --port 8000 --path /mcp
-vaultbeat-mcp --demo serve --transport stdio   # same synthetic dataset, wired into a client
+vaultbeat-apple-health serve --transport stdio
+vaultbeat-apple-health serve --transport http --host 127.0.0.1 --port 8000 --path /mcp
+vaultbeat-apple-health --demo serve --transport stdio   # same synthetic dataset, wired into a client
 ```
 
 `--demo` is a **global flag**, not a subcommand: it goes before the subcommand
-(`vaultbeat-mcp --demo sleep`), and `VAULTBEAT_DEMO=1` does the same thing. It serves a
+(`vaultbeat-apple-health --demo sleep`), and `VAULTBEAT_DEMO=1` does the same thing. It serves a
 deterministic synthetic dataset — the same records on every machine, every run — so demo
 output can be pasted into a bug report as a shared baseline. Nothing is fetched and nothing
 is decrypted; there is no private key involved at all. Every payload carries `demo_mode:
@@ -107,7 +107,7 @@ below). Binding a non-loopback address fails closed unless you pass both a token
 
 ## Binding Flow
 
-1. `vaultbeat-mcp bind` generates a fresh `pollID` and prints a QR payload:
+1. `vaultbeat-apple-health bind` generates a fresh `pollID` and prints a QR payload:
    `{"pollID":"...","publicKeyBase64":"...","serverName":"..."}`
 2. The iOS app scans that payload and calls the `mcp-bind-local` Edge Function.
 3. The local service polls the `mcp-poll-binding` Edge Function.
@@ -116,13 +116,13 @@ below). Binding a non-loopback address fails closed unless you pass both a token
    locally, and return plaintext JSON. (All privileged routes are Supabase Edge
    Functions at `/functions/v1/<name>`.)
 
-### Troubleshooting: `vaultbeat-mcp doctor`
+### Troubleshooting: `vaultbeat-apple-health doctor`
 
 If binding or reads fail, run the self-diagnosis:
 
 ```bash
-vaultbeat-mcp doctor          # human-readable [OK]/[FAIL] checklist with hints
-vaultbeat-mcp doctor --json   # machine-readable, for agents
+vaultbeat-apple-health doctor          # human-readable [OK]/[FAIL] checklist with hints
+vaultbeat-apple-health doctor --json   # machine-readable, for agents
 ```
 
 It checks, in order: config file → identity key (Keychain) → cloud reachability →
@@ -134,7 +134,7 @@ hint above.
 
 ## MCP Tools (29)
 
-`vaultbeat-mcp serve` can start either a stdio MCP server or a streamable HTTP MCP
+`vaultbeat-apple-health serve` can start either a stdio MCP server or a streamable HTTP MCP
 server. Every data tool accepts `owner` (user-ID prefix) to filter to one person and
 `fresh` to bypass the local cache — omit `owner` and both partners' records mix into
 one pool, so per-person analysis must always pass it. The tool names dropped the old
@@ -259,13 +259,13 @@ prompt, so a client that sends nothing still gets a whole sentence rather than a
 Stdio transport, for local MCP clients that launch the server as a subprocess:
 
 ```bash
-vaultbeat-mcp-local serve --transport stdio
+vaultbeat-apple-health serve --transport stdio
 ```
 
 HTTP transport, for MCP clients that connect over a network or reverse proxy:
 
 ```bash
-vaultbeat-mcp-local serve --transport http --host 127.0.0.1 --port 8000 --path /mcp
+vaultbeat-apple-health serve --transport http --host 127.0.0.1 --port 8000 --path /mcp
 ```
 
 Optional HTTP flags:
@@ -285,15 +285,15 @@ bearer token and refuses to bind a network-reachable address without explicit op
 Generate (and persist) a token, then print ready-to-paste client config:
 
 ```bash
-vaultbeat-mcp-local serve --generate-token
+vaultbeat-apple-health serve --generate-token
 ```
 
 Serve over HTTP on loopback. Auth is on by default; the token is read from
 `VAULTBEAT_MCP_HTTP_TOKEN` (preferred, keeps it out of shell history) or the stored config:
 
 ```bash
-vaultbeat-mcp-local serve --transport http              # 127.0.0.1, bearer required
-vaultbeat-mcp-local serve --transport http --no-token   # loopback only, no auth
+vaultbeat-apple-health serve --transport http              # 127.0.0.1, bearer required
+vaultbeat-apple-health serve --transport http --no-token   # loopback only, no auth
 ```
 
 Clients send the token as a request header:
@@ -322,7 +322,7 @@ wire in clear text, so you must terminate TLS in front of it (e.g. Caddy / Cloud
 nginx):
 
 ```bash
-VAULTBEAT_MCP_HTTP_TOKEN=<token> vaultbeat-mcp-local serve \
+VAULTBEAT_MCP_HTTP_TOKEN=<token> vaultbeat-apple-health serve \
   --transport http --host 0.0.0.0 --allow-remote
 ```
 
@@ -343,7 +343,7 @@ Claude Desktop's config only speaks stdio, so bridge it to the HTTP server with
 }
 ```
 
-Reveal the stored token any time with `vaultbeat-mcp-local serve --show-token`.
+Reveal the stored token any time with `vaultbeat-apple-health serve --show-token`.
 
 ## Verification
 
