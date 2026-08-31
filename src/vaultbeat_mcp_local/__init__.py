@@ -10,7 +10,15 @@ __all__ = ["__version__"]
 # "which version do I actually have" was the one that lied. That matters more
 # than usual here: app and MCP versions drift independently by design, so
 # diagnosing a missing tool starts with trusting this number.
-try:
-    __version__ = _installed_version("vaultbeat-mcp")
-except PackageNotFoundError:  # running from a source checkout, not installed
-    __version__ = "0.0.0+dev"
+# Two distribution names on purpose: the package was renamed to
+# vaultbeat-apple-health in 0.6.2, and vaultbeat-mcp installs stay in the wild.
+# Asking only for the new name would report 0.0.0+dev to every pre-rename user;
+# asking only for the old one is exactly the bug that shipped in 0.6.1 under the
+# new name. Try both before giving up (2026-08-31).
+__version__ = "0.0.0+dev"  # running from a source checkout, not installed
+for _distribution in ("vaultbeat-apple-health", "vaultbeat-mcp"):
+    try:
+        __version__ = _installed_version(_distribution)
+        break
+    except PackageNotFoundError:
+        continue

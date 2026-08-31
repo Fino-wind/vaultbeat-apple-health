@@ -668,7 +668,7 @@ def build_parser() -> argparse.ArgumentParser:
     # `--help` is where a stuck user checks what this thing is called. Reporting
     # the deprecated alias there sent them toward a name that `uvx` — the only
     # install path the docs give — cannot resolve.
-    parser = argparse.ArgumentParser(prog="vaultbeat-mcp")
+    parser = argparse.ArgumentParser(prog="vaultbeat-apple-health")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--config", help="Path to config JSON. Defaults to ~/.tether/mcp-local/config.json.")
     # 🔴 A FLAG AND AN ENV VAR, NEVER A CONFIG FIELD. Both die with the process.
