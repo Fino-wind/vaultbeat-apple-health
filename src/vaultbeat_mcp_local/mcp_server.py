@@ -212,7 +212,7 @@ def _annotate_if_empty(result: dict[str, Any], kind: str, rows_key: str) -> dict
 
     ADD-ONLY, deliberately: it introduces a `hint` key and never reads, edits or
     removes an existing field, and it does nothing at all when there IS data.
-    Payload shape is the one contract layer no server can validate (see AGENTS.md
+    Payload shape is the one contract layer no server can validate (see CLAUDE.md
     § app↔MCP coupling), so anything touching a response has to be additive.
     """
     if result.get(rows_key):
@@ -504,6 +504,11 @@ def run_mcp_server(
 
         Results are served from a short-lived local cache (default 10 min);
         pass fresh=True to force a cloud round trip.
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
         """
 
         return _annotate_if_empty(
@@ -522,6 +527,11 @@ def run_mcp_server(
         derived intake in liters, plus `average_daily_intake_liters` over the window.
         Use `owner` prefix to filter by person (e.g. "a1a1" or "b2b2").
         Each record carries `owner_user_id` to identify whose data it is.
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
         """
 
         return _annotate_if_empty(
@@ -540,6 +550,11 @@ def run_mcp_server(
         the OLS weekly rate (kg/week), and — when `goal_kg` is given — the distance to goal.
         Use `owner` prefix to filter by person (e.g. "a1a1" or "b2b2").
         Each record carries `owner_user_id` to identify whose data it is.
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
         """
 
         return _annotate_if_empty(
@@ -560,6 +575,11 @@ def run_mcp_server(
         can track symptoms, so each entry in `owners` carries `owner_user_id` plus
         per-type counts and day-by-day samples with severity
         (mild/moderate/severe/present/…). Stays on-device, never re-exported.
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
         """
 
         return await service.symptom_summary(limit=limit, fresh=fresh)
@@ -575,6 +595,11 @@ def run_mcp_server(
         partner (e.g. "昨晚舍友很吵" on a sleep day); "mood" | "general" are
         agent-authored via `log_note`. Pass target_kind to filter.
         Stays on-device, never re-exported.
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
         """
 
         return await service.notes_summary(limit=limit, target_kind=target_kind, fresh=fresh)
@@ -591,6 +616,11 @@ def run_mcp_server(
         in Vaultbeat; owner's own sessions only — strength has no partner
         fan-out. Join `date` against sleep/HRV/weight for training-load
         analysis. Pass limit_days to cap how many sessions return.
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
         """
 
         return _annotate_if_empty(
@@ -685,6 +715,11 @@ def run_mcp_server(
         `fatGrams`, `carbGrams`). Items without those fields need analysis-time
         estimation from name + portion; items with them can be summed directly.
         Owner's own days only. Pass limit_days to cap how many days return.
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
         """
 
         return _annotate_if_empty(
@@ -896,6 +931,11 @@ def run_mcp_server(
         SENSITIVE: menstrual data only reaches this server if the user explicitly opted
         in on iOS; it stays on-device and is never re-exported. Returns recent samples plus
         a next-period prediction. Use `owner` prefix to filter by person.
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
         """
 
         return await service.menstrual_cycle_summary(limit=limit, owner=owner, fresh=fresh)
@@ -1028,6 +1068,11 @@ def run_mcp_server(
         reads "no sleep data" and `in_bed_minutes` holds the time actually
         recorded in bed. Report it as "no sleep data (in bed ~Xh)", never as
         "slept 0 hours".
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
         """
 
         return await service.sleep_detail_records(
@@ -1038,7 +1083,13 @@ def run_mcp_server(
     async def get_activity(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent daily activity rings (steps, active energy kcal, exercise minutes,
         stand hours, distance km). One entry per day, newest first.
-        Use `owner` prefix to filter by person. Each record carries `owner_user_id`."""
+        Use `owner` prefix to filter by person. Each record carries `owner_user_id`.
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
+        """
 
         return _annotate_if_empty(
             await service.activity_summary(limit=limit, owner=owner, fresh=fresh),
@@ -1049,14 +1100,26 @@ def run_mcp_server(
     @tool(title="Resting heart rate", annotations=_read_only_tool())
     async def get_resting_hr(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent resting heart rate samples (bpm). Returns per-day records
-        plus average over the window. Use `owner` prefix to filter by person."""
+        plus average over the window. Use `owner` prefix to filter by person.
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
+        """
 
         return await service.resting_hr_records(limit=limit, owner=owner, fresh=fresh)
 
     @tool(title="Workouts", annotations=_read_only_tool())
     async def get_workouts(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent workout sessions (type, duration, calories, distance).
-        Use `owner` prefix to filter by person."""
+        Use `owner` prefix to filter by person.
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
+        """
 
         return await service.workout_records(limit=limit, owner=owner, fresh=fresh)
 
@@ -1096,6 +1159,11 @@ def run_mcp_server(
         the window mismatch.
 
         Use `owner` prefix to filter by person (e.g. `"a1a1"` / `"b2b2"`).
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
         """
 
         if granularity == "raw":
@@ -1138,7 +1206,13 @@ def run_mcp_server(
         contract misnomer (kept for compatibility; prefer the honest twin
         `wrist_temperature_celsius`). For cycle analysis, derive the deviation
         yourself: reading minus that person's rolling baseline. One sample per
-        night. Use `owner` prefix to filter."""
+        night. Use `owner` prefix to filter.
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
+        """
 
         return await service.wrist_temp_records(limit=limit, owner=owner, fresh=fresh)
 
@@ -1155,7 +1229,13 @@ def run_mcp_server(
         24 hours is half a day of data, NOT a collapsed metabolism. Rows with
         `incomplete: true` are already excluded from `average_daily_basal_kcal`
         (`average_over_days` is its denominator); if you quote such a day, say
-        how many hours it covers."""
+        how many hours it covers.
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
+        """
 
         return _annotate_if_empty(
             await service.basal_energy_records(limit=limit, owner=owner, fresh=fresh),
@@ -1180,7 +1260,13 @@ def run_mcp_server(
         so including it drags the average down and, since the error is
         one-directional, never cancels out. Quote `average_tdee_kcal` for diet
         targets, and if you quote a single day, check `basal_incomplete` first.
-        Use `owner` prefix to filter by person."""
+        Use `owner` prefix to filter by person.
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
+        """
 
         return await service.total_energy_burned(days=days, owner=owner, fresh=fresh)
 
@@ -1192,7 +1278,13 @@ def run_mcp_server(
         newest-first records plus latest / peak / trough / average over the
         window. Use `owner` prefix to filter by person. VO2Max is sparse (Watch
         computes it during outdoor brisk walk/run bouts, days apart), so a
-        limit of 30 usually covers many months."""
+        limit of 30 usually covers many months.
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
+        """
 
         return _annotate_if_empty(
             await service.vo2max_records(limit=limit, owner=owner, fresh=fresh),
@@ -1203,7 +1295,13 @@ def run_mcp_server(
     @tool(title="Mindfulness", annotations=_read_only_tool())
     async def get_mindfulness(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent daily mindfulness summaries (session count, total minutes).
-        Use `owner` prefix to filter by person."""
+        Use `owner` prefix to filter by person.
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend, and read
+        `coverage.window_satisfied: false` as a shorter history than asked, not as a
+        missing kind.
+        """
 
         return await service.mindfulness_summary(limit=limit, owner=owner, fresh=fresh)
 

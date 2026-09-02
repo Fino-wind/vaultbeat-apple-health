@@ -1052,7 +1052,7 @@ wheels = [
 
 [[package]]
 name = "vaultbeat-apple-health"
-version = "0.6.2"
+version = "0.6.5"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

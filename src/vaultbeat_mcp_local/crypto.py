@@ -29,7 +29,7 @@ class VaultbeatDekMismatchError(VaultbeatCryptoError):
     addressed to me" (wrong/rotated key, malformed field, someone else's
     row) — states this reader must never act on. This one means the
     opposite: the recipient match succeeded and the data itself is broken.
-    Nothing legitimate produces it — see AGENTS.md Invariant 32/33/34, and
+    Nothing legitimate produces it — see CLAUDE.md Invariant 32/33/34, and
     the iOS counterpart ``E2EEIntegrityVerdict.dekMismatch`` in
     ``E2EEProvider.swift``, which this mirrors so both platforms draw the
     safety line in the same place.
@@ -218,7 +218,7 @@ def encrypt_blob_payload(
 
     The envelope id is intentionally NOT computed here: the server
     derives it server-side from (blob_id, recipient_kind, recipient_id) so it can never
-    be a client-chosen random value (AGENTS.md anti-pattern 18).
+    be a client-chosen random value (CLAUDE.md anti-pattern 18).
     """
 
     if not recipients:

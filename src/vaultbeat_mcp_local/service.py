@@ -4133,8 +4133,9 @@ class VaultbeatLocalService:
                 # Name the MCP tools first: the caller is usually a pure MCP client
                 # that cannot run a shell command at all, and until 2026-07-28 this
                 # only offered the CLI, sending agents off to debug an install that
-                # was never broken. `vaultbeat-mcp-local` is the back-compat alias;
-                # `vaultbeat-mcp` is the real console script (see pyproject.toml).
+                # was never broken. `vaultbeat-apple-health` is the console script
+                # since the 0.6.2 rename; `vaultbeat-mcp` / `vaultbeat-mcp-local`
+                # are back-compat aliases (see pyproject.toml [project.scripts]).
                 "Re-pair with `vaultbeat_start_binding`, then `vaultbeat_poll_binding` "
                 "(CLI equivalent: `vaultbeat-apple-health bind`)."
             )
@@ -4332,8 +4333,9 @@ class VaultbeatLocalService:
                 # Name the MCP tools first: the caller is usually a pure MCP client
                 # that cannot run a shell command at all, and until 2026-07-28 this
                 # only offered the CLI, sending agents off to debug an install that
-                # was never broken. `vaultbeat-mcp-local` is the back-compat alias;
-                # `vaultbeat-mcp` is the real console script (see pyproject.toml).
+                # was never broken. `vaultbeat-apple-health` is the console script
+                # since the 0.6.2 rename; `vaultbeat-mcp` / `vaultbeat-mcp-local`
+                # are back-compat aliases (see pyproject.toml [project.scripts]).
                 "Re-pair with `vaultbeat_start_binding`, then `vaultbeat_poll_binding` "
                 "(CLI equivalent: `vaultbeat-apple-health bind`)."
             )
@@ -4490,8 +4492,9 @@ class VaultbeatLocalService:
                 # Name the MCP tools first: the caller is usually a pure MCP client
                 # that cannot run a shell command at all, and until 2026-07-28 this
                 # only offered the CLI, sending agents off to debug an install that
-                # was never broken. `vaultbeat-mcp-local` is the back-compat alias;
-                # `vaultbeat-mcp` is the real console script (see pyproject.toml).
+                # was never broken. `vaultbeat-apple-health` is the console script
+                # since the 0.6.2 rename; `vaultbeat-mcp` / `vaultbeat-mcp-local`
+                # are back-compat aliases (see pyproject.toml [project.scripts]).
                 "Re-pair with `vaultbeat_start_binding`, then `vaultbeat_poll_binding` "
                 "(CLI equivalent: `vaultbeat-apple-health bind`)."
             )
@@ -4683,8 +4686,9 @@ class VaultbeatLocalService:
                 # Name the MCP tools first: the caller is usually a pure MCP client
                 # that cannot run a shell command at all, and until 2026-07-28 this
                 # only offered the CLI, sending agents off to debug an install that
-                # was never broken. `vaultbeat-mcp-local` is the back-compat alias;
-                # `vaultbeat-mcp` is the real console script (see pyproject.toml).
+                # was never broken. `vaultbeat-apple-health` is the console script
+                # since the 0.6.2 rename; `vaultbeat-mcp` / `vaultbeat-mcp-local`
+                # are back-compat aliases (see pyproject.toml [project.scripts]).
                 "Re-pair with `vaultbeat_start_binding`, then `vaultbeat_poll_binding` "
                 "(CLI equivalent: `vaultbeat-apple-health bind`)."
             )

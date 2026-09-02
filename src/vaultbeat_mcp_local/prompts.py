@@ -72,14 +72,17 @@ __all__ = [
 #:
 #: The last clause is the one that is ours rather than industry-standard, and it
 #: is lifted deliberately from the Product Positioning rule at the top of
-#: `AGENTS.md`: the app may state what was OBSERVED and may not state what was
+#: `CLAUDE.md`: the app may state what was OBSERVED and may not state what was
 #: inferred from the clock. That rule was written after a lock screen rendered a
 #: guess ("partner asleep", derived from the hour) in the same typeface as a
 #: fact. An agent holding these tools is one more surface where a guess can be
 #: dressed as a reading, and it is the surface with the most fluent voice.
 STYLE = (
-    " Style rules: say what the data covers before you conclude anything — which "
-    "days are present, which are missing, and how recent the newest one is. "
+    " Style rules: say what the data covers before you conclude anything — quote "
+    "`coverage.days_covered` (distinct days, not the row count) and "
+    "`coverage.span_days` from the tool result, name how recent the newest day "
+    "is, and treat `coverage.window_satisfied: false` as a shorter history than "
+    "you asked for, not as missing data. "
     "Describe, do not prescribe: no diagnosis, no treatment advice, no invented "
     "scores, grades or verdicts. State an association as an association, never as "
     "a cause. Quote the actual numbers, units and dates you used. And when the "

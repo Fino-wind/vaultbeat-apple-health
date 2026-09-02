@@ -322,7 +322,7 @@ def test_sync_decrypts_cloud_envelopes(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# The MCP-side half of the blob-integrity GC (AGENTS.md Invariant 34):
+# The MCP-side half of the blob-integrity GC (CLAUDE.md Invariant 34):
 # a proven DEK mismatch is reported to the cloud; a merely-unreadable ("not
 # for me") envelope never is.
 # ---------------------------------------------------------------------------

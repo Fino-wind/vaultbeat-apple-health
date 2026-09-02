@@ -210,8 +210,10 @@ def _keyring_env_hint() -> str:
         "stores the key in a 0600 identity.key file automatically when no\n"
         "backend exists.\n"
         f"Do NOT set PYTHON_KEYRING_BACKEND to the null backend to silence this.\n"
-        "That backend accepts writes and stores nothing, which is worse than the\n"
-        "error you are trying to remove.\n"
+        "That backend accepts writes and stores nothing; Vaultbeat detects that on\n"
+        "read-back and writes identity.key anyway, so the setting buys nothing the\n"
+        "file fallback does not already do, and it hides a keyring you may be\n"
+        "able to reach by fixing the two variables above.\n"
         f"({PRIVATE_KEY_ENV} also works, but only if you already hold the key from\n"
         "systemd-creds, a vault or a KMS — there is no command that prints it.)"
     )
@@ -440,9 +442,36 @@ class ConfigStore:
                 f"{_key_lookup_diagnosis(self.path)}\n\n"
                 "This usually means a second identity was created while the first "
                 "key was unreachable. Whichever identity the cloud holds envelopes "
-                "for is the one worth keeping; re-pair this machine once you know "
-                "which private key that is."
+                "for is the one worth keeping.\n\n"
+                "To keep the private key currently in use and pair again:\n"
+                f'  1. delete the "public_key_base64" line from {self.path}\n'
+                "  2. run: uvx vaultbeat-apple-health bind\n"
+                "The public key is re-derived from the private key whenever the "
+                "stored one is absent, so this clears the conflict without "
+                "touching any key material.\n"
+                "⚠️ Envelopes the cloud sealed for the OTHER identity stay "
+                "unreadable — only that identity's private key can open them, and "
+                "this does not recover it.\n\n"
+                "If the cloud's data belongs to that other identity, find its "
+                "private key FIRST (system keyring, backups, another machine). "
+                "Never delete a private key you have not replaced: it is the only "
+                "thing that can decrypt what it sealed."
             )
+            # The old last line was "re-pair this machine once you know which
+            # private key that is" — advice that could not be followed. `bind`
+            # calls ensure_initialized() → load(), i.e. this same function, so it
+            # raises here before doing anything; `init` hits it too, and no
+            # subcommand offers a reset. The remedy named the one command
+            # guaranteed to fail, which left manually editing this file as the
+            # only way out, unmentioned.
+            #
+            # The escape above is verified, not inferred: with the key absent the
+            # `if stored_public_key and ...` guard is skipped and
+            # `public_key_base64 = derived_public_key` re-derives it. Deleting one
+            # line of JSON is also the smallest safe action available here —
+            # anything that touched the private key would risk making data
+            # permanently unreadable, which is why no `--force-reset` verb is
+            # offered instead.
         public_key_base64 = derived_public_key
 
         return LocalServerConfig(

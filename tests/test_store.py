@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from vaultbeat_mcp_local.crypto import generate_x25519_keypair
+from vaultbeat_mcp_local.crypto import generate_x25519_keypair, public_key_from_private
 from vaultbeat_mcp_local.store import (
     ConfigError,
     ConfigStore,
@@ -293,6 +293,43 @@ def test_a_keyring_key_that_disagrees_with_the_stored_public_key_is_refused(
     with pytest.raises(ConfigError) as caught:
         store.load()
     assert "does not match" in str(caught.value)
+
+
+def test_the_mismatch_remedy_is_one_a_user_can_actually_carry_out(
+    tmp_path: Path, fake_keychain: dict[tuple[str, str], str]
+) -> None:
+    """The way out named in the error must work when followed literally.
+
+    It did not. The text ended "re-pair this machine once you know which
+    private key that is", and re-pairing is `bind` → ensure_initialized() →
+    load() → this same raise. `init` too. No subcommand resets an identity, so
+    the only real exit was hand-editing config.json, which the message never
+    mentioned: a dead end wearing the clothes of advice.
+
+    This test walks the printed instructions instead of asserting the wording,
+    so it fails if the escape is ever sealed — most plausibly by making
+    `public_key_base64` required, which reads like tightening validation and
+    would quietly restore the dead end.
+    """
+    config_path = tmp_path / "config.json"
+    store = ConfigStore(config_path)
+    store.ensure_initialized()
+
+    other_private, _ = generate_x25519_keypair()
+    fake_keychain[(_KEYCHAIN_SERVICE, _keychain_username(config_path))] = other_private
+
+    with pytest.raises(ConfigError) as caught:
+        store.load()
+    message = str(caught.value)
+    assert "public_key_base64" in message  # names the field to delete
+    assert "bind" in message  # and the command to run after
+
+    raw = json.loads(config_path.read_text())
+    del raw["public_key_base64"]
+    config_path.write_text(json.dumps(raw))
+
+    config = store.load()  # step 1 done → no longer raises
+    assert config.public_key_base64 == public_key_from_private(other_private)
 
 
 def test_an_unusable_private_key_is_reported_as_such_not_as_a_mismatch(

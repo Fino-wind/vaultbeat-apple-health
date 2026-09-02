@@ -294,7 +294,7 @@ def handle_bind(args: argparse.Namespace) -> int:
     )
     if result.status != "bound":
         # Until 0.2.8 this said only "still pending, re-run poll", which tells a
-        # first-time reader nothing. `uvx vaultbeat-mcp` installs cleanly for
+        # first-time reader nothing. `uvx vaultbeat-apple-health` installs cleanly for
         # anyone, so the people who reach this line are usually the ones who
         # never read the README — and the reason no scan arrived is almost
         # always that the phone side is not ready.
@@ -321,10 +321,29 @@ def handle_bind(args: argparse.Namespace) -> int:
         # does.
         print("Binding is still pending — nothing scanned this within the timeout.")
         print()
+        # Step 2 names a screen the reader does not land on first. Opening
+        # "Connect an AI server" for the first time starts a GUIDE — the scanner
+        # is its last step — and this block's own reasoning below establishes
+        # that the likeliest reader here has never opened the app at all (they
+        # were installing it while bind timed out). So this is precisely the
+        # reader for whom "scan the QR from that screen" describes a screen that
+        # is not in front of them, and the failure is silent: they see a walk-
+        # through, conclude they are in the wrong place, and go looking.
+        #
+        # Same sentence, same fix, third copy. The site's two (`support/page.tsx`
+        # :92 rich text and :104 plain) were corrected in edf8222; this one was
+        # not found by that audit because it lives in another language in another
+        # part of the repo. `VaultbeatMCPGuideSheet.swift:442` stays as it is on
+        # purpose — its reader is INSIDE the guide already, so for them the
+        # sentence is true. Whether a shared sentence is wrong depends on where
+        # its reader is standing, which is also why grepping for the string is
+        # not enough to decide.
         print("What the phone side needs:")
         print("  1. Vaultbeat for iOS — free to install, free to connect.")
         print("     https://apps.apple.com/app/id6759241985")
         print("  2. In the app: Settings -> Data & AI -> Connect an AI server")
+        print("     First time through, the app walks you through setup and the")
+        print("     scanner comes last — follow it to the end.")
         print("  3. Scan the QR above from that screen.")
         print()
         # 🔴 The two cases have DIFFERENT answers, and the previous single
@@ -343,12 +362,15 @@ def handle_bind(args: argparse.Namespace) -> int:
         # were installing the app while bind timed out. The old text opened with
         # "Already scanned it?" and told them their window was half gone.
         #
-        # The command is `vaultbeat-mcp`, not `vaultbeat-mcp-local`. That alias
-        # exists for pre-rename installs, but the documented install path
-        # everywhere (site, skill.md, README) is `uvx vaultbeat-mcp` — and uvx
-        # resolves entry points by PACKAGE name, so `uvx vaultbeat-mcp-local poll`
-        # fails outright with "not found in the package registry". Printing it to
-        # the one reader who by definition has not read the README was the worst
+        # The command is `vaultbeat-apple-health` (the distribution name since
+        # the 0.6.2 rename). `vaultbeat-mcp` / `vaultbeat-mcp-local` survive as
+        # console-script aliases for pre-rename installs, but the documented
+        # install path everywhere (site, skill.md, README) is
+        # `uvx vaultbeat-apple-health` — and uvx resolves entry points by PACKAGE
+        # name, so `uvx vaultbeat-mcp-local poll` fails outright with "not found
+        # in the package registry" and `uvx vaultbeat-mcp poll` installs the
+        # frozen old distribution (Invariant 67). Printing either to the one
+        # reader who by definition has not read the README was the worst
         # possible place to get this wrong.
         print("Not scanned yet? The QR above is still good — nothing expires until")
         print("someone scans it. Scan it FIRST, then pick the pairing back up with:")
@@ -501,9 +523,21 @@ def handle_weight(args: argparse.Namespace) -> int:
 
 
 def handle_menstrual(args: argparse.Namespace) -> int:
+    # stderr, not stdout: stdout is the JSON document. Three of the fifteen data
+    # subcommands printed this notice to stdout, which put a prose line ahead of
+    # the JSON and broke `vaultbeat-apple-health menstrual | jq` outright — for
+    # exactly the three kinds whose sensitivity the notice is about. The other
+    # twelve were always clean, so the shape of the output depended on which
+    # kind you asked for.
+    #
+    # The notice itself stays, and stays visible: a terminal shows stderr, so a
+    # human reads it exactly as before. Only redirection changes, which is the
+    # whole point — `> file` and `| jq` now receive the document alone.
+    # `DEMO_BANNER` above already had it right; these three predate that.
     print(
         "Note: menstrual data is sensitive; it is decrypted locally and never re-exported. "
-        "It only appears if the user explicitly opted in on iOS."
+        "It only appears if the user explicitly opted in on iOS.",
+        file=sys.stderr,
     )
     summary = asyncio.run(_service(args).menstrual_cycle_summary(limit=args.limit, fresh=args.fresh, owner=getattr(args, "owner", None)))
     _emit_decrypted(summary, args, label="menstrual cycle summary")
@@ -563,7 +597,8 @@ def handle_wrist_temp(args: argparse.Namespace) -> int:
 
 def handle_notes(args: argparse.Namespace) -> int:
     print(
-        "Note: notes are sensitive free text; they are decrypted locally and never re-exported."
+        "Note: notes are sensitive free text; they are decrypted locally and never re-exported.",
+        file=sys.stderr,
     )
     summary = asyncio.run(
         _service(args).notes_summary(limit=args.limit, target_kind=args.kind, fresh=args.fresh)
@@ -583,7 +618,8 @@ def handle_strength(args: argparse.Namespace) -> int:
 def handle_symptoms(args: argparse.Namespace) -> int:
     print(
         "Note: symptom data is sensitive; it is decrypted locally and never re-exported. "
-        "It only appears if a user explicitly opted in on iOS."
+        "It only appears if a user explicitly opted in on iOS.",
+        file=sys.stderr,
     )
     summary = asyncio.run(_service(args).symptom_summary(limit=args.limit, fresh=args.fresh))
     _emit_decrypted(summary, args, label="symptoms summary")

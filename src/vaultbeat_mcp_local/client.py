@@ -517,7 +517,7 @@ class VaultbeatCloudClient:
         other eye: whenever THIS server's own decrypt fails with a proven
         DEK-mismatch (never on a mere "not for me"), it reports the blob id so
         iOS can forget its upload fingerprint and re-upload it, regardless of
-        what the owner-side check concluded. See AGENTS.md Invariant 34.
+        what the owner-side check concluded. See CLAUDE.md Invariant 34.
 
         Best-effort by design (see the caller in service.py): a report that
         never arrives just means this blob waits for the next call that

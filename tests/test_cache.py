@@ -1,6 +1,6 @@
 """LocalRecordCache + service cache-wiring tests.
 
-The cache is the AGENTS.md "MCP Local Server Performance" fix: within the TTL a
+The cache is the CLAUDE.md "MCP Local Server Performance" fix: within the TTL a
 repeat query must answer from local plaintext with ZERO cloud round trips, and
 `fresh=True` must force one. Reuses `FakeCloudClient` / `_make_envelope` from
 test_service so the envelopes are real E2EE ciphertext, not stubs.

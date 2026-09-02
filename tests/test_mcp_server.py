@@ -575,6 +575,64 @@ def test_only_the_doctor_reaches_outside_this_system(monkeypatch: Any, tmp_path:
     assert open_world == ["vaultbeat_doctor"]
 
 
+def test_every_tool_that_returns_coverage_says_so_in_its_docstring(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A docstring is the tool's API to the agent, and `coverage` is invisible
+    without one: an agent only learns the field exists by reading a response,
+    which is after it has already decided what to quote (Invariant 64).
+
+    Rule-based on both sides, so a new read tool cannot ship half the contract:
+    returning `coverage` without naming it, or naming it without returning it.
+    Demo mode supplies real-shaped results with no network, no pairing and no
+    key; the doctor is skipped because it is the one tool that leaves this
+    system, and writes are skipped because they need arguments.
+    """
+    monkeypatch.setenv("VAULTBEAT_DEMO", "1")
+    captured: dict[str, tuple[Any, Any]] = {}
+
+    class FakeFastMCP:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def tool(self, *args: Any, **kwargs: Any) -> Any:
+            def decorator(function: Any) -> Any:
+                captured[function.__name__] = (function, kwargs.get("annotations"))
+                return function
+
+            return decorator
+
+        def run(self, **kwargs: Any) -> None:
+            pass
+
+        def add_prompt(self, prompt: Any) -> None:
+            pass
+
+    monkeypatch.setattr("mcp.server.fastmcp.FastMCP", FakeFastMCP)
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    covered: list[str] = []
+    for name, (function, hints) in captured.items():
+        if not hints.readOnlyHint or hints.openWorldHint:
+            continue
+        result = function()
+        if asyncio.iscoroutine(result):
+            result = asyncio.run(result)
+        returns_coverage = "coverage" in result
+        documents_coverage = "coverage.days_covered" in (function.__doc__ or "")
+        assert returns_coverage == documents_coverage, (
+            f"{name}: returns coverage={returns_coverage}, documents it={documents_coverage}"
+        )
+        if returns_coverage:
+            covered.append(name)
+
+    # Sanity that demo mode actually produced results rather than the loop
+    # trivially agreeing on "neither": the two ends of the read surface.
+    assert "vaultbeat_sync_sleep" in covered
+    assert "get_mindfulness" in covered
+    assert "vaultbeat_status" not in covered
+
+
 def test_append_tools_are_annotated_non_destructive_and_entry_tools_are_not(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
