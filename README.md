@@ -359,3 +359,5 @@ python -m pytest -q mcp-local-server/tests
 python -m ruff check mcp-local-server/src mcp-local-server/tests
 python -m mypy mcp-local-server/src
 ```
+
+<!-- mcp-name: io.github.Fino-wind/vaultbeat-apple-health -->
