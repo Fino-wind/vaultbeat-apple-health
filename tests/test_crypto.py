@@ -449,7 +449,7 @@ def test_decrypt_blob_payload_rejects_non_base64_encrypted_data_key() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The integrity safety line: NotForMe vs DekMismatch (AGENTS.md Invariant 34)
+# The integrity safety line: NotForMe vs DekMismatch (CLAUDE.md Invariant 34)
 #
 # AES-GCM reports both failures identically at the InvalidTag layer, so these
 # pin that decrypt_blob_payload still tells them apart — the distinction the

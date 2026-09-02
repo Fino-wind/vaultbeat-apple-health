@@ -211,10 +211,14 @@ def test_menstrual_subcommand_prints_sensitivity_note_and_summary(
     exit_code = cli.main(["--config", str(tmp_path / "config.json"), "menstrual"])
 
     assert exit_code == 0
-    out = capsys.readouterr().out
-    assert "sensitive" in out  # privacy note is surfaced to the operator
-    json_start = out.index("{")
-    printed = json.loads(out[json_start:])
+    captured = capsys.readouterr()
+    # The notice belongs on stderr and the document on stdout. Asserted as two
+    # separate facts on purpose: the old version of this test read the notice
+    # out of stdout and then did `out.index("{")` to step over it, which is the
+    # bug written down as a test — `| jq` had no such escape hatch.
+    assert "sensitive" in captured.err  # still shown to a human at a terminal
+    assert "sensitive" not in captured.out  # and never in the document
+    printed = json.loads(captured.out)  # parses WHOLE, no slicing
     assert printed["predicted_next_period_start_date"] is None
 
 
@@ -376,15 +380,21 @@ def demo_cli(monkeypatch: Any) -> None:
 
 
 def _stdout_payload(out: str) -> list[tuple[str, Any]]:
-    """Parse the JSON document out of stdout, preserving key order.
+    """Parse stdout as a JSON document, preserving key order.
 
-    `menstrual` / `notes` / `symptoms` print a prose sensitivity note ahead of
-    the payload, so stdout is not a bare JSON document for those three — a
-    pre-existing wart this change neither introduces nor fixes. Slicing from the
-    first brace is what the existing subcommand tests already do.
+    Parses the WHOLE string rather than slicing from the first brace, which
+    makes this the guard for "stdout is exactly one JSON document" across every
+    data subcommand: anything printed alongside the payload fails here.
+
+    It used to slice, because `menstrual` / `notes` / `symptoms` printed a prose
+    sensitivity notice to stdout ahead of the payload and this docstring called
+    that "a pre-existing wart this change neither introduces nor fixes". The
+    slice is what let it survive — the notice broke `… | jq` for those three
+    kinds while every test stepped politely around it. The notice now goes to
+    stderr, so no slicing is needed and none should be reintroduced.
     """
 
-    return json.loads(out[out.index("{"):], object_pairs_hook=list)
+    return json.loads(out, object_pairs_hook=list)
 
 
 @pytest.mark.parametrize("subcommand", _data_subcommands())

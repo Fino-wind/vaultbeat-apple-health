@@ -1,11 +1,13 @@
 # Vaultbeat Local MCP Server
 
-Local service program for Vaultbeat's encrypted health-data recipient flow.
+**Your Apple Health data — sleep stages, cycle, HRV, resting heart rate, workouts, weight, VO₂ max, meals, lifts, notes — readable and writable by your own AI agent (Claude Code, Hermes, OpenClaw, anything MCP), end-to-end encrypted so that only your machine ever sees plaintext.** The [Vaultbeat](https://vaultbeat.app) iPhone app captures from HealthKit; this package is the local server that decrypts for the agent.
+
+Technically: the local service program for Vaultbeat's encrypted health-data recipient flow.
 Published externally as [`Fino-wind/vaultbeat-apple-health`](https://github.com/Fino-wind/vaultbeat-apple-health)
 (public package name `vaultbeat-apple-health` since 0.6.2; `vaultbeat-mcp` and
 `vaultbeat-mcp-local` remain back-compat console scripts). This directory is the source of truth — after any user-visible change here,
 re-export the public repo and update its README tool table + the website `/mcp` page
-(see AGENTS.md "Sync duty").
+(see CLAUDE.md "Sync duty").
 
 It runs on the user's computer, generates the Curve25519 keypair used by the iOS app,
 shows a QR binding payload, receives a one-time server token from the cloud API, and
@@ -86,10 +88,13 @@ has nothing to decrypt. `config.json` is the file people `cat` into bug reports.
 
 **Headless servers**: if the keyring is unreachable, do *not* set
 `PYTHON_KEYRING_BACKEND` to the null backend. That backend accepts writes and
-stores nothing, so the key is discarded silently. Either let layer 3 handle it
-(automatic when no backend exists) or, if a D-Bus session exists but this
-process cannot see it, pass `DBUS_SESSION_BUS_ADDRESS` through explicitly —
-`XDG_RUNTIME_DIR` on its own is not enough.
+stores nothing; since 0.4.3 every keyring write is verified by reading it back,
+so a null backend just lands the key in layer 3's `identity.key` file — the same
+outcome as having no keyring, with a keyring you might have reached hidden behind
+it. Either let layer 3 handle it (automatic when no backend exists) or, if a
+D-Bus session exists but this process cannot see it, pass
+`DBUS_SESSION_BUS_ADDRESS` through explicitly — `XDG_RUNTIME_DIR` on its own is
+not enough.
 
 > **`.tether`, not `.vaultbeat` — that is deliberate, do not "fix" it.** The app
 > was renamed but this path is frozen at the pre-rename location, because the
@@ -174,9 +179,11 @@ Health data:
 - `get_total_energy_burned` — basal + active = TDEE, with a 7-day average
 
 **Every read tool also returns a `coverage` block**, and an agent that wants to say
-"this is based on N days" has nothing else to read. Fields: `days_covered`, `first_day`,
-`last_day`, `span_days`, `days_missing_in_span`, `rows_counted`, `requested`,
-`requested_unit`, `window_satisfied`. Two things it exists to stop: counting the returned
+"this is based on N days" has nothing else to read. Fields: `days_covered`,
+`days_in_payload` (how many of those days have a row printed — smaller only when a
+display cap cut the list), `first_day`, `last_day`, `span_days`,
+`days_missing_in_span`, `rows_counted`, `requested`, `requested_unit`,
+`window_satisfied`. Two things it exists to stop: counting the returned
 array instead (`limit` has already cut it, so the length answers a different question),
 and reading a long `span_days` as coverage — `days_covered: 12` with `span_days: 200` is
 twelve scattered days, not seven months. Quote `days_covered` beside any average, trend
@@ -352,5 +359,3 @@ python -m pytest -q mcp-local-server/tests
 python -m ruff check mcp-local-server/src mcp-local-server/tests
 python -m mypy mcp-local-server/src
 ```
-
-<!-- mcp-name: io.github.Fino-wind/vaultbeat-apple-health -->

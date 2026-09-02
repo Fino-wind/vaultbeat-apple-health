@@ -361,3 +361,25 @@ def test_doctor_does_not_fail_when_pypi_is_unreachable(tmp_path: Path, monkeypat
 
     assert check["ok"] is True
     assert "could not reach PyPI" in check["detail"]
+
+
+def test_doctor_pypi_probe_names_the_distribution_in_pyproject() -> None:
+    """`_PYPI_URL` must ask PyPI about the package this code actually ships as.
+
+    The 2026-08-31 rename left it pointing at the frozen `vaultbeat-mcp`
+    distribution (last release 0.6.1), so `_client_version_status` compared
+    every install against a package that will never publish again and answered
+    "installed (latest)" forever — the one command whose job is to say "you are
+    behind" was structurally unable to (Invariant 67 ③/④, fixed in 0.6.3). Both
+    MCP release guards read the name out of pyproject and stayed green through
+    it; this ties the probe to that same source so the next rename cannot.
+    """
+    import tomllib
+
+    from vaultbeat_mcp_local.service import VaultbeatLocalService
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject.open("rb") as handle:
+        distribution = tomllib.load(handle)["project"]["name"]
+
+    assert VaultbeatLocalService._PYPI_URL == f"https://pypi.org/pypi/{distribution}/json"
