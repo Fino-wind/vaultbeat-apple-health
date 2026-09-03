@@ -354,11 +354,14 @@ PROMPTS: tuple[VaultbeatPrompt, ...] = (
             "subprocess of my AI client, so it cannot inspect the command line, the "
             "environment or the config file the client actually used, and a green "
             "check is not evidence about that half. Then say which of these it is: "
-            "nothing was ever recorded, Apple Health permission is missing for that "
-            "type, the iOS app predates the feature, or this server was bound recently "
-            "and its own encrypted copy of the history is still filling in. Name one, "
-            "give the single next action for that one, and say what would prove you "
-            "right. Do not hand me a checklist of all four."
+            "the account is on the free plan or a trial, which uploads only the last "
+            "7 days to the cloud, so anything older was never sent and no amount of "
+            "re-syncing will produce it; nothing was ever recorded; Apple Health "
+            "permission is missing for that type; the iOS app predates the feature; "
+            "or this server was bound recently and its own encrypted copy of the "
+            "history is still filling in. Name one, give the single next action for "
+            "that one, and say what would prove you right. Do not hand me a checklist "
+            "of all five."
             + STYLE
         ),
         arguments=(PromptArg("context", "Optional — which tool was empty, and what you expected to see.", ""),),

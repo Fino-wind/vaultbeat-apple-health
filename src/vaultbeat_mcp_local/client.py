@@ -47,7 +47,7 @@ class VaultbeatTrialExpiredError(VaultbeatCloudError):
             f"Your 3-day Vaultbeat Pro trial ended{when}. "
             "To restore access: open the Vaultbeat app on your iPhone → "
             "Settings → Membership, and pick a Pro plan ($9.99/month, "
-            "$79.99/year, or $149.99 once, forever). Nothing was deleted — "
+            "$29.99/year, or $74.99 once, forever). Nothing was deleted — "
             "your health data is still encrypted in your account and "
             "reappears the moment Pro is active."
         )
