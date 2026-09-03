@@ -12,7 +12,7 @@ re-export the public repo and update its README tool table + the website `/mcp` 
 It runs on the user's computer, generates the Curve25519 keypair used by the iOS app,
 shows a QR binding payload, receives a one-time server token from the cloud API, and
 then exposes decrypted health data — sleep, water, weight, cycle, activity, vitals —
-through either a CLI or a stdio MCP server. Read-only: data is written by the iOS app.
+through either a CLI or a stdio MCP server.
 
 ## Commands
 
@@ -137,7 +137,7 @@ a fresh QR", or "the stored key can no longer decrypt your data — delete this 
 in the iOS app and bind again"). Exit code 0 = all healthy, 1 = something needs the
 hint above.
 
-## MCP Tools (29)
+## MCP Tools
 
 `vaultbeat-apple-health serve` can start either a stdio MCP server or a streamable HTTP MCP
 server. Every data tool accepts `owner` (user-ID prefix) to filter to one person and
@@ -234,7 +234,7 @@ opted in on iOS (absent otherwise), is decrypted locally, and is never re-export
 
 The MCP server never exposes the private key or server token through tool results.
 
-## MCP Prompts (8)
+## MCP Prompts
 
 `prompts/list` is the only channel through which an agent can ask what this server is
 *for*, rather than what it can call. Without it every client invents its own analysis

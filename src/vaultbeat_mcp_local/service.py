@@ -2341,7 +2341,8 @@ class VaultbeatLocalService:
             block["days_left"] = days_left
             when = "today" if days_left == 0 else f"in {days_left} day(s)"
             block["note"] = (
-                "A 3-day full-access trial was running when this server paired; "
+                "A 3-day trial of the AI interface was running when this "
+                "server paired; "
                 f"it ends {deadline.date().isoformat()} ({when}). This is a "
                 "snapshot from pairing time — a Pro purchase made in the iOS app "
                 "since then is not visible here, and the cloud enforces the real "
@@ -2380,7 +2381,7 @@ class VaultbeatLocalService:
         if not (moment <= deadline <= moment + timedelta(hours=24)):
             return None
         return (
-            "Heads-up worth passing to the user: the 3-day full-access trial "
+            "Heads-up worth passing to the user: the 3-day AI-interface trial "
             "recorded when this Vaultbeat server paired ends within the next "
             f"day ({self._last_bound_trial_ends_at}). After that, reads return "
             "a trial-expired refusal until Pro is active in the Vaultbeat iOS "
@@ -5419,7 +5420,7 @@ class VaultbeatLocalService:
                 "data_source": "synthetic" if self._demo else "account",
                 "next_step": (
                     "Not paired yet — this is the expected state before first use. "
-                    "Run: uvx --from 'vaultbeat-apple-health[qr]@latest' vaultbeat-apple-health bind "
+                    "Run: uvx vaultbeat-apple-health@latest bind "
                     "then scan the QR code in the iOS app under "
                     "Settings → Data & AI → Connect an AI server. "
                     "Requires the Vaultbeat iOS app; connecting is open on every plan."

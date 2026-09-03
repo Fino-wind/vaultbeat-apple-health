@@ -96,10 +96,13 @@ reader west of Greenwich. Real blobs carry local-midnight-in-UTC; the demo
 trades that fidelity for the same label everywhere, which matters more when
 the reader is a stranger checking whether the tool works.
 
-Intra-day instants (sleep bedtime/wake, hourly buckets, workout start/end) are
-real UTC instants and render in the reader's own timezone, exactly like real
-data does. Durations, counts and kcal are timezone-independent, so every
-aggregate number is identical everywhere.
+Intra-day instants are real UTC instants and render in the reader's own
+timezone. Sleep is generated from a LOCAL 22:0x bedtime via `_local_dt` so it
+renders as a night everywhere — see that function for the 06:31-bedtime bug that
+this paragraph's own reasoning had been describing as already true since 2026-08.
+Hourly buckets stay UTC-hour-aligned on purpose (the wire contract requires it).
+Durations, counts and kcal are timezone-independent, so every aggregate number is
+identical everywhere.
 
 WATERMARKING
 ------------
@@ -198,6 +201,30 @@ def _dt(day: date, hour: float = 12, minute: float = 0, second: float = 0) -> da
 
     base = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
     return base + timedelta(hours=hour, minutes=minute, seconds=second)
+
+
+def _local_dt(day: date, hour: float = 12, minute: float = 0) -> datetime:
+    """The UTC instant of a LOCAL wall-clock time on `day`, in the reader's zone.
+
+    🔴 Sleep must use this, not `_dt`. `_dt(bed_day, 22, ...)` is 22:0x **UTC**,
+    and a reader in Beijing sees a person who goes to bed at 06:31 and wakes at
+    14:31 — every night, identically — at the exact moment Step 0 of skill.md is
+    asking a stranger to trust us with their health data. It reads as broken.
+
+    The module docstring above reasons that intra-day instants "render in the
+    reader's own timezone, exactly like real data does". That reasoning is right
+    and the old implementation contradicted it: real data is a 22:00 LOCAL
+    bedtime stored as its UTC equivalent, so it renders back as 22:00 anywhere.
+    Generating 22:00 UTC is the one thing real data never does.
+
+    ⚠️ This deliberately makes the dataset timezone-DEPENDENT, which is the
+    point. The day-bucket anchor above stays noon-UTC and must not follow —
+    that one is chosen so the day LABEL is the same everywhere, a different
+    property with the opposite requirement.
+    """
+
+    naive = datetime(day.year, day.month, day.day) + timedelta(hours=hour, minutes=minute)
+    return naive.astimezone(timezone.utc)
 
 
 def _iso(moment: datetime) -> str:
@@ -313,7 +340,7 @@ def _build_sleep(rng: random.Random) -> list[DecryptedRecord]:
             bed_day = wake_day - timedelta(days=1)
             suffix = f"{wake_day.isoformat()}-{tag}"
 
-            bedtime = _dt(bed_day, 22, rng.randint(5, 55))
+            bedtime = _local_dt(bed_day, 22, rng.randint(5, 55))
             watch_off = owner == DEMO_PARTNER_ID and back == 6
 
             if watch_off:
