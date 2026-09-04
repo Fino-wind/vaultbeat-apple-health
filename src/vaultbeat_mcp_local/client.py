@@ -132,6 +132,31 @@ class PollBindingResult:
     request_id: str | None = None
 
 
+def _user_agent() -> str:
+    """`<pypi distribution>/<version>`, e.g. `vaultbeat-apple-health/0.6.8`.
+
+    🔑 **The distribution half is the payload, not decoration.** The package was
+    renamed at 0.6.2 and pre-rename installs keep telling their own `doctor`
+    they are current — the version check frozen inside them queries the OLD
+    package's PyPI page, where their version genuinely is the newest. So "who is
+    still on `vaultbeat-mcp`" cannot be answered from a version number; both
+    names share one version series. It needs the name.
+
+    Set once on the client rather than per call site: `_request` is the single
+    place an `AsyncClient` is constructed here, so this reaches every endpoint,
+    including ones added later. Per-request `headers=` still wins on collision,
+    and no caller sets a user-agent.
+
+    Carries no hostname, no path, no identifier — it is built entirely from
+    package metadata that is identical on every install of that version.
+    A source checkout has no distribution metadata at all and says so.
+    """
+
+    from vaultbeat_mcp_local import __distribution__, __version__
+
+    return f"{__distribution__ or 'vaultbeat-mcp-local-source'}/{__version__}"
+
+
 class VaultbeatCloudClient:
     # Read budget. Supabase edge functions cold-start at 20-63s measured
     # (2026-07-27), and the old 20s ceiling meant the heaviest call — `sync`,
@@ -250,7 +275,9 @@ class VaultbeatCloudClient:
 
         last_error: Exception | None = None
         async with httpx.AsyncClient(
-            timeout=self._timeout(), transport=self._transport
+            timeout=self._timeout(),
+            transport=self._transport,
+            headers={"user-agent": _user_agent()},
         ) as client:
             for attempt in range(max_attempts):
                 if attempt > 0:
