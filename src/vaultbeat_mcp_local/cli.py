@@ -200,15 +200,43 @@ def handle_doctor(args: argparse.Namespace) -> int:
         # answer anywhere else.
         caps = report.get("capabilities") or {}
         if caps.get("available"):
+            # 🔴 The field is `possibly_needs_newer_app` and this rendering used
+            # to drop the "possibly": it printed "needs an iOS build from <date>
+            # or later" as a flat assertion. Its own producer's docstring says
+            # the opposite — "deliberately does NOT claim to know the app's
+            # version" — and the note printed one line below ranks the version
+            # SECOND of four causes, behind "this server was bound recently".
+            #
+            # The five gated kinds are strength / food / vo2max / basal_energy /
+            # hrv_hourly: the first two are manual-entry only, vo2max is sparse
+            # by design (Apple computes it during outdoor walk/run/hike), and the
+            # last two need an Apple Watch. So a brand-new user on the CURRENT
+            # build, with no Watch and no lifts logged, was told five times that
+            # their app was out of date — at the exact step `skill.md` sends
+            # every new user to as the verification of the whole setup. They go
+            # to the App Store, find no update, and conclude the pairing failed.
             gated = caps.get("possibly_needs_newer_app") or {}
             if gated:
                 print()
-                print("[WARN] Some tools have no data on this account:")
+                print("[WARN] Some tools have no data yet on this account:")
+                print("       Most often this server was bound recently and the history")
+                print("       is still sealing for it — open the app, tap Settings →")
+                print("       Data & AI → 'Re-sync all health data to AI', then re-run.")
                 for kind, since in sorted(gated.items()):
-                    print(f"       {kind} — needs an iOS build from {since} or later")
+                    print(f"       {kind} — one possible cause is an iOS build older than {since}")
                 print(f"       → {caps['note']}")
             else:
                 print(f"[OK]   capabilities: all {len(caps.get('kinds_with_data', []))} data types present")
+
+            # Printed unconditionally when the account has more than one owner:
+            # this is the ONLY place a prefix can be discovered, and passing one
+            # is what keeps a "weight trend" from being two people's weights
+            # averaged together with nothing in the payload saying so.
+            owners = caps.get("owner_prefixes") or []
+            if len(owners) > 1:
+                print()
+                print(f"[INFO] This account has {len(owners)} data owners: {', '.join(owners)}")
+                print("       Pass one as `owner` on every read, or results blend both people.")
 
         # Rows this run deliberately skipped, each with its reason. In demo mode
         # the checks that ARE run all pass, so without this the CLI ends on "All
@@ -252,6 +280,23 @@ def handle_doctor(args: argparse.Namespace) -> int:
 
         print("All checks passed." if report["ok"] else "Some checks failed — follow the hints above.")
     return 0 if report["ok"] else 1
+
+
+#: The two sentences `bind` prints on success once a trial clock has started.
+#:
+#: Module constants rather than inline strings so a test can assert them without
+#: driving a whole network bind — this exact pair was FALSE from 2026-09-03 to
+#: 2026-09-06 and nothing anywhere went red, because the sentence was in one
+#: file and the change that falsified it was in another. See the comment at the
+#: call site for why they are two facts and not one.
+TRIAL_UNLOCK_LINE = "The AI interface is unlocked until {date}."
+
+UPLOAD_WINDOW_LINE = (
+    "Separately: on Free and during the trial your last 7 days are what reaches the "
+    "cloud, so that is the window your AI can read. Asking for a month returns a week "
+    "— that is the plan boundary, not a sync that has not finished. Pro uploads the "
+    "whole history."
+)
 
 
 def handle_bind(args: argparse.Namespace) -> int:
@@ -416,9 +461,30 @@ def handle_bind(args: argparse.Namespace) -> int:
     # Absent for a grandfathered user, a trial already running, or an edge
     # deployment older than 2026-08-17 — saying nothing is correct in all three,
     # so this stays conditional rather than guessing a date.
+    # 🔴 Two separate facts, and merging them is what made this line false.
+    #
+    # It read "Full access to your health data is on until <date>" until
+    # 2026-09-06. The trial unlocks the AI INTERFACE; it does not lift the
+    # UPLOAD WINDOW, which Invariant 72 (free-tier-uploads-seven-days, shipped
+    # 2026-09-03) clamps to 7 days for `.trial` exactly as for `.free`. The two
+    # were one sentence, so adding the clamp made the sentence a falsehood with
+    # nothing anywhere going red.
+    #
+    # 🔑 And it was false EVERY time it printed, not occasionally: a fresh trial
+    # clock is suppressed for grandfathered users, for a trial already running,
+    # and for paid Pro (20260819063000_no_trial_clock_for_paid.sql) — i.e. for
+    # precisely the accounts that are NOT clamped. `trial_ends_at` is non-nil if
+    # and only if the reader is on the 7-day window.
+    #
+    # Why the second line is not a sales line despite naming Pro: without the
+    # reason, a user who asks for a month and receives a week has a working
+    # product that looks broken, and the obvious next move is to re-sync or
+    # re-pair — neither of which can ever help. Stating the boundary is what
+    # makes the short answer legible. Still no price, still no "subscribe now".
     if result.trial_ends_at:
         print()
-        print(f"Full access to your health data is on until {result.trial_ends_at[:10]}.")
+        print(TRIAL_UNLOCK_LINE.format(date=result.trial_ends_at[:10]))
+        print(UPLOAD_WINDOW_LINE)
         print("Once registered above, go ask your AI something — that is what this was for.")
     return 0
 

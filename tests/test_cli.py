@@ -521,3 +521,42 @@ def test_a_real_run_is_untouched_by_any_of_this(
     captured = capsys.readouterr()
     assert "DECRYPTED" in captured.out and "SYNTHETIC" not in captured.out
     assert captured.err == "", "no banner on a real run"
+
+
+# ── bind success copy (2026-09-06) ──────────────────────────────────────────
+
+
+def test_bind_success_does_not_promise_access_the_plan_does_not_grant() -> None:
+    """The sentence that was false every time it printed, from 09-03 to 09-06.
+
+    It read "Full access to your health data is on until <date>". The trial
+    unlocks the AI INTERFACE; Invariant 72 clamps the UPLOAD WINDOW to 7 days
+    for `.trial` exactly as for `.free`, so the two facts had to stop being one
+    sentence. Worse than occasionally wrong: `trial_ends_at` is non-nil only
+    when a fresh trial clock starts, and that is suppressed for grandfathered,
+    already-trialling and paid accounts — i.e. it printed if and only if the
+    reader was clamped.
+    """
+
+    unlock = cli.TRIAL_UNLOCK_LINE.format(date="2026-09-09")
+    assert "2026-09-09" in unlock
+    assert "full access" not in unlock.lower(), (
+        "an unqualified access claim is what made this line false; say what is unlocked"
+    )
+    assert "health data" not in unlock.lower(), (
+        "the trial unlocks the interface, not the data window — naming the data here "
+        "is exactly the merge that produced the falsehood"
+    )
+
+
+def test_bind_success_states_the_seven_day_window_as_a_boundary() -> None:
+    """A user who asks for a month and gets a week must be able to tell why.
+
+    Without the reason the product looks broken at its own success moment, and
+    the obvious next moves (re-sync, re-pair) can never help.
+    """
+
+    window = cli.UPLOAD_WINDOW_LINE.lower()
+    assert "7 days" in window
+    assert "plan boundary" in window, "it has to say this is a plan, not a pending sync"
+    assert "not a sync" in window

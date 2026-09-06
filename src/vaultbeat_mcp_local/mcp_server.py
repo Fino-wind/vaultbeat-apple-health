@@ -10,7 +10,8 @@ from typing import Any, Callable, TypeVar, cast
 from vaultbeat_mcp_local import __version__
 from vaultbeat_mcp_local.demo import demo_enabled
 from vaultbeat_mcp_local.demo_watermark import watermark_demo_result
-from vaultbeat_mcp_local.prompts import register_prompts
+from vaultbeat_mcp_local.analysis import series_catalog
+from vaultbeat_mcp_local.prompts import register_prompts, server_instructions
 from vaultbeat_mcp_local.service import VaultbeatLocalService
 from vaultbeat_mcp_local.store import ConfigStore
 
@@ -29,6 +30,18 @@ _F = TypeVar("_F", bound=Callable[..., Any])
 # FastMCP lazily so a missing SDK produces a sentence instead of a traceback; a
 # module-level `from mcp.types import ...` here would raise first and make that
 # whole guard dead code.
+
+
+#: Shipped with the series catalog. Says the one thing the list itself cannot:
+#: that the ABSENT kinds are absent on purpose, so an agent does not read a short
+#: list as a gap in the product and go looking for `get_workout_trend`.
+_SERIES_CATALOG_NOTE = (
+    "These are the quantities that are genuinely one number per day, which is what "
+    "trend / compare / correlate need. Kinds that are not here (sleep stages, "
+    "workouts, strength sets, food, notes, symptoms, menstrual cycle) are richer than "
+    "one number and are read with their own `get_*` tool — their absence from this "
+    "list is a design choice, not missing data."
+)
 
 
 def _read_only_tool(*, open_world: bool = False) -> Any:
@@ -391,8 +404,15 @@ def run_mcp_server(
     #
     # The demo suffix rides on the same string for the same reason: it is the one
     # label a client shows without anyone calling anything.
+    # `instructions` rides in the `initialize` response — the ONE channel every
+    # MCP client receives without asking. It exists because `STYLE` and `ABSENCE`
+    # did not reach most agents: those are appended to prompts, and `prompts/*`
+    # is opt-in, while the common shape is initialize → tools/list → call. See
+    # `prompts.server_instructions` for why the text concatenates them instead of
+    # paraphrasing.
     mcp = FastMCP(
         "Vaultbeat Health [DEMO — SYNTHETIC DATA]" if demo_active else "Vaultbeat Health",
+        instructions=server_instructions(demo=demo_active),
         host=host,
         port=port,
         streamable_http_path=_normalize_http_path(path),
@@ -1052,8 +1072,10 @@ def run_mcp_server(
 
         Returns `stage_intervals` (contiguous stage bands with start/end),
         `stage_minutes`, and `stage_vitals` (per-stage HR/RR min/mean/max). Use
-        `owner` prefix to filter by person (e.g. "a1a1" for linyou, "b2b2" for
-        partner).
+        `owner` prefix to filter by person — the first characters of a user id.
+        `vaultbeat_doctor` lists them under `capabilities.owner_prefixes`; there
+        is no other way to discover one, and omitting `owner` on a paired
+        account blends both people into one result.
 
         ⚠️ SIZE: each night is ~1-2k characters as returned. Setting
         `include_timeline=True` adds the raw per-sample array (hr, rr, stage,
@@ -1304,6 +1326,100 @@ def run_mcp_server(
         """
 
         return await service.mindfulness_summary(limit=limit, owner=owner, fresh=fresh)
+
+    # ── Analysis ───────────────────────────────────────────────────────────
+    #
+    # Three tools, one `series` parameter each, instead of a trend tool per kind:
+    # the arithmetic is identical across kinds, and a per-kind family would be
+    # 45 tools that all have to be kept in step. `list_metric_series` is what
+    # makes the parameter guessable — an agent reads the catalog, it does not
+    # guess a name and get an error.
+    #
+    # 🔑 They exist because an agent asked for a trend WILL produce one, and a
+    # Pearson coefficient computed token-by-token is the least reliable number
+    # an LLM emits. Moving the arithmetic here does not make the analysis
+    # better-founded; it makes it DETERMINISTIC and identical between two
+    # sessions asking the same question — which is the property the raw-rows
+    # route cannot have. Interpretation stays out (see `analysis.py`).
+
+    @tool(title="List analysable series", annotations=_read_only_tool())
+    async def list_metric_series() -> dict[str, Any]:
+        """List every series the trend / compare / correlate tools accept, with units.
+
+        Call this BEFORE guessing a `series` name. Kinds with a richer shape
+        (sleep stages, workouts, strength sets, food, notes, symptoms, cycle) are
+        deliberately absent — flattening them to one number per day would answer a
+        question you did not ask; read them with their own `get_*` tool.
+        """
+
+        return {"series": series_catalog(), "note": _SERIES_CATALOG_NOTE}
+
+    @tool(title="Metric trend", annotations=_read_only_tool())
+    async def get_metric_trend(
+        series: str, days: int = 30, owner: str | None = None, fresh: bool = False
+    ) -> dict[str, Any]:
+        """Least-squares trend for one daily series: slope per day, endpoints, spread.
+
+        `series` is a name from `list_metric_series`. `days` selects the newest N days
+        THAT HAVE DATA, not the last N calendar days — compare `n_days` with
+        `span_days` to see whether the history is dense or sparse.
+
+        Returns arithmetic only. `slope_per_day` is in the series' own unit per day and
+        carries no threshold, band or verdict; fewer than 3 days returns a null slope
+        with a reason rather than a number fitted to noise.
+
+        Carries a `coverage` block over the days the arithmetic used: quote
+        `coverage.days_covered` and `coverage.span_days` beside any number here, and
+        read `coverage.window_satisfied: false` as a shorter history than you asked
+        for rather than as a missing kind.
+        """
+
+        return await service.metric_trend(series=series, days=days, owner=owner, fresh=fresh)
+
+    @tool(title="Compare two periods", annotations=_read_only_tool())
+    async def compare_metric_periods(
+        series: str, days: int = 7, owner: str | None = None, fresh: bool = False
+    ) -> dict[str, Any]:
+        """Compare the newest `days` days of a series against the `days` before them.
+
+        "Before" means the next-oldest days WITH DATA, so a gap makes the earlier
+        window older rather than emptier — read `previous.first_day` / `previous.last_day`
+        to see which period you actually got, and quote them.
+
+        Returns both windows' mean/median/min/max and the differences. It does not say
+        which window is better; that depends on the metric and on the person.
+
+        Carries a `coverage` block over the days the arithmetic used: quote
+        `coverage.days_covered` and `coverage.span_days` beside any number here, and
+        read `coverage.window_satisfied: false` as a shorter history than you asked
+        for rather than as a missing kind.
+        """
+
+        return await service.metric_compare_periods(series=series, days=days, owner=owner, fresh=fresh)
+
+    @tool(title="Correlate two series", annotations=_read_only_tool())
+    async def correlate_metric_series(
+        series_a: str, series_b: str, days: int = 30, owner: str | None = None, fresh: bool = False
+    ) -> dict[str, Any]:
+        """Pearson r between two daily series, over days that have BOTH recorded.
+
+        Days missing on either side are dropped, never interpolated and never read as
+        zero, so `n_pairs` is usually smaller than either series — quote it with `r`.
+        Fewer than 3 shared days returns null with a reason: any two points are
+        perfectly collinear, so a coefficient there is an artefact.
+
+        The result carries a `caveat` field about causation. Repeat its substance in
+        your answer, and do not translate r into a word like "strong".
+
+        Carries a `coverage` block over the days the arithmetic used: quote
+        `coverage.days_covered` and `coverage.span_days` beside any number here, and
+        read `coverage.window_satisfied: false` as a shorter history than you asked
+        for rather than as a missing kind.
+        """
+
+        return await service.metric_correlate(
+            series_a=series_a, series_b=series_b, days=days, owner=owner, fresh=fresh
+        )
 
     if selected_transport == "stdio":
         mcp.run(transport="stdio")
