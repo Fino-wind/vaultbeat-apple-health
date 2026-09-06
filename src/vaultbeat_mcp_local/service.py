@@ -10,6 +10,14 @@ from datetime import date, datetime, timedelta, timezone
 from collections.abc import Callable
 from typing import Any, Protocol, TypeVar
 
+from vaultbeat_mcp_local.analysis import (
+    compare_periods,
+    correlate,
+    daily_series,
+    lookup as series_lookup,
+    series_catalog,
+    trend,
+)
 from vaultbeat_mcp_local.cache import LocalRecordCache
 from vaultbeat_mcp_local.client import (
     PollBindingResult,
@@ -1405,6 +1413,46 @@ _COVERAGE_NOTE = (
     "when no limit was requested. None of these fields is a quality judgement — "
     "sparse is normal for kinds the Watch only measures occasionally."
 )
+
+
+#: Rides on every analysis result. It says the two things an agent gets wrong
+#: about these tools specifically, which is why it is not just `_COVERAGE_NOTE`:
+#: the window here counts DAYS THAT HAVE DATA rather than calendar days, and the
+#: output is arithmetic that deliberately stops short of a conclusion.
+_SERIES_NOTE = (
+    "`days` selects the newest N calendar days THAT HAVE DATA for this series, not "
+    "the last N days on the calendar — for a metric the Watch samples occasionally, "
+    "30 days of data can span half a year. Read `span_days` beside `n_days` to see "
+    "which you got. Days with no reading are skipped, never filled in and never read "
+    "as zero. Where a day holds several samples they are averaged, and "
+    "`rows_consumed` is how many rows that took. These numbers are arithmetic only: "
+    "no threshold, band, grade or verdict is implied by any of them."
+)
+
+
+def _attach_series_coverage(
+    result: dict[str, Any], points: dict[str, float], *, requested: int
+) -> dict[str, Any]:
+    """The standard coverage block, over an already-bucketed `{day: value}` map.
+
+    Reuses `_attach_coverage` rather than hand-rolling the fields, so an analysis
+    result and a read result answer "how much data is this?" with the same keys,
+    the same note, and the same meaning. That matters more here than anywhere
+    else: `STYLE` tells every agent to quote `coverage.days_covered` beside a
+    trend, and a trend tool that spelled it `n_days` would be the one place that
+    instruction silently fails.
+
+    The rows handed in are synthetic one-per-day stubs because the days ARE the
+    rows at this layer — the real ones were collapsed by `daily_series`, and
+    passing those instead would count samples where the caller asked for days.
+    """
+
+    return _attach_coverage(
+        result,
+        rows=[{"local_date": day} for day in sorted(points)],
+        requested=requested,
+        unit="days",
+    )
 
 
 def _coverage_day_of(row: Any) -> str | None:
@@ -4918,6 +4966,155 @@ class VaultbeatLocalService:
             },
         }
 
+    # ── Analysis over daily series (arithmetic only — see `analysis.py`) ────
+    #
+    # These three READ THROUGH the same per-kind methods the tools use rather
+    # than querying separately, so a trend can never disagree with the rows
+    # `get_<kind>` prints. Two query paths for one number is the shape that lets
+    # a product report two different answers for the same question.
+
+    #: How many rows to ask a kind for, per day of window requested.
+    #:
+    #: Kinds whose `limit` counts SAMPLES (resting_hr, hrv, wrist_temp, vo2max)
+    #: need more rows than days or the window comes back short; kinds whose
+    #: limit counts days are simply over-fetched, which costs nothing because
+    #: every read is served from the same local cache. Over-fetching in one
+    #: direction is recoverable, under-fetching silently truncates the window —
+    #: so the asymmetric choice is deliberate.
+    _SERIES_ROW_MULTIPLIER = 4
+    _SERIES_ROW_FLOOR = 30
+
+    async def _series_points(
+        self, spec: Any, *, days: int, owner: str | None, fresh: bool
+    ) -> tuple[dict[str, float], int, dict[str, Any]]:
+        """Fetch one series and cut it to the newest `days` calendar days.
+
+        Returns (points, rows_consumed, raw_summary). The cut happens on DAYS
+        after bucketing, never on rows before it — cutting rows first is the bug
+        the read tools already fixed twice (business-time sort before the cut):
+        a kind that records several samples on a busy day would otherwise return
+        fewer days than asked while looking like it returned the full window.
+        """
+
+        fetch = getattr(self, spec.method, None)
+        if fetch is None:  # pragma: no cover — SERIES is checked by a test
+            raise VaultbeatUnsupportedMetricError(spec.method)
+
+        limit = max(days * self._SERIES_ROW_MULTIPLIER, self._SERIES_ROW_FLOOR)
+        summary = await fetch(limit=limit, owner=owner, fresh=fresh)
+        points, consumed = daily_series(summary, spec)
+
+        newest = sorted(points)[-days:] if days > 0 else []
+        return {d: points[d] for d in newest}, consumed, summary
+
+    @staticmethod
+    def _unknown_series(name: str) -> dict[str, Any]:
+        """A wrong series name answered with the right ones, not with a stack trace.
+
+        Raising would reach the agent as one sentence with no way forward, and
+        the most likely next move is another guess. The catalog costs a few
+        hundred bytes on a path that only runs when someone is already lost.
+        """
+
+        return {
+            "error": "unknown_series",
+            "requested": name,
+            "message": (
+                f"No series named {name!r}. Pick one of `available_series` below, or "
+                "call the matching `get_<kind>` tool if you need the raw rows instead "
+                "of one number per day."
+            ),
+            "available_series": series_catalog(),
+        }
+
+    async def metric_trend(
+        self, *, series: str, days: int = 30, owner: str | None = None, fresh: bool = False
+    ) -> dict[str, Any]:
+        spec = series_lookup(series)
+        if spec is None:
+            return self._unknown_series(series)
+        points, consumed, _ = await self._series_points(
+            spec, days=days, owner=owner, fresh=fresh
+        )
+        result = trend(points, spec)
+        result["requested_days"] = days
+        result["rows_consumed"] = consumed
+        result["note"] = _SERIES_NOTE
+        _attach_series_coverage(result, points, requested=days)
+        return result
+
+    async def metric_compare_periods(
+        self, *, series: str, days: int = 7, owner: str | None = None, fresh: bool = False
+    ) -> dict[str, Any]:
+        """Compare the newest `days` days against the `days` immediately before them.
+
+        "Immediately before" means the next-newest days WITH DATA, not the
+        preceding calendar block — this layer never invents a day, so a gap
+        makes the previous window older rather than emptier. `previous.first_day`
+        and `previous.last_day` are what say which it was, and they ship on every
+        response for exactly that reason.
+        """
+
+        spec = series_lookup(series)
+        if spec is None:
+            return self._unknown_series(series)
+        points, consumed, _ = await self._series_points(
+            spec, days=days * 2, owner=owner, fresh=fresh
+        )
+        ordered = sorted(points)
+        recent_days = ordered[-days:]
+        previous_days = ordered[: -days][-days:] if len(ordered) > days else []
+        result = compare_periods(
+            {d: points[d] for d in recent_days},
+            {d: points[d] for d in previous_days},
+            spec,
+        )
+        result["requested_days_per_window"] = days
+        result["rows_consumed"] = consumed
+        result["note"] = _SERIES_NOTE
+        # Over BOTH windows, and `requested` is therefore `days * 2`: the block
+        # has to describe the set the comparison rests on, and a comparison
+        # rests on both halves. Each half's own day count is inside its block.
+        _attach_series_coverage(
+            result,
+            {d: points[d] for d in recent_days + previous_days},
+            requested=days * 2,
+        )
+        return result
+
+    async def metric_correlate(
+        self,
+        *,
+        series_a: str,
+        series_b: str,
+        days: int = 30,
+        owner: str | None = None,
+        fresh: bool = False,
+    ) -> dict[str, Any]:
+        spec_a = series_lookup(series_a)
+        if spec_a is None:
+            return self._unknown_series(series_a)
+        spec_b = series_lookup(series_b)
+        if spec_b is None:
+            return self._unknown_series(series_b)
+        a_points, a_rows, _ = await self._series_points(
+            spec_a, days=days, owner=owner, fresh=fresh
+        )
+        b_points, b_rows, _ = await self._series_points(
+            spec_b, days=days, owner=owner, fresh=fresh
+        )
+        result = correlate(a_points, b_points, spec_a, spec_b)
+        result["requested_days"] = days
+        result["rows_consumed"] = {"a": a_rows, "b": b_rows}
+        result["note"] = _SERIES_NOTE
+        # The SHARED days, not the union: those are the only days the
+        # coefficient is computed over, and Invariant 62 asks that coverage
+        # describe the set the numbers come from rather than the set that was
+        # fetched. A union here would report 30 days behind an r built on 11.
+        shared = {d: a_points[d] for d in sorted(set(a_points) & set(b_points))}
+        _attach_series_coverage(result, shared, requested=days)
+        return result
+
     async def doctor(self) -> dict[str, Any]:
         """Aggregated self-diagnosis for the install/binding first mile
         (roadmap v1.2.1 "绑定失败自诊断"). Returns machine-readable checks;
@@ -5321,6 +5518,25 @@ class VaultbeatLocalService:
             # kind's payload parsed for its own business date; until then a count
             # is the honest signal.
             "record_counts": {k: counts[k] for k in present},
+            # ⭐ (2026-09-06) The one place these can be produced for free — this
+            # function already holds every decrypted record, and each carries its
+            # owner id.
+            #
+            # 🔑 Why they need a home at all: `skill.md` tells the agent to pass
+            # `owner` on EVERY read of a paired account, because omitting it
+            # silently pools two people's records into one average with nothing
+            # in the payload saying so. It also said to get the prefixes from
+            # `vaultbeat_status` — which has never returned them. The only way to
+            # discover a prefix was to make exactly the unfiltered call the rule
+            # exists to prevent, and then read an id out of the blended result.
+            #
+            # NOT put on `status`: that is a local-binding report, it makes no
+            # network call and decrypts nothing, and answering this there would
+            # mean parsing a cache file that reaches ~20 MB — on the most
+            # frequently polled tool in the product.
+            "owner_prefixes": sorted(
+                {r.owner_user_id[:8] for r in records if r.owner_user_id}
+            ),
             "possibly_needs_newer_app": gated,
             # 🔴 Cause (1) is FIRST because it is the one a brand-new user actually
             # hits, and the only one they can act on in seconds. Until 2026-08-11 this

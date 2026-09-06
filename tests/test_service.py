@@ -4151,6 +4151,12 @@ _READ_TOOL_KWARGS: dict[str, dict[str, Any]] = {
     "notes_summary": {"limit": 20},
     "strength_summary": {"limit": 20},
     "food_summary": {"limit": 20},
+    # The analysis trio takes a `series` rather than a `limit`, and it is
+    # REQUIRED — there is no sensible default quantity to trend, and picking one
+    # would make a typo'd series silently return somebody else's metric.
+    "metric_trend": {"series": "resting_hr", "days": 14},
+    "metric_compare_periods": {"series": "resting_hr", "days": 7},
+    "metric_correlate": {"series_a": "resting_hr", "series_b": "sleep_minutes", "days": 14},
 }
 
 

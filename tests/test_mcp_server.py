@@ -575,6 +575,24 @@ def test_only_the_doctor_reaches_outside_this_system(monkeypatch: Any, tmp_path:
     assert open_world == ["vaultbeat_doctor"]
 
 
+#: Arguments for the read tools that cannot be called bare.
+#:
+#: Everything else takes only defaulted parameters and is invoked with none, so
+#: this table stays empty for new tools by default — a tool lands here only
+#: because it has a REQUIRED argument, which for the analysis trio is deliberate
+#: (there is no sensible default quantity to trend, and defaulting one would let
+#: a typo'd series silently return a different metric).
+_READ_TOOL_ARGS: dict[str, dict[str, Any]] = {
+    "get_metric_trend": {"series": "resting_hr", "days": 14},
+    "compare_metric_periods": {"series": "resting_hr", "days": 7},
+    "correlate_metric_series": {
+        "series_a": "resting_hr",
+        "series_b": "sleep_minutes",
+        "days": 14,
+    },
+}
+
+
 def test_every_tool_that_returns_coverage_says_so_in_its_docstring(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
@@ -615,7 +633,7 @@ def test_every_tool_that_returns_coverage_says_so_in_its_docstring(
     for name, (function, hints) in captured.items():
         if not hints.readOnlyHint or hints.openWorldHint:
             continue
-        result = function()
+        result = function(**_READ_TOOL_ARGS.get(name, {}))
         if asyncio.iscoroutine(result):
             result = asyncio.run(result)
         returns_coverage = "coverage" in result

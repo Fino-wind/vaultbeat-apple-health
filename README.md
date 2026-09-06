@@ -12,7 +12,7 @@ re-export the public repo and update its README tool table + the website `/mcp` 
 It runs on the user's computer, generates the Curve25519 keypair used by the iOS app,
 shows a QR binding payload, receives a one-time server token from the cloud API, and
 then exposes decrypted health data — sleep, water, weight, cycle, activity, vitals —
-through either a CLI or a stdio MCP server.
+through either a CLI or a stdio MCP server. Read-only: data is written by the iOS app.
 
 ## Commands
 
@@ -137,7 +137,7 @@ a fresh QR", or "the stored key can no longer decrypt your data — delete this 
 in the iOS app and bind again"). Exit code 0 = all healthy, 1 = something needs the
 hint above.
 
-## MCP Tools
+## MCP Tools (33)
 
 `vaultbeat-apple-health serve` can start either a stdio MCP server or a streamable HTTP MCP
 server. Every data tool accepts `owner` (user-ID prefix) to filter to one person and
@@ -177,6 +177,22 @@ Health data:
   during outdoor walk/run/hike, so a handful of samples across a year is normal
 - `get_basal_energy` — basal metabolism (BMR) kcal, hourly buckets
 - `get_total_energy_burned` — basal + active = TDEE, with a 7-day average
+
+Analysis (arithmetic over a daily series — the tools above return the rows, these
+return the maths):
+
+- `list_metric_series` — the series names the three tools below accept, with units.
+  Call it before guessing a name.
+- `get_metric_trend` — least-squares slope per day, endpoints, mean/median/min/max
+- `compare_metric_periods` — newest N days vs the N days before them, with the differences
+- `correlate_metric_series` — Pearson r between two series over days that have both
+
+They exist because an agent asked for a trend produces one either way, and a
+coefficient computed token-by-token is the least reliable number an LLM emits.
+These return numbers only — no threshold, band, grade or verdict — and refuse rather
+than fit a line to two points. Kinds with a richer shape (sleep stages, workouts,
+strength sets, food, notes, symptoms, cycle) are deliberately not series: flattening
+them to one number per day would answer a question you did not ask.
 
 **Every read tool also returns a `coverage` block**, and an agent that wants to say
 "this is based on N days" has nothing else to read. Fields: `days_covered`,

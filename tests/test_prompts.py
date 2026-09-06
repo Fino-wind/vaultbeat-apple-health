@@ -300,3 +300,73 @@ def test_a_real_server_does_not_prefix_the_prompts(
     text = _get_prompt(_build_server(tmp_path, monkeypatch), "daily_brief")
     assert not text.startswith(DEMO_PREFIX)
     assert "SYNTHETIC" not in text
+
+
+# ── The handshake channel ───────────────────────────────────────────────────
+#
+# These assert through `create_initialization_options()` rather than on the
+# constant, for the reason `test_the_server_actually_lists_them` gives one
+# section up: reading `SERVER_INSTRUCTIONS` directly would keep passing if the
+# text were never handed to `FastMCP`, and "written but never delivered" is the
+# exact failure this text was added to fix.
+
+
+def _handshake_instructions(server: Any) -> str:
+    return server._mcp_server.create_initialization_options().instructions or ""
+
+
+def test_the_handshake_actually_carries_the_instructions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = _handshake_instructions(_build_server(tmp_path, monkeypatch))
+    assert text, "initialize would arrive with no orientation at all"
+    assert "vaultbeat_doctor" in text, "the first call an agent should make is unnamed"
+
+
+def test_the_two_safety_rules_reach_agents_that_never_open_a_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of putting them here as well.
+
+    `prompts/*` is opt-in; the common client shape is initialize → tools/list →
+    call, which never touches one. Asserting the VERBATIM constants (not a
+    paraphrase) is what keeps the two delivery channels from drifting into two
+    different policies.
+    """
+
+    text = _handshake_instructions(_build_server(tmp_path, monkeypatch))
+    assert STYLE.strip() in text
+    assert ABSENCE.strip() in text
+
+
+def test_the_handshake_states_the_seven_day_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A free-tier read comes back short, and the wrong diagnosis is expensive.
+
+    Without this sentence an agent reads a 7-day answer to a 30-day question as
+    a sync that has not finished, and tells the user to wait for data that is
+    never coming — a plan boundary rendered as a fault in our own product.
+    """
+
+    text = _handshake_instructions(_build_server(tmp_path, monkeypatch))
+    assert "7 days" in text
+    assert "coverage.days_covered" in text
+
+
+def test_demo_mode_says_so_in_the_handshake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Invariant 61: instructions are quotable before any tool runs."""
+
+    monkeypatch.setenv(demo_module.DEMO_ENV, "1")
+    demo_module.reset_cache()
+    text = _handshake_instructions(_build_server(tmp_path, monkeypatch))
+    assert text.startswith(DEMO_PREFIX)
+
+
+def test_a_real_server_does_not_watermark_the_handshake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = _handshake_instructions(_build_server(tmp_path, monkeypatch))
+    assert "SYNTHETIC" not in text

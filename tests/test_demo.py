@@ -99,6 +99,17 @@ _ARGS: dict[str, dict[str, Any]] = {
     "log_note": {"text": "恶心"},
     "log_note_append": {"text": "恶心"},
     "log_weight_entry": {"weight_kg": 72.5},
+    # READ tools with a required argument. The analysis trio takes a `series`
+    # on purpose (no sensible default quantity to trend, and a default would let
+    # a typo silently return a different metric), so every sweep below has to
+    # look here rather than calling them bare.
+    "get_metric_trend": {"series": "resting_hr", "days": 14},
+    "compare_metric_periods": {"series": "resting_hr", "days": 7},
+    "correlate_metric_series": {
+        "series_a": "resting_hr",
+        "series_b": "sleep_minutes",
+        "days": 14,
+    },
 }
 
 #: Tools that write to the cloud on a real install, mapped to the service method
@@ -565,7 +576,8 @@ def test_two_independent_services_produce_byte_identical_output(
     def render(directory: Path) -> bytes:
         server = _build_server(directory, monkeypatch)
         payload = {
-            name: _call(server, name).structuredContent for name in _read_tool_names(server)
+            name: _call(server, name, _ARGS.get(name)).structuredContent
+            for name in _read_tool_names(server)
         }
         return json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
 
@@ -648,7 +660,7 @@ def test_a_full_read_pass_writes_nothing_to_disk(
 
     server = _build_server(tmp_path, monkeypatch)
     for name in _read_tool_names(server):
-        assert not _call(server, name).isError, name
+        assert not _call(server, name, _ARGS.get(name)).isError, name
     for name in ("vaultbeat_status", "vaultbeat_doctor"):
         assert not _call(server, name).isError, name
 

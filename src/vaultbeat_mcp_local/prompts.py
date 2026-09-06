@@ -57,11 +57,13 @@ from typing import Any
 __all__ = [
     "ABSENCE",
     "PROMPTS",
+    "SERVER_INSTRUCTIONS",
     "STYLE",
     "PromptArg",
     "VaultbeatPrompt",
     "register_prompts",
     "render_prompt",
+    "server_instructions",
 ]
 
 
@@ -123,6 +125,65 @@ DEMO_PREFIX = (
     "instruction below as written, but say plainly in your answer that it "
     "describes a demo. "
 )
+
+
+# ── The handshake channel ───────────────────────────────────────────────────
+
+#: The orientation text that rides in the `initialize` response, before the
+#: client has called anything.
+#:
+#: WHY IT EXISTS, given that `STYLE` and `ABSENCE` were already written: they
+#: were unreachable for most agents. Both are appended to PROMPTS, and
+#: `prompts/*` is opt-in — a client has to go looking. The overwhelmingly common
+#: shape is `initialize` → `tools/list` → call a tool, which never touches a
+#: prompt, so the two rules that exist specifically to stop an agent reporting a
+#: gap as a zero were being delivered only to the agents that already cared
+#: enough to browse. `instructions` is the one channel every MCP client receives
+#: by construction.
+#:
+#: 🔑 It CONCATENATES those constants rather than restating them (Invariant 58
+#: applied to prose, same as the prompt library): two deliveries, one text. A
+#: paraphrase here would be a mirror, and mirrors of a safety rule rot into two
+#: different policies — which is the exact failure the prompt library's own
+#: header warns about.
+#:
+#: Kept short on purpose. This is sent once per session, but it is spent from
+#: the same context budget as the answer, and an orientation nobody finishes
+#: reading orients nobody. Everything here is a rule an agent gets WRONG
+#: without it; anything merely nice to know belongs in `skill.md`.
+_INSTRUCTIONS_BODY = (
+    "Vaultbeat serves one person's Apple Health history, end-to-end encrypted in "
+    "the cloud and decrypted only on this machine. You are reading a real body's "
+    "record, so the cost of a confident wrong sentence is higher than the cost of "
+    "saying you do not know.\n\n"
+    "Order of operations: call `vaultbeat_doctor` first — it reports which kinds "
+    "actually have data and is the only tool that can tell apart the several "
+    "reasons a kind might be empty. Then read the kind you need. There is no "
+    "`get_sleep`; the sleep tool is `get_sleep_detail`.\n\n"
+    "A short history is usually a plan boundary, not a sync delay. On the free "
+    "plan and during the 3-day trial only the user's last 7 days are uploaded to "
+    "the cloud, so that is all this server can ever decrypt — asking for a month "
+    "returns a week, permanently, and re-syncing in the iOS app will not change "
+    "it. Check `coverage.days_covered` before telling anyone to wait.\n\n"
+    "Writes (`log_*`) record what the user told you, not what you inferred. Read "
+    "the day first, append rather than replace when a tool offers both, and never "
+    "invent a value to fill a field the user did not give you."
+)
+
+#: Assembled once at import so both halves are impossible to update separately.
+SERVER_INSTRUCTIONS = _INSTRUCTIONS_BODY + "\n\n" + STYLE.strip() + "\n\n" + ABSENCE.strip()
+
+
+def server_instructions(*, demo: bool) -> str:
+    """The `initialize` orientation text, watermarked when serving synthetic data.
+
+    Demo mode reuses `DEMO_PREFIX` for the reason Invariant 61 gives: a boundary
+    has to be visible on every surface that can be quoted, and `serverInfo` plus
+    `instructions` are the two a client renders before any tool runs. The name
+    already carries the suffix; this carries the sentence explaining it.
+    """
+
+    return DEMO_PREFIX + SERVER_INSTRUCTIONS if demo else SERVER_INSTRUCTIONS
 
 
 @dataclass(frozen=True)
