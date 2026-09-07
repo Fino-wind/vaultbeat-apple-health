@@ -320,6 +320,95 @@ def test_every_series_returns_days_through_the_real_service(
         )
 
 
+def _sampled_kind(*, total_days: int, samples_per_day: int, calls: list[int]) -> Any:
+    """A read method shaped like the real sampling kinds.
+
+    `limit` counts SAMPLES, not days, and the newest rows come first — that is
+    what `resting_hr` / `hrv` / `wrist_temp` / `vo2max` do, and it is the shape
+    that makes a day-window request come back short.
+    """
+
+    from datetime import date, timedelta
+
+    async def fetch(*, limit: int, owner: Any = None, fresh: bool = False) -> dict[str, Any]:
+        calls.append(limit)
+        anchor_day = date(2026, 9, 7)
+        rows = [
+            {"local_date": (anchor_day - timedelta(days=d)).isoformat(), "sdnn_ms": 40 + s}
+            for d in range(total_days)
+            for s in range(samples_per_day)
+        ]
+        return {"records": rows[:limit]}
+
+    return fetch
+
+
+def test_a_busy_sampling_kind_still_fills_the_requested_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure this guards did not look like a failure — it looked like the user.
+
+    `_series_points` asks for `days * 4` rows. For a kind whose `limit` counts
+    samples, a day with more than four of them means the rows run out before
+    the days do: measured at 6 samples/day, a 30-day request against 60 days of
+    stored history returned 20 days.
+
+    Nothing errored. `window_satisfied` went false, which is TRUE and is read
+    as the wrong thing — the coverage note glosses that flag as "that is all
+    the history this server holds … re-check after a re-sync", so the agent
+    sends the user to re-sync data that was already on disk, and the trend's
+    slope is computed over a third of the span it claims to answer for.
+
+    Asserting `days_covered > 0` (which is all the sweep above does) passes on
+    every one of those. This asserts the number that was wrong.
+    """
+
+    service = _demo_service(tmp_path, monkeypatch)
+    calls: list[int] = []
+    service.hrv_records = _sampled_kind(  # type: ignore[method-assign]
+        total_days=60, samples_per_day=6, calls=calls
+    )
+
+    result = asyncio.run(service.metric_trend(series="hrv_sdnn", days=30))
+    coverage = result["coverage"]
+
+    assert coverage["days_covered"] == 30, (
+        f"asked for 30 days against 60 days of history, got "
+        f"{coverage['days_covered']} — the row window truncated the day window"
+    )
+    assert coverage["window_satisfied"] is True
+    assert coverage["span_days"] == 30
+    assert len(calls) > 1, "it should have had to widen at least once"
+
+
+def test_a_short_history_stops_asking_instead_of_widening_to_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control, and it is what keeps the widening honest.
+
+    Without it, "fill the window" could be satisfied by re-asking until the cap
+    every time a kind is merely sparse — burning five reads to re-read the same
+    rows, and making `window_satisfied: false` (the correct answer when the
+    history really is short) arrive only after the loop gave up.
+
+    A response that comes back UNDER its limit is the signal that the history
+    ended, and one is enough to stop on.
+    """
+
+    service = _demo_service(tmp_path, monkeypatch)
+    calls: list[int] = []
+    service.hrv_records = _sampled_kind(  # type: ignore[method-assign]
+        total_days=10, samples_per_day=6, calls=calls
+    )
+
+    result = asyncio.run(service.metric_trend(series="hrv_sdnn", days=30))
+    coverage = result["coverage"]
+
+    assert coverage["days_covered"] == 10, "it must not invent the days it could not find"
+    assert coverage["window_satisfied"] is False, "a short history must still say so"
+    assert len(calls) == 1, f"re-asked {len(calls)}x for a history that had already ended"
+
+
 def test_an_unknown_series_answers_with_the_available_ones(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

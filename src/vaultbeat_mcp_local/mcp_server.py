@@ -154,6 +154,46 @@ def _demo_wrap(function: _F) -> _F:
     return cast(_F, sync_wrapper)
 
 
+def _demo_block_wrap(function: _F, *, tool_name: str) -> _F:
+    """Wrap one tool so demo mode REFUSES it instead of running it.
+
+    The difference from `_demo_wrap` is the whole point: that one runs the tool
+    and stamps the answer, this one never calls the tool at all. For the two
+    pairing tools that is the only safe shape — their side effects happen
+    during execution (`store.ensure_initialized`, `store.update`), so anything
+    that lets the body run and then annotates the result has already written
+    config.json and minted a key by the time it gets a value to annotate.
+
+    Kept at the `tool()` choke point rather than as an `if self._demo:` at the
+    top of each body: Invariant 61 names a demo predicate appearing inside tool
+    bodies as the tell that the boundary has decayed back into a flag, and the
+    list of tools that must refuse is exactly the list annotated here.
+
+    Same two shapes as `_demo_wrap`, for the same reason — `start_binding` is a
+    plain `def` and `poll_binding` is `async def`, and a sync wrapper around a
+    coroutine function hands FastMCP an unserialisable coroutine object that
+    the client renders as success.
+    """
+
+    from vaultbeat_mcp_local.service import _demo_binding_refusal
+
+    if inspect.iscoroutinefunction(function):
+
+        @functools.wraps(function)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            return _demo_binding_refusal(tool_name)
+
+        _prefix_doc(async_wrapper, function)
+        return cast(_F, async_wrapper)
+
+    @functools.wraps(function)
+    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+        return _demo_binding_refusal(tool_name)
+
+    _prefix_doc(sync_wrapper, function)
+    return cast(_F, sync_wrapper)
+
+
 def _prefix_doc(wrapper: Any, original: Any) -> None:
     """Put the demo warning at the top of the description FastMCP will publish."""
 
@@ -431,7 +471,9 @@ def run_mcp_server(
     if inner_server is not None and hasattr(inner_server, "version"):
         inner_server.version = __version__
 
-    def tool(*, title: str, annotations: Any) -> Callable[[_F], _F]:
+    def tool(
+        *, title: str, annotations: Any, blocked_in_demo: bool = False
+    ) -> Callable[[_F], _F]:
         """Register one tool — the single place demo mode can reach every tool.
 
         A choke point, not a convenience wrapper (Invariant 58): the alternative
@@ -452,7 +494,14 @@ def run_mcp_server(
             # mode returns before reaching.
             prepared = _access_wrap(function, service)
             if demo_active:
-                prepared = _demo_wrap(prepared)
+                # `blocked_in_demo` is checked FIRST and is not additive: a tool
+                # that must not run cannot also be watermarked, because
+                # watermarking implies there was a result to stamp.
+                prepared = (
+                    _demo_block_wrap(prepared, tool_name=function.__name__)
+                    if blocked_in_demo
+                    else _demo_wrap(prepared)
+                )
             return cast(_F, mcp.tool(title=title, annotations=annotations)(prepared))
 
         return decorator
@@ -504,7 +553,10 @@ def run_mcp_server(
 
     @tool(title="Sleep history", annotations=_read_only_tool())
     async def vaultbeat_sync_sleep(
-        limit: int = 50, owner: str | None = None, fresh: bool = False
+        limit: int = 50,
+        owner: str | None = None,
+        fresh: bool = False,
+        summary_only: bool = False,
     ) -> dict[str, Any]:
         """Fetch encrypted Vaultbeat sleep records, decrypt them locally, and return
         per-day primary session summaries matching the iOS app's display.
@@ -512,9 +564,11 @@ def run_mcp_server(
         Returns `daily_summary` (one primary session per local date, selected by
         iOS priority: Watch > iPhone > inBedOnly) and `sessions` (all raw records).
         The `limit` controls how many raw blobs are fetched; 50 covers ~2-3 weeks.
-        Use `owner` prefix to filter by person (e.g. "a1a1" for one user,
-        "b2b2" for the other) — without it, both partners' data is mixed and
-        per-day selection may pick the wrong person's session.
+        Use `owner` prefix to filter by person — take it from `vaultbeat_status`
+        (`owner_user_id_prefix` is the paired user; server 0.7.1+), or
+        `vaultbeat_doctor` for every owner present in the data. Without it, both
+        partners' data is mixed and per-day selection may pick the wrong
+        person's session.
 
         ⚠️ `is_in_bed_only: true` means sleep was NEVER MEASURED that night (the
         Watch wasn't worn) — NOT that the person slept zero. On those nights
@@ -529,13 +583,47 @@ def run_mcp_server(
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
         missing kind.
+
+        🔑 **Pass `summary_only=True` when you only want the SIDE EFFECT.** A default
+        call returns every decrypted session — measured at 76,446 characters, which
+        overflows a typical tool-result limit and gets spilled to a file the caller
+        then has to read back. That is the right shape when you want the nights; it
+        is pure waste when you called this to make the server do something (force a
+        sync, check the link is alive, confirm a deploy took effect), which is a
+        large share of real calls. `summary_only=True` returns the counts, the day
+        range and the coverage block, and nothing else. For the nights themselves,
+        `get_sleep_detail` is the tool that exists for it.
         """
 
-        return _annotate_if_empty(
-            await service.sleep_records(limit=limit, owner=owner, fresh=fresh),
-            "sleep",
-            "sessions",
-        )
+        result = await service.sleep_records(limit=limit, owner=owner, fresh=fresh)
+        if summary_only:
+            # 🔴 Keep `coverage` and drop the bodies. Coverage is what says how much
+            # the answer rests on (Invariant 64), so removing it would turn a
+            # deliberately small reply into an unanchored one — the opposite of the
+            # honesty this server is built on. `synced` counts the raw sessions that
+            # were actually decrypted, so the caller can still tell "the sync did
+            # something" from "the sync found nothing".
+            slim: dict[str, Any] = {
+                "summary_only": True,
+                "synced": len(result.get("sessions") or []),
+                "days": len(result.get("daily_summary") or []),
+                "note": (
+                    "Bodies omitted because summary_only=True. Call "
+                    "`get_sleep_detail` for the nights themselves."
+                ),
+            }
+            # ⚠️ The day RANGE is deliberately not recomputed here — `coverage`
+            # already carries `first_day` / `last_day`, and a second copy would be
+            # a second thing to keep correct. The first draft did recompute it,
+            # off `local_date`, and shipped two `None`s: the rows in
+            # `daily_summary` key their day as `date`. Caught by running it
+            # against the real account rather than by reading the code.
+            for passthrough in ("coverage", "errors"):
+                if passthrough in result:
+                    slim[passthrough] = result[passthrough]
+            return slim
+
+        return _annotate_if_empty(result, "sleep", "sessions")
 
     @tool(title="Water intake", annotations=_read_only_tool())
     async def get_water_intake(
@@ -545,7 +633,9 @@ def run_mcp_server(
 
         Returns one entry per day (newest first) with refill count, container volume, and
         derived intake in liters, plus `average_daily_intake_liters` over the window.
-        Use `owner` prefix to filter by person (e.g. "a1a1" or "b2b2").
+        Use `owner` prefix to filter by person — take it from
+        `vaultbeat_status` (`owner_user_id_prefix` is the paired user; server
+        0.7.1+), or `vaultbeat_doctor` for every owner present in the data.
         Each record carries `owner_user_id` to identify whose data it is.
 
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
@@ -568,7 +658,9 @@ def run_mcp_server(
 
         Returns one entry per day (newest first, kilograms) plus latest/average/min/max,
         the OLS weekly rate (kg/week), and — when `goal_kg` is given — the distance to goal.
-        Use `owner` prefix to filter by person (e.g. "a1a1" or "b2b2").
+        Use `owner` prefix to filter by person — take it from
+        `vaultbeat_status` (`owner_user_id_prefix` is the paired user; server
+        0.7.1+), or `vaultbeat_doctor` for every owner present in the data.
         Each record carries `owner_user_id` to identify whose data it is.
 
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
@@ -967,6 +1059,10 @@ def run_mcp_server(
     @tool(
         title="Start pairing (invalidates any open QR)",
         annotations=_mutating_tool(destructive=True),
+        # Writes config.json and mints the 0600 identity key — both forbidden
+        # to a demo process (Invariant 61), and both silent. See
+        # `_demo_binding_refusal`.
+        blocked_in_demo=True,
     )
     def vaultbeat_start_binding(server_name: str = "Local AI Server") -> dict[str, Any]:
         """Initialize a binding session: generates a keypair (if needed) and returns a
@@ -1007,6 +1103,10 @@ def run_mcp_server(
     @tool(
         title="Finish pairing (replaces this binding)",
         annotations=_mutating_tool(destructive=True),
+        # Its success branch overwrites server_id / server_token / owner
+        # identity and can clear the plaintext cache — the most destructive
+        # write in the package, and demo mode has no business reaching it.
+        blocked_in_demo=True,
     )
     async def vaultbeat_poll_binding() -> dict[str, Any]:
         """Check whether the user has scanned the QR code and authorized this server.
@@ -1180,7 +1280,9 @@ def run_mcp_server(
         was retracted 2026-07-22 after an adversarial review pointed out
         the window mismatch.
 
-        Use `owner` prefix to filter by person (e.g. `"a1a1"` / `"b2b2"`).
+        Use `owner` prefix to filter by person — take it from
+        `vaultbeat_status` (`owner_user_id_prefix` is the paired user; server
+        0.7.1+), or `vaultbeat_doctor` for every owner present in the data.
 
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read

@@ -371,9 +371,11 @@ def test_every_registered_tool_answers_in_demo_mode_without_binding(
     EVERY registered tool rather than a curated list — a new tool is covered the
     day it is added.
 
-    `vaultbeat_start_binding` runs first on purpose: `vaultbeat_poll_binding`
-    legitimately refuses without a session (see honest fact 2), and starting one
-    is what makes the sweep test demo mode instead of re-testing that contract.
+    `vaultbeat_start_binding` used to run first on purpose, so that
+    `vaultbeat_poll_binding` would have a session to find instead of refusing
+    for the ordinary unbound reason. Since 2026-09-07 both pairing tools refuse
+    in demo mode before touching anything, so the order no longer changes what
+    is tested — it is kept only so a failure reads in a stable sequence.
     """
 
     server = _build_server(tmp_path, monkeypatch)
@@ -392,9 +394,20 @@ def test_every_registered_tool_answers_in_demo_mode_without_binding(
 
     assert failures == [], "tools errored in demo mode:\n" + "\n".join(failures)
 
-    # Teeth for the write assertions elsewhere in this file: the fake is not
-    # merely unreached scenery — one read genuinely arrived at it.
-    assert "poll_binding" in recording_cloud.calls
+    # 🔴 This read `assert "poll_binding" in recording_cloud.calls` until
+    # 2026-09-07, and it was the ONE call that could still reach the network in
+    # demo mode — `poll_once` goes through the real cloud client, which demo
+    # mode never substitutes because it substitutes at the DATA boundary. This
+    # fixture's own docstring records the consequence in plain words ("without
+    # this, `vaultbeat_poll_binding` makes a real HTTPS request to production
+    # Supabase"), but it was written as a fact about the test harness, so the
+    # assertion built on it made an outbound call from an offline-by-design
+    # mode look like the sign of a healthy fake.
+    #
+    # The honest contract is the opposite and is now asserted as such: demo mode
+    # is offline, so NOTHING reaches the client at all. That is strictly
+    # stronger — the old line permitted every other tool to call out too.
+    assert recording_cloud.calls == [], "demo mode reached the network"
     assert recording_cloud.writes == []
 
 
@@ -502,6 +515,125 @@ def test_write_tools_refuse_and_no_write_ever_reaches_the_cloud(
 
     assert recording_cloud.writes == []
     assert recording_cloud.calls == []
+
+
+def test_the_recording_cloud_is_actually_wired_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recording_cloud: Any
+) -> None:
+    """Prove the fake is reachable, so every `calls == []` elsewhere has teeth.
+
+    This job used to be done inside the demo sweep, by asserting that
+    `poll_binding` HAD called out — which only worked because demo mode was
+    letting a network call through, so the proof depended on the very defect
+    that got fixed. A substitution that silently stopped applying (a renamed
+    symbol, a moved import, a fixture that no longer runs) would then turn
+    every "nothing reached the cloud" assertion in this file into a sentence
+    about an object nobody uses, and they would all still pass.
+
+    So the witness now lives where the call is SUPPOSED to happen: demo OFF,
+    where reaching the client is the correct behaviour rather than the bug.
+    """
+
+    monkeypatch.delenv(DEMO_ENV, raising=False)
+    server = _build_server(tmp_path, monkeypatch)
+
+    # Open a session first so `poll_binding` has a poll_id to ask about;
+    # without one it refuses locally and never reaches the client.
+    _call(server, "vaultbeat_start_binding", _ARGS.get("vaultbeat_start_binding"))
+    _call(server, "vaultbeat_poll_binding", _ARGS.get("vaultbeat_poll_binding"))
+
+    assert "poll_binding" in recording_cloud.calls, (
+        "the fake cloud client is no longer substituted in — every "
+        "`recording_cloud.calls == []` assertion in this file is now vacuous"
+    )
+
+
+# ── 3b. Pairing refuses, and the disk is untouched ───────────────────────────
+
+
+#: The two tools that must refuse for the OPPOSITE reason to the write tools:
+#: not "demo mode has no account to write to", but "demo mode needs no account".
+#: Both write disk on the way through — `start_binding` calls
+#: `store.ensure_initialized` (config.json + the 0600 identity.key) and
+#: `poll_binding` overwrites the credentials on success.
+_PAIRING_TOOLS = ("vaultbeat_start_binding", "vaultbeat_poll_binding")
+
+
+def test_pairing_tools_refuse_in_demo_and_write_nothing_to_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, demo_on: None
+) -> None:
+    """Two claims, and the second is the one that needed a new kind of assertion.
+
+    The return value proves the tool answered. It proves nothing about whether
+    a keypair was minted and a config file written on the way to answering —
+    an implementation that ran the body and then stamped the result would pass
+    a return-value-only check while leaving both artefacts behind. So this
+    asserts the FILESYSTEM, which is a statement about what happened rather
+    than about what was said. Same reasoning as
+    `test_write_tools_refuse_and_no_write_ever_reaches_the_cloud` recording the
+    wire instead of trusting the answer.
+
+    Why it matters more here than for the write tools: a demo `log_*` that
+    leaked would post synthetic data to a real account, which is loud. A demo
+    `start_binding` that leaked is silent in both directions — on a fresh
+    machine it leaves a real key behind after a "look what this does" run, and
+    on a paired one it rewrites `poll_id` and invalidates a QR the user is
+    looking at (Invariant 54), while the same session's `doctor` goes on
+    reporting demo mode as holding no key.
+    """
+
+    config_path = tmp_path / "config.json"
+    server = _build_server(tmp_path, monkeypatch)
+
+    # The premise of the disk assertion below. If constructing the server had
+    # already written a config, "still absent afterwards" would be vacuous.
+    assert not config_path.exists(), "premise broken: config existed before any tool ran"
+
+    for name in _PAIRING_TOOLS:
+        result = _call(server, name, _ARGS.get(name))
+
+        assert result.isError is False, f"{name} raised instead of refusing"
+        structured = result.structuredContent
+        assert isinstance(structured, dict), name
+        assert structured["ok"] is False, name
+        # The specific code, not just any refusal: it proves the call went
+        # through the pairing branch rather than failing for some other reason
+        # (an unbound machine refuses plenty of things).
+        assert structured["error"] == "demo_mode_needs_no_pairing", name
+        assert structured["tool"] == name, name
+        assert DEMO_ENV in structured["detail"], name
+        assert "SYNTHETIC" in _banner(structured), name
+
+    # The claim the return values cannot make.
+    assert not config_path.exists(), "demo mode wrote a config file"
+    assert not (tmp_path / "identity.key").exists(), "demo mode minted an identity key"
+    assert sorted(q.name for q in tmp_path.iterdir()) == [], "demo mode left files behind"
+
+
+def test_pairing_tools_still_write_when_demo_is_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control. Without it the test above passes for the wrong reason.
+
+    A typo in a tool name, a decorator that silently dropped its body, or a
+    `blocked_in_demo` that blocked everything would all leave the disk clean —
+    and "clean disk" is exactly what the previous test calls success. This
+    pins that the untouched filesystem is demo mode's doing and not the
+    harness's, by running the same tool with demo OFF and requiring the write
+    it is supposed to make.
+    """
+
+    config_path = tmp_path / "config.json"
+    monkeypatch.delenv(DEMO_ENV, raising=False)
+    server = _build_server(tmp_path, monkeypatch)
+
+    result = _call(server, "vaultbeat_start_binding", _ARGS.get("vaultbeat_start_binding"))
+
+    assert result.isError is False
+    structured = result.structuredContent
+    assert isinstance(structured, dict)
+    assert structured.get("poll_id"), "real mode must open a pairing session"
+    assert config_path.exists(), "real mode must persist the session it just opened"
 
 
 # ── 4. The demo covers the whole product — the anti-rot guard ────────────────

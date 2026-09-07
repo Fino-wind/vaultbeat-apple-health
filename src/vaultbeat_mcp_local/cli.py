@@ -824,10 +824,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout",
         type=int,
         default=300,
+        # 🔴 Read "SECONDS to keep the QR code valid ... or subscribe first"
+        # until 2026-09-07. Both halves were wrong, and wrong in the same
+        # direction: they made pairing sound narrower and more conditional than
+        # it is, at the first command anyone runs.
+        #
+        # · This flag does not govern the QR's lifetime. It is how long THIS
+        #   COMMAND waits. The pairing row on the cloud lives 600s
+        #   (`mcp-bind-local` sets expires_at = now + 600000), so at the default
+        #   the QR OUTLIVES the wait by five minutes — raising it up to that
+        #   ceiling costs nothing. Saying the flag keeps the QR valid implies
+        #   the opposite: that a timeout kills the code you are looking at.
+        # · Pairing is open on EVERY plan. `vaultbeat_poll_binding`'s own
+        #   docstring states it ("Connecting is open on every plan, so there is
+        #   no tier to check"), so this line had the package contradicting
+        #   itself — and the half a new user reads first is the one that puts a
+        #   price in front of the one step that has none.
         help=(
-            "SECONDS to keep the QR code valid while waiting for the phone scan. "
-            "Raise it if you need time to install the app or subscribe first. "
-            "(default: %(default)s)"
+            "SECONDS this command waits for the phone scan before giving up. "
+            "Pairing is free on every plan; raise this if you still need to "
+            "install the iOS app. The QR stays scannable for 10 minutes either "
+            "way. (default: %(default)s)"
         ),
     )
     # 7.0s keeps polling under the cloud's 10/min IP rate limit (60/7 ≈ 8.6/min);
@@ -878,7 +895,9 @@ def build_parser() -> argparse.ArgumentParser:
     sleep_parser.add_argument("--limit", type=int)
     sleep_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
+        help="Only include records from this owner. Run `doctor` to see the real "
+        "prefixes on this account — a made-up one matches nothing and returns "
+        "an empty result rather than an error.",
     )
     sleep_parser.add_argument(
         "--fresh",
@@ -895,7 +914,9 @@ def build_parser() -> argparse.ArgumentParser:
     sleep_detail_parser.add_argument("--limit", type=int, help="Keep at most N most recent nights.")
     sleep_detail_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
+        help="Only include records from this owner. Run `doctor` to see the real "
+        "prefixes on this account — a made-up one matches nothing and returns "
+        "an empty result rather than an error.",
     )
     sleep_detail_parser.add_argument(
         "--fresh",
@@ -911,7 +932,9 @@ def build_parser() -> argparse.ArgumentParser:
     water_parser.add_argument("--limit", type=int)
     water_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
+        help="Only include records from this owner. Run `doctor` to see the real "
+        "prefixes on this account — a made-up one matches nothing and returns "
+        "an empty result rather than an error.",
     )
     water_parser.add_argument(
         "--fresh",
@@ -928,7 +951,9 @@ def build_parser() -> argparse.ArgumentParser:
     weight_parser.add_argument("--limit", type=int, help="Keep at most N most recent body days.")
     weight_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
+        help="Only include records from this owner. Run `doctor` to see the real "
+        "prefixes on this account — a made-up one matches nothing and returns "
+        "an empty result rather than an error.",
     )
     weight_parser.add_argument(
         "--fresh",
@@ -951,7 +976,9 @@ def build_parser() -> argparse.ArgumentParser:
     menstrual_parser.add_argument("--limit", type=int)
     menstrual_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
+        help="Only include records from this owner. Run `doctor` to see the real "
+        "prefixes on this account — a made-up one matches nothing and returns "
+        "an empty result rather than an error.",
     )
     menstrual_parser.add_argument(
         "--fresh",
@@ -967,7 +994,9 @@ def build_parser() -> argparse.ArgumentParser:
     activity_parser.add_argument("--limit", type=int)
     activity_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
+        help="Only include records from this owner. Run `doctor` to see the real "
+        "prefixes on this account — a made-up one matches nothing and returns "
+        "an empty result rather than an error.",
     )
     activity_parser.add_argument(
         "--fresh",
@@ -983,7 +1012,9 @@ def build_parser() -> argparse.ArgumentParser:
     resting_hr_parser.add_argument("--limit", type=int)
     resting_hr_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
+        help="Only include records from this owner. Run `doctor` to see the real "
+        "prefixes on this account — a made-up one matches nothing and returns "
+        "an empty result rather than an error.",
     )
     resting_hr_parser.add_argument(
         "--fresh",
@@ -999,7 +1030,9 @@ def build_parser() -> argparse.ArgumentParser:
     workouts_parser.add_argument("--limit", type=int)
     workouts_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
+        help="Only include records from this owner. Run `doctor` to see the real "
+        "prefixes on this account — a made-up one matches nothing and returns "
+        "an empty result rather than an error.",
     )
     workouts_parser.add_argument(
         "--fresh",
@@ -1015,7 +1048,9 @@ def build_parser() -> argparse.ArgumentParser:
     mindfulness_parser.add_argument("--limit", type=int)
     mindfulness_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
+        help="Only include records from this owner. Run `doctor` to see the real "
+        "prefixes on this account — a made-up one matches nothing and returns "
+        "an empty result rather than an error.",
     )
     mindfulness_parser.add_argument(
         "--fresh",
@@ -1031,7 +1066,9 @@ def build_parser() -> argparse.ArgumentParser:
     hrv_parser.add_argument("--limit", type=int)
     hrv_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
+        help="Only include records from this owner. Run `doctor` to see the real "
+        "prefixes on this account — a made-up one matches nothing and returns "
+        "an empty result rather than an error.",
     )
     hrv_parser.add_argument(
         "--fresh",
@@ -1054,7 +1091,9 @@ def build_parser() -> argparse.ArgumentParser:
     wrist_temp_parser.add_argument("--limit", type=int)
     wrist_temp_parser.add_argument(
         "--owner",
-        help="Only include records from this owner (user-ID prefix, e.g. a1a1 or b2b2).",
+        help="Only include records from this owner. Run `doctor` to see the real "
+        "prefixes on this account — a made-up one matches nothing and returns "
+        "an empty result rather than an error.",
     )
     wrist_temp_parser.add_argument(
         "--fresh",

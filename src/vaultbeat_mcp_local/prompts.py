@@ -401,12 +401,21 @@ PROMPTS: tuple[VaultbeatPrompt, ...] = (
                              "(nothing was given — ask me what to log and write nothing until I answer)"),),
     ),
     # Anyone who just installed this and sees nothing. Documented as the most
-    # expensive wrong turn in the product: the four causes need opposite fixes,
-    # and the natural guess (permissions) is usually the wrong one on day one.
+    # expensive wrong turn in the product: the causes need opposite fixes, and
+    # the natural guess (permissions) is usually the wrong one on day one.
+    #
+    # 🔴 The count is deliberately absent here and in `description`. Both said
+    # "four" from 2026-08-27 until 2026-09-07, and 0.6.7 (7e1aa08) made that
+    # false the day it added the free-tier 7-day cause to the body below —
+    # leaving this prompt telling the agent "four" while its own last line said
+    # "all five". Same shape as the `clampDays` copy drift: true when written,
+    # invalidated by a later change, with nothing that could go red. A number
+    # nobody needs is a number that can only rot, so there is no longer one to
+    # keep in sync (same reasoning as the tool counts in code-map.md).
     VaultbeatPrompt(
         name="why_is_this_empty",
         title="Why is this empty?",
-        description="Work out which of the four causes is behind an empty or stale result, instead of guessing.",
+        description="Work out which cause is behind an empty or stale result, instead of guessing.",
         template=(
             "A Vaultbeat read came back empty or looked out of date. {{context}}Work "
             "out which cause it is before suggesting anything. Call `vaultbeat_doctor` "
@@ -422,7 +431,7 @@ PROMPTS: tuple[VaultbeatPrompt, ...] = (
             "or this server was bound recently and its own encrypted copy of the "
             "history is still filling in. Name one, give the single next action for "
             "that one, and say what would prove you right. Do not hand me a checklist "
-            "of all five."
+            "of all of them."
             + STYLE
         ),
         arguments=(PromptArg("context", "Optional — which tool was empty, and what you expected to see.", ""),),
