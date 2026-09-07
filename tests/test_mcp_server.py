@@ -786,21 +786,41 @@ def test_demo_mode_watermarks_every_tool_result(monkeypatch: Any, tmp_path: Path
 
 
 def test_demo_mode_wraps_sync_tools_too(monkeypatch: Any, tmp_path: Path) -> None:
-    """Two of these tools are plain `def`, not `async def`.
+    """Exactly two tools are plain `def`, and since 2026-09-07 they take
+    DIFFERENT demo wrappers — so the shape branch has to be right twice.
 
-    One sync wrapper around a coroutine function would hand FastMCP a coroutine
-    object as the result — the tool would "succeed" and return something
-    unserialisable — so the wrapper has to branch on the shape.
-    `vaultbeat_start_binding` is the sync one that returns a plain dict.
+    A single sync wrapper placed around a coroutine function would hand FastMCP
+    a coroutine object as the result: the tool "succeeds" and returns something
+    unserialisable. Both `_demo_wrap` (runs the tool, stamps the answer) and
+    `_demo_block_wrap` (refuses without running it) therefore carry their own
+    sync/async branch, and a mistake in either is invisible until a client
+    tries to render the result.
+
+    · `vaultbeat_status` → `_demo_wrap`. Used to be covered only through
+      `vaultbeat_start_binding`, which moved to the other wrapper — leaving the
+      branch this test is named for with no sync witness at all.
+    · `vaultbeat_start_binding` → `_demo_block_wrap`, because it writes
+      config.json and mints the identity key (Invariant 61). Its refusal
+      CONTENT is asserted in tests/test_demo.py, together with the filesystem
+      claim that is the actual point; here it is only the shape that matters.
     """
     monkeypatch.setenv("VAULTBEAT_DEMO", "1")
     tools = _capture_tools(monkeypatch)
     run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
 
-    result = tools["vaultbeat_start_binding"]()
-    assert not asyncio.iscoroutine(result)
-    assert result["demo_mode"] is True
-    assert "poll_id" in result
+    stamped = tools["vaultbeat_status"]()
+    assert not asyncio.iscoroutine(stamped)
+    assert stamped["demo_mode"] is True
+    # Add-only: the real payload survives the stamp. `data_source` is emitted
+    # by `status()` itself (not by the demo block spliced in beside it), so its
+    # presence says the tool actually ran rather than being replaced wholesale
+    # — which is exactly what distinguishes this wrapper from the other one.
+    assert stamped["data_source"] == "synthetic"
+
+    refused = tools["vaultbeat_start_binding"]()
+    assert not asyncio.iscoroutine(refused)
+    assert refused["demo_mode"] is True
+    assert refused["error"] == "demo_mode_needs_no_pairing"
 
 
 def test_demo_mode_prefixes_every_tool_description(monkeypatch: Any, tmp_path: Path) -> None:
@@ -915,3 +935,62 @@ def test_destructive_titles_name_their_consequence(monkeypatch: Any, tmp_path: P
     # the rule above accepts any parenthesis, which is deliberately loose.
     assert meta["vaultbeat_poll_binding"]["title"] == "Finish pairing (replaces this binding)"
     assert meta["vaultbeat_start_binding"]["title"] == "Start pairing (invalidates any open QR)"
+
+def test_sync_sleep_summary_only_drops_bodies_but_keeps_coverage(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """The side-effect call must not pay for a payload nobody asked for.
+
+    A default `vaultbeat_sync_sleep` returns every decrypted session — measured
+    at 80,933 characters against the owner's real account, which overflows a
+    typical tool-result limit and gets spilled to a file the caller then reads
+    back. That is correct when you want the nights. It is pure waste when the
+    call exists to make the server DO something (force a sync, prove the link is
+    alive, confirm a deploy landed), which is a large share of real calls.
+
+    Two assertions, and the second is the one worth having:
+    · the bodies are gone (that is the point), and
+    · `coverage` survives — a deliberately small answer that no longer says how
+      much data it rests on would be a smaller LIE, not a smaller truth
+      (Invariant 64). The day range rides along inside it, which is also why
+      this path does not recompute one.
+    """
+
+    monkeypatch.delenv("VAULTBEAT_DEMO", raising=False)
+    tools = _capture_tools(monkeypatch)
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    async def fake_sleep_records(**_: Any) -> dict[str, Any]:
+        return {
+            "daily_summary": [{"date": "2026-09-07", "total_sleep_minutes": 420}],
+            "sessions": [{"blob": "x" * 500}, {"blob": "y" * 500}],
+            "coverage": {"days_covered": 1, "first_day": "2026-09-07",
+                         "last_day": "2026-09-07", "note": "…"},
+        }
+
+    import vaultbeat_mcp_local.mcp_server as mod
+    monkeypatch.setattr(mod, "_annotate_if_empty", lambda r, *a, **k: r)
+
+    captured = tools["vaultbeat_sync_sleep"]
+    with monkeypatch.context() as m:
+        m.setattr(
+            "vaultbeat_mcp_local.service.VaultbeatLocalService.sleep_records",
+            lambda self, **kw: fake_sleep_records(**kw),
+        )
+        slim = asyncio.run(captured(summary_only=True))
+        full = asyncio.run(captured())
+
+    # The point: bodies gone.
+    assert "sessions" not in slim
+    assert "daily_summary" not in slim
+    assert slim["summary_only"] is True
+    assert slim["synced"] == 2, "must still say the sync moved something"
+    assert slim["days"] == 1
+
+    # The point that is easy to lose: it still says what it rests on.
+    assert slim["coverage"]["first_day"] == "2026-09-07"
+    assert "get_sleep_detail" in slim["note"], "must name where the nights live"
+
+    # And the default is untouched — this is an additive parameter, not a change
+    # of behaviour for every caller that already exists.
+    assert "sessions" in full and "daily_summary" in full

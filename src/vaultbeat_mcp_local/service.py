@@ -1430,6 +1430,18 @@ _SERIES_NOTE = (
 )
 
 
+def _rows_returned(summary: dict[str, Any], spec: Any) -> int:
+    """How many rows the read actually handed back, valid or not.
+
+    Deliberately NOT `daily_series`' `consumed`, which counts only rows that
+    survived validation. The question here is "did this response hit the limit",
+    and a truncated page full of rows this layer cannot bucket still hit it.
+    """
+
+    rows = summary.get(spec.array)
+    return len(rows) if isinstance(rows, list) else 0
+
+
 def _attach_series_coverage(
     result: dict[str, Any], points: dict[str, float], *, requested: int
 ) -> dict[str, Any]:
@@ -2255,6 +2267,55 @@ def _demo_write_refusal(tool: str) -> dict[str, Any]:
             f"account, and it has no account to write to. Do not re-pair or run "
             f"diagnostics. To log real data, unset {DEMO_ENV} and pair this machine "
             f"with the Vaultbeat iOS app (Settings → Data & AI → Connect an AI server)."
+        ),
+    }
+
+
+def _demo_binding_refusal(tool: str) -> dict[str, Any]:
+    """The answer the two PAIRING tools give while demo mode is on.
+
+    Separate from `_demo_write_refusal` because the honest reason is the
+    opposite one. A `log_*` refusal says "demo mode has no account to write
+    to"; this one says "demo mode does not NEED an account" — pairing is the
+    step demo mode exists to let you skip, so being told to go pair would send
+    a reader backwards out of the thing they are already using.
+
+    RETURNED, never raised, for the reason spelled out on `_demo_write_refusal`:
+    an exception becomes a ToolError that never reaches the watermarker.
+
+    🔴 Why this exists at all. `start_binding` calls `store.ensure_initialized`
+    and `store.update`; `poll_once` overwrites `server_id` / `server_token` /
+    the owner identity on success. Both WRITE DISK — config.json and the 0600
+    identity.key — which is precisely what Invariant 61 forbids a demo process
+    from doing, and the failure is silent in both directions: on a fresh
+    machine a "look what this does" demo run mints a real keypair and leaves a
+    real config behind; on a machine that is already paired it rewrites
+    `poll_id`, invalidating a QR the user may have on screen (Invariant 54).
+    Meanwhile the same process's `doctor` reports demo mode as offline and
+    holding no key — true when it was printed, and made false by the first
+    binding call of that session.
+    """
+
+    from vaultbeat_mcp_local.demo import DEMO_BANNER, DEMO_ENV
+
+    return {
+        # Banner first, same ordering as `_watermark_demo` and the write
+        # refusal — the sentence has to work on a reader who does not already
+        # know to look for a boolean.
+        "demo_warning": DEMO_BANNER,
+        "demo_mode": True,
+        "ok": False,
+        "error": "demo_mode_needs_no_pairing",
+        "tool": tool,
+        "detail": (
+            f"Demo mode is on ({DEMO_ENV} is set), so nothing was written and no keys "
+            f"were created — the config file and identity key on this machine are "
+            f"untouched. Pairing is the step demo mode replaces: the synthetic records "
+            f"the read tools are serving need no account, so there is nothing here to "
+            f"pair with and nothing is broken. To connect a REAL account, unset "
+            f"{DEMO_ENV}, restart this server, and run the pairing tools again (or "
+            f"`uvx vaultbeat-apple-health bind` in a terminal) — pairing is free on "
+            f"every plan."
         ),
     }
 
@@ -4984,6 +5045,15 @@ class VaultbeatLocalService:
     _SERIES_ROW_MULTIPLIER = 4
     _SERIES_ROW_FLOOR = 30
 
+    #: How many times `_series_points` may double its ask when the rows it got
+    #: back filled fewer days than were requested AND arrived at the limit.
+    #:
+    #: 5 doublings take the first ask (4 rows/day) to 128 rows per day, past any
+    #: sampling rate Apple Health produces for these kinds. The cap exists so a
+    #: kind that returns a constant number of rows regardless of `limit` — a
+    #: bug, but a possible one — cannot spin here; it is not expected to bind.
+    _SERIES_MAX_WIDENINGS = 5
+
     async def _series_points(
         self, spec: Any, *, days: int, owner: str | None, fresh: bool
     ) -> tuple[dict[str, float], int, dict[str, Any]]:
@@ -5003,6 +5073,36 @@ class VaultbeatLocalService:
         limit = max(days * self._SERIES_ROW_MULTIPLIER, self._SERIES_ROW_FLOOR)
         summary = await fetch(limit=limit, owner=owner, fresh=fresh)
         points, consumed = daily_series(summary, spec)
+
+        # 🔴 Widen and re-ask while the window is SHORT and the rows arrived at
+        # the ceiling. Both conditions are needed and they mean different things:
+        #   · fewer days than asked, on its own, is the normal answer for a kind
+        #     the Watch measures occasionally — widening then would just re-read
+        #     the same rows.
+        #   · rows landing exactly at `limit` is what says the server had more
+        #     to give. Fewer than `limit` means the history genuinely ended.
+        # Measured before this loop existed: a kind with 6 samples a day, asked
+        # for 30 days against 60 days of stored history, returned 20 days with
+        # `window_satisfied: false` — which is TRUE but reads as the wrong
+        # thing, because the coverage note explains that flag as "that is all
+        # the history this server holds … re-check after a re-sync". So the
+        # trend was computed over a third of the requested span while the agent
+        # was told to send the user to re-sync data that was already there.
+        #
+        # ⚠️ Counted on the RAW rows, not on `consumed`: `daily_series` drops
+        # rows with no day, a non-numeric field, a bool or a NaN, so `consumed`
+        # can sit below `limit` on a response that was in fact truncated — and
+        # reading it as "the history ended" is exactly the mistake this loop is
+        # here to stop making.
+        #
+        # `fresh` is not repeated: the first ask already refreshed the cache if
+        # it was going to, and every widening after that is served locally.
+        for _ in range(self._SERIES_MAX_WIDENINGS):
+            if len(points) >= days or _rows_returned(summary, spec) < limit:
+                break
+            limit *= 2
+            summary = await fetch(limit=limit, owner=owner, fresh=False)
+            points, consumed = daily_series(summary, spec)
 
         newest = sorted(points)[-days:] if days > 0 else []
         return {d: points[d] for d in newest}, consumed, summary
@@ -5531,9 +5631,25 @@ class VaultbeatLocalService:
             # exists to prevent, and then read an id out of the blended result.
             #
             # NOT put on `status`: that is a local-binding report, it makes no
-            # network call and decrypts nothing, and answering this there would
-            # mean parsing a cache file that reaches ~20 MB — on the most
-            # frequently polled tool in the product.
+            # network call and decrypts nothing, and answering THIS question
+            # there would mean parsing a cache file that reaches ~20 MB — on the
+            # most frequently polled tool in the product.
+            #
+            # ⚠️ `status.owner_user_id_prefix` (added 2026-09-07) is NOT that,
+            # and the two must not be merged in either direction. They answer
+            # different questions and have different costs:
+            #   · here, "WHO IS IN THIS DATA" — derived from the records, so it
+            #     sees the partner too, and pays the decrypt this comment is
+            #     about.
+            #   · there, "WHICH ONE AM I" — one field off the config that is
+            #     already loaded, zero I/O, and undefined for anybody else.
+            # A list of two prefixes does not say which of them is the user, so
+            # this field alone cannot satisfy skill.md's rule ("pass `owner` to
+            # select ONE PERSON"): measured on the owner's own account, the two
+            # prefixes are an 82.9 kg body and a 39.5 kg body, and an agent
+            # picking the wrong one answers "you are 39.5 kg" with no error
+            # anywhere. Conversely the config prefix cannot replace this one —
+            # it never mentions the partner, so it cannot warn about blending.
             "owner_prefixes": sorted(
                 {r.owner_user_id[:8] for r in records if r.owner_user_id}
             ),
@@ -5678,6 +5794,29 @@ class VaultbeatLocalService:
             # "grandfathered / paid / unknown", same as the iOS Settings row.
             **({"access": access} if access else {}),
             "owner_identity_bound": bool(config.owner_user_id and config.owner_public_key_base64),
+            # 🔴 The prefix `skill.md` sends every agent HERE to fetch ("Get the
+            # prefixes from `vaultbeat_status`, and pass one"). Until 2026-09-07
+            # this dict carried only the boolean above, so that documented step
+            # had no source and the agent's two exits were both wrong: omit
+            # `owner` and pool two bodies into one average (the blend
+            # `_attach_owner_guard` exists to catch), or copy the literal
+            # `"a1a1"` out of a tool description and match nothing.
+            #
+            # ⚠️ NOT the same field as `_attach_owner_guard`'s
+            # `owner_user_id_prefixes` (plural), and they must not be merged:
+            # that one answers "who is mixed into THIS result" and only appears
+            # once the mixing already happened, on results with >1 owner. This
+            # one answers "which one am I", is available before any read, and is
+            # the only source of that answer on a SINGLE-owner account — where
+            # the plural field never fires and an agent otherwise cannot confirm
+            # its filter is the user rather than the partner.
+            #
+            # Eight chars because the `owner=` filter is a `startswith` and
+            # every other prefix surface is `[:8]` (demo.py's DEMO_OWNER_PREFIX
+            # carries the same note). Zero extra I/O: `config` is already loaded
+            # on the line above. Absent rather than null when unbound — absence
+            # is the claim-free rendering, same as `access`.
+            **({"owner_user_id_prefix": config.owner_user_id[:8]} if config.owner_user_id else {}),
             "owner_device_bound": bool(config.owner_device_id),
             "config_path": str(self.store.path),
         }
