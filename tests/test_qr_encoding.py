@@ -1,9 +1,13 @@
 """A QR code drawn into a GBK pipe took the whole pairing down with it.
 
-Observed 2026-09-11, reported by a user pairing from Codex on Windows: the agent
+Seen 2026-09-11 in a screenshot of a Codex session pairing on Windows: the agent
 said "Windows 终端的 GBK 编码把二维码字符弄坏了" and went off to generate a PNG by
 hand. It was right about the cause and wrong about the severity — this was not a
 cosmetic problem.
+
+⚠️ Who was at that keyboard is not recorded, and the first version of this file
+said "reported by a user" — which was an inference, not something the screenshot
+showed. Kept as a note because the file is about exactly that distinction.
 
 `qrcode.print_ascii` is hard-coded to draw with cp437 255 / 223 / 220 / 219, and
 in GBK:
@@ -171,62 +175,76 @@ def test_the_note_states_what_was_done_never_that_the_code_is_unreadable() -> No
     assert "mojibake" in lowered
 
 
-def test_everything_printed_around_the_qr_code_is_pure_ascii() -> None:
+def test_every_string_bind_prints_is_pure_ascii() -> None:
     """One stream must not carry two encodings, and this one already did.
 
-    The QR drawing now goes out as UTF-8 bytes regardless of what stdout claims
-    (that is what stops `bind` crashing). Every `print()` beside it still goes
-    through stdout's own encoder — so a single em dash in this copy put GBK
-    bytes and UTF-8 bytes in the same stream, and a reader decoding either way
-    got half of it wrong: the agent saw a perfect QR code followed by "NOTE ??
-    this QR code", the cmd.exe user saw the reverse.
+    The QR drawing goes out as UTF-8 bytes regardless of what stdout claims (that
+    is what stops `bind` crashing). Every `print()` beside it still goes through
+    stdout's own encoder, so a single em dash puts GBK bytes and UTF-8 bytes in
+    the same stream and a reader decoding either way gets half of it wrong: the
+    agent sees a perfect QR code followed by "NOTE ?? this QR code", the cmd.exe
+    user sees the reverse.
 
-    ⚠️ `_QR_RELAY_WARNING` had that em dash from the day it was written, long
-    before any of this. It never showed up because nothing else in the stream
-    disagreed with it yet.
+    🔴 The first version of this test checked FOUR MODULE CONSTANTS by name, and
+    was called `test_everything_printed_around_the_qr_code_is_pure_ascii` — a
+    name that promised the whole bind path while a hand-written tuple covered a
+    twelfth of it. It passed while `_tty_hint()` still returned an em dash, and
+    that one is the worst possible place for it: `_tty_hint` returns text ONLY
+    when `isatty()` is false — i.e. on every agent-invoked run, the exact case
+    this whole file exists for.
 
-    An em dash is worth nothing here. ASCII is the only encoding every reader of
-    this stream agrees on, so the copy stays inside it.
+    So the literals are now collected from the SOURCE by AST. A tuple of names
+    can only ever guard what someone remembered to add to it; walking the tree
+    guards what the code actually prints.
     """
+    import ast
+    import pathlib
+
     from vaultbeat_mcp_local import cli
 
-    for name in (
-        "_QR_RELAY_WARNING",
-        "_QR_ESCAPE_ROUTES",
-        "_QR_ENCODING_NOTE",
-        "_QR_NOT_DRAWN",
-    ):
-        text = getattr(cli, name)
-        offenders = sorted({f"U+{ord(c):04X} {c!r}" for c in text if ord(c) > 127})
-        assert not offenders, f"{name} must stay ASCII; found {offenders}"
+    source = pathlib.Path(cli.__file__).read_text()
+    tree = ast.parse(source)
 
+    # Every string literal that `handle_bind` or `_tty_hint` can put on stdout:
+    # print() arguments, returned strings, and the module constants they name.
+    printed: list[tuple[str, str]] = []
 
-def test_bind_still_polls_when_drawing_blows_up_in_an_unforeseen_way() -> None:
-    """The guarantee is about the pairing, not about the picture.
+    def literals_under(node: ast.AST, where: str) -> None:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                printed.append((where, sub.value))
+            elif isinstance(sub, ast.Name) and sub.id.startswith("_QR_"):
+                value = getattr(cli, sub.id, None)
+                if isinstance(value, str):
+                    printed.append((f"{where} -> {sub.id}", value))
 
-    `_print_qr` names the encoding failures it knows how to degrade. This pins
-    the outer promise: whatever else goes wrong while drawing — broken pipe,
-    closed stdout, a future `qrcode` raising somewhere new — `handle_bind` still
-    reaches `poll_until_bound`. The session is already open on the server by
-    this point; failing to draw it is cosmetic, failing to claim it is not.
-    """
-    from unittest.mock import MagicMock
+    # ⚠️ Only what actually reaches stdout: `print()` arguments and returned
+    # strings. Walking the whole function body would also collect DOCSTRINGS —
+    # the first draft did, and failed on `_tty_hint`'s own docstring, which no
+    # user ever sees. A test that flags harmless text teaches people to ignore it.
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef) and node.name in {"handle_bind", "_tty_hint"}):
+            continue
+        for sub in ast.walk(node):
+            emits = None
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == "print":
+                emits = sub.args
+            elif isinstance(sub, ast.Return) and sub.value is not None:
+                emits = [sub.value]
+            if emits is None:
+                continue
+            for arg in emits:
+                literals_under(arg, node.name)
 
-    import vaultbeat_mcp_local.cli as cli
+    assert printed, "AST walk found nothing — the function names must have changed"
 
-    args = MagicMock(no_qr=False, timeout=1, interval=1, server_name="n", api_base_url=None)
-    service = MagicMock()
-    service.start_binding.return_value = MagicMock(qr_payload_json='{"pollID":"x"}')
-    polled = MagicMock(status="bound", server_name="n", trial_ends_at=None)
-
-    async def _poll(**_kwargs: object) -> object:
-        return polled
-
-    service.poll_until_bound = _poll
-
-    with mock.patch.object(cli, "_service", return_value=service), mock.patch.object(
-        cli, "_print_qr", side_effect=BrokenPipeError("nobody home")
-    ):
-        cli.handle_bind(args)  # must not raise
-
-    assert service.start_binding.called, "the session must still have been opened"
+    offenders = [
+        (where, f"U+{ord(c):04X} {c!r}", text[:60])
+        for where, text in printed
+        for c in text
+        if ord(c) > 127
+    ]
+    assert not offenders, (
+        "bind prints non-ASCII; one stream would carry two encodings:\n"
+        + "\n".join(f"  {w}: {c} in {t!r}" for w, c, t in offenders)
+    )
