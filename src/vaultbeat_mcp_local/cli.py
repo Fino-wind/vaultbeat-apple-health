@@ -129,11 +129,17 @@ def _tty_hint() -> str:
     above, which has to cover the case where a pty exists but a renderer eats
     the output anyway (Hermes). Neither check subsumes the other, which is why
     both are here.
+
+    ⚠️ THREE now, not two — `_stdout_encoding_can_draw_a_qr` joined them in 0.7.2
+    and answers a third question: whether stdout's own encoder can represent the
+    glyphs at all. That one used to be fatal rather than cosmetic (a GBK pipe
+    raised mid-drawing and `bind` never reached its polling loop), so it is the
+    one of the three that had teeth. Still none subsumes another.
     """
     if sys.stdout.isatty():
         return ""
     return (
-        "\n(stdout is not a terminal — nobody is watching this stream directly, "
+        "\n(stdout is not a terminal: nobody is watching this stream directly, "
         "so the QR code below is almost certainly not reaching a human.)"
     )
 
@@ -526,7 +532,7 @@ def handle_bind(args: argparse.Namespace) -> int:
         # the site, the public README and research-facts.json all still say
         # `tether-ai-health-sync` and will break on the rename; id-only never
         # does.
-        print("Binding is still pending — nothing scanned this within the timeout.")
+        print("Binding is still pending: nothing scanned this within the timeout.")
         print()
         # Step 2 names a screen the reader does not land on first. Opening
         # "Connect an AI server" for the first time starts a GUIDE — the scanner
@@ -546,11 +552,11 @@ def handle_bind(args: argparse.Namespace) -> int:
         # its reader is standing, which is also why grepping for the string is
         # not enough to decide.
         print("What the phone side needs:")
-        print("  1. Vaultbeat for iOS — free to install, free to connect.")
+        print("  1. Vaultbeat for iOS: free to install, free to connect.")
         print("     https://apps.apple.com/app/id6759241985")
         print("  2. In the app: Settings -> Data & AI -> Connect an AI server")
         print("     First time through, the app walks you through setup and the")
-        print("     scanner comes last — follow it to the end.")
+        print("     scanner comes last, follow it to the end.")
         print("  3. Scan the QR above from that screen.")
         print()
         # 🔴 The two cases have DIFFERENT answers, and the previous single
@@ -579,7 +585,7 @@ def handle_bind(args: argparse.Namespace) -> int:
         # frozen old distribution (Invariant 67). Printing either to the one
         # reader who by definition has not read the README was the worst
         # possible place to get this wrong.
-        print("Not scanned yet? The QR above is still good — nothing expires until")
+        print("Not scanned yet? The QR above is still good, nothing expires until")
         print("someone scans it. Scan it FIRST, then pick the pairing back up with:")
         print("  uvx vaultbeat-apple-health poll")
         print()
@@ -593,7 +599,7 @@ def handle_bind(args: argparse.Namespace) -> int:
         # `bind`. Following that mints a new pollID and invalidates the QR still
         # on screen, turning "one scan away" into "cannot complete". Cheap to
         # warn about, expensive to discover.
-        print("(Running poll BEFORE scanning reports `expired` — that is just")
+        print("(Running poll BEFORE scanning reports `expired`, that is just")
         print(" 'no scan has arrived', not a dead code. Don't re-run bind on it;")
         print(" a new bind replaces the QR you are looking at.)")
         return 2
@@ -607,7 +613,7 @@ def handle_bind(args: argparse.Namespace) -> int:
     # at the exact moment the user is looking at a terminal that just said
     # everything worked.
     print()
-    print("One last step — register this server with your MCP client.")
+    print("One last step: register this server with your MCP client.")
     print("For Claude Code, run:")
     print()
     print("  claude mcp add vaultbeat-health -- uvx vaultbeat-apple-health@latest serve --transport stdio")
@@ -647,7 +653,7 @@ def handle_bind(args: argparse.Namespace) -> int:
         print()
         print(TRIAL_UNLOCK_LINE.format(date=result.trial_ends_at[:10]))
         print(UPLOAD_WINDOW_LINE)
-        print("Once registered above, go ask your AI something — that is what this was for.")
+        print("Once registered above, go ask your AI something: that is what this was for.")
     return 0
 
 
