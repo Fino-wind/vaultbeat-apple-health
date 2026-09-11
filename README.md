@@ -121,6 +121,24 @@ below). Binding a non-loopback address fails closed unless you pass both a token
    locally, and return plaintext JSON. (All privileged routes are Supabase Edge
    Functions at `/functions/v1/<name>`.)
 
+### Troubleshooting: the QR code looks wrong (Windows / non-UTF-8 terminals)
+
+A QR code is drawn with block characters, and some encodings cannot represent
+them — GBK (the default on simplified-Chinese Windows) is missing two of the four
+outright. Since 0.7.2 the code is written as UTF-8 bytes underneath the terminal's
+own encoder, so this is usually invisible: agents and modern terminals decode UTF-8
+and get an intact code.
+
+If you do see mojibake, or rows of uneven length:
+
+- **The pairing is still live and still waiting.** Do not re-run `bind` — that
+  mints a new `pollID` and invalidates anything already scanned. Leave it polling.
+- Render the payload (printed as plain JSON just above the code) as an image —
+  `qrencode -o pair.png '<payload>'`, or any QR library — send it to your phone,
+  and use **import from Photos** in the app's scanner rather than the camera.
+- Or run `chcp 65001` and try again in a fresh terminal.
+- Or use `bind --no-qr` to get the payload as text only.
+
 ### Troubleshooting: `vaultbeat-apple-health doctor`
 
 If binding or reads fail, run the self-diagnosis:

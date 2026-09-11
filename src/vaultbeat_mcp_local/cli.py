@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import os
 import sys
@@ -102,7 +103,7 @@ def _wrote_message(output_path: Path, label: str) -> str:
 
 
 _QR_RELAY_WARNING = """\
-NOTE FOR AI AGENTS RELAYING THIS OUTPUT — read before you answer the user.
+NOTE FOR AI AGENTS RELAYING THIS OUTPUT: read before you answer the user.
 
 You are about to receive a QR code drawn with block characters. Receiving it
 does NOT mean the user can see it. Many agent front-ends (Hermes' TUI, chat
@@ -115,7 +116,7 @@ So do not tell the user the QR code appeared, and do not ask them to scan
 
     uvx vaultbeat-apple-health@latest bind
 
-If they say they see nothing, that is the expected outcome — it is your
+If they say they see nothing, that is the expected outcome: it is your
 rendering layer, not their mistake, and not a bug in Vaultbeat."""
 
 
@@ -135,6 +136,128 @@ def _tty_hint() -> str:
         "\n(stdout is not a terminal — nobody is watching this stream directly, "
         "so the QR code below is almost certainly not reaching a human.)"
     )
+
+
+# The four characters `qrcode.print_ascii` is hard-coded to draw with, as cp437
+# code points 255 / 223 / 220 / 219: NBSP, ▀, ▄, █.
+#
+# 🔴 TWO of them do not exist in GBK at all (NBSP and ▀), and the other two
+# encode to TWO bytes there — i.e. they are full-width, so a "black" module
+# occupies two columns while a replaced "white" one occupies one, and every row
+# of the code ends up a different width. On a simplified-Chinese Windows the
+# damage is not cosmetic; see `_QR_ENCODING_NOTE`.
+# ⚠️ Escapes, not literals. The first one is NBSP — indistinguishable from a
+# plain space in every editor, and a plain space encodes fine in GBK, so
+# "tidying" it would silently turn this probe into one that always passes on
+# exactly the machines it exists to catch.
+_QR_GLYPHS = "\u00a0\u2580\u2584\u2588"
+
+_QR_ESCAPE_ROUTES = """\
+THE PAIRING IS STILL LIVE AND STILL WAITING. Do not re-run `bind`: that mints a
+new pollID and invalidates anything the user has already scanned.
+
+Routes that work from here:
+
+  1. Render the payload printed above as a QR image yourself (it is plain JSON;
+     any QR library, or `qrencode -o pair.png '<payload>'`), send that file to
+     the user's phone, and tell them to open the scanner in the app and use
+     "import from Photos" instead of the camera. The app decodes a saved image,
+     so nothing has to be pointed at a screen. This command keeps polling while
+     they do.
+  2. Tell the user to run `chcp 65001` and try `bind` again in a fresh terminal.
+  3. Re-run with `--no-qr` to get the payload as text only."""
+
+# 🔴 Says what was DONE and what is UNKNOWN, and never that the code is
+# unreadable — because most of the time it is not.
+#
+# The bytes go out as UTF-8 regardless of what stdout claims (see
+# `_emit_qr_drawing`), so an agent that decodes UTF-8 —
+# which is nearly all of them — receives an intact QR code. Telling that reader
+# "the code above is probably unreadable" is a false statement about something
+# it can see with its own eyes, and the credibility it spends is the same
+# credibility `_QR_RELAY_WARNING` needs a few lines earlier.
+#
+# What IS known: this stream declares an encoding that cannot represent the
+# glyphs. That is evidence about the reader, not a verdict on the drawing, and
+# it is stated as such.
+_QR_ENCODING_NOTE = """\
+NOTE: this QR code was emitted as UTF-8 bytes, bypassing this stream's declared
+encoding ({encoding}), which cannot represent the characters a QR code is drawn
+with.
+
+If you are reading UTF-8, the code above is intact: use it.
+If you are seeing mojibake or rows of uneven length, the encodings disagree and
+the code's geometry is gone: do not ask the user to scan it.
+
+""" + _QR_ESCAPE_ROUTES
+
+# The harder failure: nothing renderable left the process at all.
+_QR_NOT_DRAWN = """\
+NOTE FOR AI AGENTS: no QR code was drawn. This stream's encoding ({encoding})
+cannot represent the characters one is drawn with, and the byte-level fallback
+was unavailable too. There is nothing above to scan.
+
+""" + _QR_ESCAPE_ROUTES
+
+
+def _stdout_encoding_name() -> str:
+    return getattr(sys.stdout, "encoding", None) or "unknown"
+
+
+def _stdout_encoding_can_draw_a_qr() -> bool:
+    """Can the characters survive the encoding stdout says it is using?
+
+    ⚠️ This asks a NARROWER question than "will the user see a QR code", and
+    deliberately so — it is the one question with a mechanical answer. Whether a
+    renderer downstream eats the glyphs anyway is `_QR_RELAY_WARNING`'s problem,
+    and whether anyone is watching at all is `_tty_hint`'s. Three checks, none
+    subsuming another.
+    """
+    encoding = getattr(sys.stdout, "encoding", None)
+    if not encoding:
+        return False
+    try:
+        _QR_GLYPHS.encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
+def _emit_qr_drawing(drawing: str) -> bool:
+    """Get the code onto stdout, preferring the byte layer. False = nothing came out.
+
+    🔑 The byte path is the half that FIXES the agent case rather than
+    apologising for it. On Windows, Python only bypasses the locale encoding
+    when stdout is attached to a real console; the moment it is a pipe - which
+    is every agent-invoked command - it falls back to `cp936` with
+    `errors='strict'`, and printing the drawing raises `UnicodeEncodeError`
+    before `poll_until_bound` is ever reached. Writing UTF-8 bytes cannot raise
+    that, and agent front-ends decode UTF-8, so the code arrives intact.
+
+    ⚠️ The two paths are EXCLUSIVE, which is the point of the early return. A
+    `buffer.write` that dies partway has already put half a code on screen;
+    retrying through the text layer would print a second one below it. And there
+    is nothing to gain by trying - the text layer is strictly weaker (it is the
+    one that raises on GBK), so the only thing it could add is a duplicate.
+    The text path exists solely for a stdout with no `buffer` at all, which
+    means a replaced or captured stream, which means nothing was written yet.
+    """
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is not None:
+        try:
+            sys.stdout.flush()
+            buffer.write(drawing.encode("utf-8"))
+            buffer.flush()
+        except Exception:
+            return False
+        return True
+
+    try:
+        sys.stdout.write(drawing)
+        sys.stdout.flush()
+    except Exception:
+        return False
+    return True
 
 
 def _print_qr(payload: str) -> None:
@@ -160,7 +283,32 @@ def _print_qr(payload: str) -> None:
     qr = qrcode.QRCode(border=2)
     qr.add_data(payload)
     qr.make(fit=True)
-    qr.print_ascii(invert=True)
+
+    # Render to a string first. `qr.print_ascii()` writing straight to
+    # `sys.stdout` is what made this a CRASH rather than a cosmetic problem: on
+    # a pipe under a GBK locale the write raises mid-drawing, `handle_bind`
+    # never reaches `poll_until_bound`, and the pairing the server has already
+    # opened is left with nobody claiming it. Buffering moves every encoding
+    # decision to code that can catch it.
+    drawing = io.StringIO()
+    qr.print_ascii(out=drawing, invert=True)
+    art = drawing.getvalue()
+
+    if not _emit_qr_drawing(art):
+        # Nothing renderable got out. The payload is already on screen above this
+        # call, so the pairing is still completable: say how, and let the caller
+        # carry on polling.
+        print(_QR_NOT_DRAWN.format(encoding=_stdout_encoding_name()))
+        return
+
+    # Bytes left the process, which is not the same as a QR code reaching a
+    # human: a downstream reader that decodes as GBK sees mangled rows. The
+    # declared encoding is the only evidence available here about what that
+    # reader expects, so use it — and say so only when it says there is a
+    # problem, to keep this silent on the UTF-8 machines that are the norm.
+    if not _stdout_encoding_can_draw_a_qr():
+        print()
+        print(_QR_ENCODING_NOTE.format(encoding=_stdout_encoding_name()))
 
 
 def handle_init(args: argparse.Namespace) -> int:
@@ -329,7 +477,21 @@ def handle_bind(args: argparse.Namespace) -> int:
     print("Scan this payload with Vaultbeat on iOS:")
     print(session.qr_payload_json)
     if not args.no_qr:
-        _print_qr(session.qr_payload_json)
+        # 🔴 Drawing the code is BEST-EFFORT; claiming the pairing is not.
+        #
+        # `_print_qr` handles the encoding failures it can name and degrades with
+        # something useful to say. This catch is for the ones it cannot — a
+        # broken pipe, a closed stdout, a future qrcode release that raises
+        # somewhere new. Whatever it is, the session on the server is already
+        # open and the payload is already printed above, so the only unrecoverable
+        # outcome is not reaching `poll_until_bound` — which is exactly what
+        # happened on GBK Windows until 0.7.2.
+        #
+        # `Exception`, not `BaseException`: Ctrl-C must still stop the command.
+        try:
+            _print_qr(session.qr_payload_json)
+        except Exception as exc:  # pragma: no cover - defence in depth
+            print(f"(could not draw a QR code: {exc!r} - scan the payload above)")
 
     result = asyncio.run(
         service.poll_until_bound(
