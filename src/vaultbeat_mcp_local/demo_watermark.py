@@ -1,27 +1,37 @@
-"""Stamp the synthetic-data marker onto a demo result — for BOTH exits.
+"""Stamp the synthetic-data marker onto a demo result.
 
-This server has two ways a health payload leaves the process, and they share no
-code below the service layer:
+🔀 **There is ONE exit now (2026-09-12, Invariant 81 (health-data-has-one-exit))**:
 
     MCP tool  →  _demo_wrap  →  FastMCP  →  the agent
-    CLI       →  _emit_decrypted        →  stdout, or a 0600 file
 
-Until 2026-08-27 the marker existed only on the first one. `mcp_server.py` owned
-`_watermark_demo`, so the CLI could not reach it without importing a sibling
-transport — and `cli.py` deliberately keeps `mcp_server` behind a lazy import
-inside `handle_serve` so that the MCP SDK's import chain is not paid by every
-`vaultbeat-mcp sleep`. (`handle_serve`'s own comment puts that chain at ~1.4s;
-this file does not restate the figure, having measured only the structural
-half — importing `cli` loads no `mcp.*` module, and this module keeps it that
-way.) So the marker did not spread; it stayed where it was written. `vaultbeat-mcp --demo sleep` emitted a payload whose only tell was the
-`demo0001-` owner prefix, i.e. a tell that only works on a reader who already
-knows the answer.
+The CLI half of this module's reason for existing is gone with the fifteen data
+subcommands — `_emit_decrypted` no longer exists, so no health payload leaves
+this process except through a tool. **The history below is kept because it is
+the argument for that removal, not a description of the code.**
+
+Until 2026-08-27 there were two exits and the marker existed only on the first.
+`mcp_server.py` owned `_watermark_demo`, so the CLI could not reach it without
+importing a sibling transport — and `cli.py` deliberately keeps `mcp_server`
+behind a lazy import inside `handle_serve` so that the MCP SDK's import chain is
+not paid by every invocation. (`handle_serve`'s own comment puts that chain at
+~1.4s; this file does not restate the figure, having measured only the
+structural half — importing `cli` loads no `mcp.*` module, and this module keeps
+it that way.) So the marker did not spread; it stayed where it was written, and
+`--demo sleep` emitted a payload whose only tell was the `demo0001-` owner
+prefix, i.e. a tell that only works on a reader who already knows the answer.
 
 That is Invariant 61 (demo-is-a-boundary-not-a-flag) failing in the direction it
 warns about — "every answer says it is synthetic" has to fall out of WHERE the
 substitution happens, and one of the two exits was outside the boundary. It is
 also the shape Invariant 58 (one-funnel-per-event) describes exactly: the
 judgement did have a single home, just not one both callers could reach.
+
+🔑 **Worth keeping in view: that defect was fixed by extracting this module, and
+the fix held for sixteen days until the second exit was deleted outright.** The
+watermark was one of three things that had to be remembered separately for the
+CLI path (the others: the stdout-vs-stderr split of Invariant 71
+(cli-data-stdout-is-json-only), and the `--output` file's wording). Each was
+found and fixed on its own. Removing the exit removed the category.
 
 ⚠️ Why this is its own module rather than a section of `demo.py`, stated
 honestly: `demo.py` is the natural home — it already owns `DEMO_BANNER`,
