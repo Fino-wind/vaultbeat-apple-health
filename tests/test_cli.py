@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -181,62 +180,6 @@ def test_resolve_http_token_prefers_env_over_config(monkeypatch: Any, tmp_path: 
     assert cli._resolve_http_token(empty) is None  # neither env nor config set
 
 
-def test_water_subcommand_prints_summary(
-    monkeypatch: Any, tmp_path: Path, capsys: Any
-) -> None:
-    async def fake_summary(
-        self: VaultbeatLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
-    ) -> dict[str, Any]:
-        return {"day_count": 1, "average_daily_intake_liters": 3.0, "errors": []}
-
-    monkeypatch.setattr(VaultbeatLocalService, "water_intake_summary", fake_summary)
-
-    exit_code = cli.main(["--config", str(tmp_path / "config.json"), "water", "--limit", "5"])
-
-    assert exit_code == 0
-    printed = json.loads(capsys.readouterr().out)
-    assert printed["average_daily_intake_liters"] == 3.0
-
-
-def test_menstrual_subcommand_prints_sensitivity_note_and_summary(
-    monkeypatch: Any, tmp_path: Path, capsys: Any
-) -> None:
-    async def fake_summary(
-        self: VaultbeatLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
-    ) -> dict[str, Any]:
-        return {"day_count": 0, "predicted_next_period_start_date": None, "errors": []}
-
-    monkeypatch.setattr(VaultbeatLocalService, "menstrual_cycle_summary", fake_summary)
-
-    exit_code = cli.main(["--config", str(tmp_path / "config.json"), "menstrual"])
-
-    assert exit_code == 0
-    captured = capsys.readouterr()
-    # The notice belongs on stderr and the document on stdout. Asserted as two
-    # separate facts on purpose: the old version of this test read the notice
-    # out of stdout and then did `out.index("{")` to step over it, which is the
-    # bug written down as a test — `| jq` had no such escape hatch.
-    assert "sensitive" in captured.err  # still shown to a human at a terminal
-    assert "sensitive" not in captured.out  # and never in the document
-    printed = json.loads(captured.out)  # parses WHOLE, no slicing
-    assert printed["predicted_next_period_start_date"] is None
-
-
-def test_water_subcommand_returns_3_on_decode_errors(
-    monkeypatch: Any, tmp_path: Path
-) -> None:
-    async def fake_summary(
-        self: VaultbeatLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
-    ) -> dict[str, Any]:
-        return {"day_count": 0, "errors": ["env-1: VaultbeatCryptoError"]}
-
-    monkeypatch.setattr(VaultbeatLocalService, "water_intake_summary", fake_summary)
-
-    exit_code = cli.main(["--config", str(tmp_path / "config.json"), "water"])
-
-    assert exit_code == 3  # mirrors `sync`'s nonzero exit when records failed to decode
-
-
 def test_doctor_returns_1_and_prints_fail_when_unbound(tmp_path: Path, capsys: Any) -> None:
     exit_code = cli.main(["--config", str(tmp_path / "config.json"), "doctor"])
 
@@ -246,28 +189,50 @@ def test_doctor_returns_1_and_prints_fail_when_unbound(tmp_path: Path, capsys: A
     assert "bind" in captured.out
 
 
-def test_notes_kind_accepts_every_readable_kind() -> None:
-    """`--kind` must cover the kinds this server itself writes.
+# ── One exit for health data (2026-09-12) ───────────────────────────────────
+#
+# Invariant 81 (health-data-has-one-exit). Two tests, because the regression has
+# two shapes and either alone would let the other through: a command can be added
+# back, and the funnel that lets a command print health data can be re-added.
 
-    2026-07-27: choices were the iOS pair (sleep/menstrual) only, so the
-    mood/general notes `log_note` creates were unfilterable from the CLI —
-    argparse rejected them with exit code 2.
+
+def test_no_subcommand_can_print_health_data() -> None:
+    """The subcommand set is exactly the six that pair, diagnose, or serve.
+
+    Asserted as an EXACT set rather than a blacklist of the fifteen that were
+    removed: a blacklist passes for `get_sleep`, `sleep2`, or anything else
+    named differently, which is precisely how a removed capability comes back.
+
+    Adding a genuinely new control command is meant to fail here — it is one
+    line to update, and the failure is the prompt to ask whether the new command
+    reads health data. That question is the whole point of this test.
     """
+
     parser = cli.build_parser()
+    action = next(a for a in parser._subparsers._group_actions if hasattr(a, "choices"))
 
-    for kind in ("sleep", "menstrual", "mood", "general"):
-        args = parser.parse_args(["notes", "--kind", kind])
-        assert args.kind == kind
+    assert set(action.choices) == {"init", "bind", "poll", "status", "doctor", "serve"}
 
 
-def test_notes_kind_still_rejects_an_unknown_kind(capsys: Any) -> None:
-    parser = cli.build_parser()
+def test_the_cli_has_no_health_data_funnel() -> None:
+    """The helpers that existed to print decrypted health data stay gone.
 
-    with pytest.raises(SystemExit) as excinfo:
-        parser.parse_args(["notes", "--kind", "not-a-kind"])
+    `_emit_decrypted` was THE place health data left the CLI, with `_health_json`
+    deciding what it said and `_wrote_message` describing the 0600 file it could
+    write. The set above would still pass if one of these came back attached to,
+    say, `doctor` — so this asserts the machinery, not just the menu.
 
-    assert excinfo.value.code == 2
-    assert "invalid choice" in capsys.readouterr().err
+    ⚠️ `_print_json` is deliberately NOT in this list and must not be added: it
+    prints config status and the doctor report, neither of which is health data.
+    """
+
+    for gone in ("_emit_decrypted", "_health_json", "_wrote_message", "_warn_demo_on_stderr"):
+        assert not hasattr(cli, gone), (
+            f"`{gone}` is back — health data has one exit, and it is the MCP protocol "
+            "(Invariant 81 (health-data-has-one-exit))"
+        )
+
+    assert hasattr(cli, "_print_json"), "control commands still need their own printer"
 
 
 def test_cli_error_names_the_exception_type_when_str_is_empty(
@@ -276,21 +241,25 @@ def test_cli_error_names_the_exception_type_when_str_is_empty(
     """`httpx.ReadTimeout` stringifies to "" — the most common real failure here
     (Supabase edge cold starts) produced a bare `error:` with zero diagnostic
     content. Three consecutive cold-backup runs failed that way on 2026-07-27 and
-    the cause could only be found by bypassing this handler entirely."""
+    the cause could only be found by bypassing this handler entirely.
+
+    Carried by `status` since 2026-09-12: this asserts `main`'s except branch,
+    not any one subcommand, and its old carrier (`water`) was one of the fifteen
+    data subcommands removed that day. A surviving command is the durable
+    choice — the handler under test is shared by all of them.
+    """
 
     class SilentFailure(Exception):
         def __str__(self) -> str:
             return ""
 
-    async def boom(
-        self: VaultbeatLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
-    ) -> dict[str, Any]:
+    def boom(self: VaultbeatLocalService) -> dict[str, Any]:
         raise SilentFailure
 
-    monkeypatch.setattr(VaultbeatLocalService, "water_intake_summary", boom)
+    monkeypatch.setattr(VaultbeatLocalService, "status", boom)
 
     with pytest.raises(SystemExit) as excinfo:
-        cli.main(["--config", str(tmp_path / "config.json"), "water"])
+        cli.main(["--config", str(tmp_path / "config.json"), "status"])
 
     assert excinfo.value.code == 1
     assert "SilentFailure" in capsys.readouterr().err
@@ -301,15 +270,13 @@ def test_cli_error_keeps_the_message_when_there_is_one(
 ) -> None:
     """Naming the type must not cost the message — both are printed."""
 
-    async def boom(
-        self: VaultbeatLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
-    ) -> dict[str, Any]:
+    def boom(self: VaultbeatLocalService) -> dict[str, Any]:
         raise ValueError("config is unreadable")
 
-    monkeypatch.setattr(VaultbeatLocalService, "water_intake_summary", boom)
+    monkeypatch.setattr(VaultbeatLocalService, "status", boom)
 
     with pytest.raises(SystemExit) as excinfo:
-        cli.main(["--config", str(tmp_path / "config.json"), "water"])
+        cli.main(["--config", str(tmp_path / "config.json"), "status"])
 
     assert excinfo.value.code == 1
     err = capsys.readouterr().err
@@ -347,180 +314,6 @@ def test_bind_can_always_render_a_qr_code(capsys: pytest.CaptureFixture[str]) ->
 # CLI exit did not, and the CLI is the one whose output gets redirected into a
 # file, pasted into an issue, or handed to a second agent. These assert the
 # CLI half of Invariant 61 (demo-is-a-boundary-not-a-flag).
-
-
-def _data_subcommands() -> list[str]:
-    """Every subcommand that emits health data, derived from the parser.
-
-    Keyed off `--output`, which is exactly the set that goes through
-    `_emit_decrypted` — control subcommands (`init` / `bind` / `poll` /
-    `status` / `doctor` / `serve`) have no such flag. Derived rather than typed
-    out so a data subcommand written next is covered on the day it is written,
-    not on the day someone notices. `_read_tool_names` in `test_demo.py` exists
-    for the same reason on the MCP side.
-    """
-
-    parser = cli.build_parser()
-    action = next(a for a in parser._subparsers._group_actions if hasattr(a, "choices"))
-    return sorted(
-        name
-        for name, sub in action.choices.items()
-        if any("--output" in act.option_strings for act in sub._actions)
-    )
-
-
-@pytest.fixture
-def demo_cli(monkeypatch: Any) -> None:
-    """Demo mode on, memoized dataset dropped — mirrors `test_demo.py::demo_on`."""
-
-    import vaultbeat_mcp_local.demo as demo_module
-
-    monkeypatch.setenv(demo_module.DEMO_ENV, "1")
-    demo_module.reset_cache()
-
-
-def _stdout_payload(out: str) -> list[tuple[str, Any]]:
-    """Parse stdout as a JSON document, preserving key order.
-
-    Parses the WHOLE string rather than slicing from the first brace, which
-    makes this the guard for "stdout is exactly one JSON document" across every
-    data subcommand: anything printed alongside the payload fails here.
-
-    It used to slice, because `menstrual` / `notes` / `symptoms` printed a prose
-    sensitivity notice to stdout ahead of the payload and this docstring called
-    that "a pre-existing wart this change neither introduces nor fixes". The
-    slice is what let it survive — the notice broke `… | jq` for those three
-    kinds while every test stepped politely around it. The notice now goes to
-    stderr, so no slicing is needed and none should be reintroduced.
-    """
-
-    return json.loads(out, object_pairs_hook=list)
-
-
-@pytest.mark.parametrize("subcommand", _data_subcommands())
-def test_every_data_subcommand_leads_its_payload_with_the_warning(
-    subcommand: str, tmp_path: Path, capsys: Any, demo_cli: None
-) -> None:
-    """`demo_warning` must be the FIRST key of what the CLI prints.
-
-    First key, not merely present: `demo_mode: true` is a flag a reader has to
-    already know to look for, while the banner is a sentence that acts on one
-    who does not — and this payload's likeliest reader is a diff, an issue
-    comment or another agent, none of which was told what it is looking at.
-
-    Asserted on the serialised text via `object_pairs_hook`, never on a dict:
-    a dict is an intermediate nobody outside this process sees, and the thing
-    under test is precisely that `_health_json` stops sorting keys once the
-    payload is stamped (sorted, `count` wins and the banner lands mid-document,
-    behind an array long enough for a truncated paste to lose it).
-    """
-
-    assert cli.main(["--config", str(tmp_path / "config.json"), subcommand, "--limit", "2"]) == 0
-
-    pairs = _stdout_payload(capsys.readouterr().out)
-    assert pairs[0][0] == "demo_warning", f"{subcommand}: first key was {pairs[0][0]!r}"
-    assert str(pairs[0][1]).startswith("[SYNTHETIC DEMO DATA]")
-    assert dict(pairs)["demo_mode"] is True
-
-
-@pytest.mark.parametrize("subcommand", _data_subcommands())
-def test_every_data_subcommand_stamps_the_output_file_too(
-    subcommand: str, tmp_path: Path, capsys: Any, demo_cli: None
-) -> None:
-    """`--output` is the branch that matters most and the easier one to forget.
-
-    A file outlives the session that could have explained it, which is the whole
-    case Invariant 61 exists for. It used to be a second `json.dumps` in a
-    second function, so the stamp would have had to be remembered twice.
-    """
-
-    out_path = tmp_path / f"{subcommand}.json"
-    args = ["--config", str(tmp_path / "config.json"), subcommand, "--limit", "2", "--output", str(out_path)]
-    assert cli.main(args) == 0
-
-    pairs = json.loads(out_path.read_text(encoding="utf-8"), object_pairs_hook=list)
-    assert pairs[0][0] == "demo_warning", f"{subcommand}: file led with {pairs[0][0]!r}"
-
-    # And the sentence about the file must not claim a decryption that never
-    # happened — telling an operator to treat synthetic output as sensitive is
-    # the same defect pointing the other way.
-    printed = capsys.readouterr().out
-    assert "SYNTHETIC" in printed
-    assert "DECRYPTED" not in printed
-
-
-def test_the_banner_line_goes_to_stderr_so_stdout_stays_a_json_document(
-    tmp_path: Path, capsys: Any, demo_cli: None
-) -> None:
-    """Two markers, two channels, on purpose.
-
-    stdout carries the in-band stamp because that is what survives `> out.json`;
-    stderr carries the human sentence because a person with a terminal in front
-    of them will not notice a key in the middle of 200 lines. Printing the
-    sentence to stdout instead would break every consumer that parses this —
-    `doctor` may print `[DEMO]` to stdout only because its human rendering is
-    not JSON.
-    """
-
-    assert cli.main(["--config", str(tmp_path / "config.json"), "activity", "--limit", "1"]) == 0
-
-    captured = capsys.readouterr()
-    assert captured.out.lstrip().startswith("{")
-    json.loads(captured.out)  # must parse whole, with nothing prepended
-    assert captured.err.startswith("[SYNTHETIC DEMO DATA]")
-
-
-def test_demo_output_is_byte_identical_across_runs(
-    tmp_path: Path, capsys: Any, demo_cli: None
-) -> None:
-    """Dropping `sort_keys` for stamped payloads must not cost determinism.
-
-    Sorting bought stability of key order across future code EDITS, which is
-    worth something for a real export used as a diff baseline; run-to-run
-    identity comes from the seeded generator and fixed dict construction, and is
-    what makes two people comparing a demo payload in a bug report meaningful.
-    That is the property being traded away, and this is the one being kept.
-    """
-
-    argv = ["--config", str(tmp_path / "config.json"), "sleep", "--limit", "5"]
-    assert cli.main(argv) == 0
-    first = capsys.readouterr().out
-    assert cli.main(argv) == 0
-    assert capsys.readouterr().out == first
-
-
-def test_a_real_run_is_untouched_by_any_of_this(
-    monkeypatch: Any, tmp_path: Path, capsys: Any
-) -> None:
-    """No stamp, keys still sorted, and the file sentence unchanged.
-
-    The inverse failure is quieter than the one this change fixes but no more
-    acceptable: labelling a real reading synthetic would teach a user to ignore
-    the label that matters.
-    """
-
-    async def fake_summary(
-        self: VaultbeatLocalService, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
-    ) -> dict[str, Any]:
-        return {"zulu": 1, "alpha": 2, "rows": [{"a": 1}], "errors": []}
-
-    monkeypatch.setattr(VaultbeatLocalService, "water_intake_summary", fake_summary)
-    out_path = tmp_path / "real.json"
-    args = ["--config", str(tmp_path / "config.json"), "water", "--output", str(out_path)]
-    assert cli.main(args) == 0
-
-    text = out_path.read_text(encoding="utf-8")
-    # `object_pairs_hook` recurses, so it is used only for the ordering check —
-    # reading a nested row out of it would compare a list of pairs to a dict.
-    order = [key for key, _ in json.loads(text, object_pairs_hook=list)]
-    assert order == ["alpha", "errors", "rows", "zulu"], "keys must stay sorted"
-    written = json.loads(text)
-    assert "demo_warning" not in written
-    assert written["rows"] == [{"a": 1}], "rows must not gain `synthetic`"
-
-    captured = capsys.readouterr()
-    assert "DECRYPTED" in captured.out and "SYNTHETIC" not in captured.out
-    assert captured.err == "", "no banner on a real run"
 
 
 # ── bind success copy (2026-09-06) ──────────────────────────────────────────

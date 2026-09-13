@@ -12,44 +12,48 @@ re-export the public repo and update its README tool table + the website `/mcp` 
 It runs on the user's computer, generates the Curve25519 keypair used by the iOS app,
 shows a QR binding payload, receives a one-time server token from the cloud API, and
 then exposes decrypted health data — sleep, water, weight, cycle, activity, vitals —
-through either a CLI or a stdio MCP server. Read-only: data is written by the iOS app.
+**through the MCP server, and only through it**. Read-only for health data: writes come
+from the iOS app or from this server's own `log_*` tools.
 
 ## Commands
 
+**There are six, and none of them reads health data.** Health data has exactly one exit
+— the MCP protocol — so the commands here only pair a machine, check that pairing, and
+start the server. See "Why the CLI cannot read health data" below.
+
 ```bash
 python -m pip install -e './mcp-local-server[qr]'
-# try every read tool against synthetic data — no pairing, no cloud, no Apple Health
-vaultbeat-apple-health --demo sleep --limit 5
-vaultbeat-apple-health --demo doctor
 
-vaultbeat-apple-health bind
-vaultbeat-apple-health status
+vaultbeat-apple-health bind      # pair this machine with the iOS app (QR)
+vaultbeat-apple-health status    # local binding state
+vaultbeat-apple-health doctor    # self-diagnose config, key, cloud reachability
+vaultbeat-apple-health init      # generate a keypair + config without pairing
+vaultbeat-apple-health poll      # poll once for a pending authorization
 
-# read decrypted health data — every data subcommand accepts
-# --owner <user-id prefix> to filter to one person (omitting it mixes
-# both partners' records into one pool; aggregates become meaningless)
-vaultbeat-apple-health sleep --limit 5 --owner a1a1        # sleep sessions + provenance
-vaultbeat-apple-health sleep-detail --limit 1 --owner a1a1 # HR+RR+stage timeline
-vaultbeat-apple-health water --limit 30 --owner a1a1       # water intake + daily average
-vaultbeat-apple-health weight --limit 90 --owner b2b2      # weight trend (latest/avg/weekly rate)
-vaultbeat-apple-health menstrual --limit 60 --owner b2b2   # menstrual cycle (sensitive)
-vaultbeat-apple-health activity --limit 30 --owner a1a1    # daily activity rings
-vaultbeat-apple-health resting-hr --limit 30 --owner a1a1  # resting heart rate
-vaultbeat-apple-health workouts --limit 20 --owner a1a1    # workout records
-vaultbeat-apple-health mindfulness --limit 30 --owner a1a1 # mindful minutes
-vaultbeat-apple-health hrv --limit 30 --owner a1a1         # HRV / SDNN (hourly buckets by default; --granularity raw for per-sample)
-vaultbeat-apple-health wrist-temp --limit 30 --owner a1a1  # sleeping wrist temperature
-vaultbeat-apple-health symptoms --limit 30                 # symptom days (grouped by owner)
-vaultbeat-apple-health notes --kind sleep --limit 30       # free-text day annotations
-
-# run as an MCP server
+# run as an MCP server — this is how health data is read
 vaultbeat-apple-health serve --transport stdio
 vaultbeat-apple-health serve --transport http --host 127.0.0.1 --port 8000 --path /mcp
-vaultbeat-apple-health --demo serve --transport stdio   # same synthetic dataset, wired into a client
+vaultbeat-apple-health --demo serve --transport stdio   # synthetic dataset, wired into a client
+vaultbeat-apple-health --demo doctor
 ```
 
+### Why the CLI cannot read health data
+
+Until 0.7.4 this package shipped fifteen data subcommands (`sleep`, `water`, `weight`,
+`menstrual`, `hrv`, …) that printed decrypted health JSON to stdout. **They were removed,
+and nothing was lost**: every one of them had an MCP tool doing the same job
+(`sleep` → `vaultbeat_sync_sleep`, `water` → `get_water_intake`, and so on), while the MCP
+side additionally carries nine capabilities the CLI never had — food, basal energy, total
+energy, VO₂ max, the metric-series tools, and the six `log_*` writers.
+
+The CLI half was not a second feature, it was **a second door into the same room** —
+and a door that skipped everything the MCP tools state about what they return: how many
+days are actually covered, why an empty result is not a zero, which plan clamps the
+window. Any agent with shell access could read a person's cycle history by running a
+command, bypassing all of it. One exit is the property worth having, so there is one exit.
+
 `--demo` is a **global flag**, not a subcommand: it goes before the subcommand
-(`vaultbeat-apple-health --demo sleep`), and `VAULTBEAT_DEMO=1` does the same thing. It serves a
+(`vaultbeat-apple-health --demo serve`), and `VAULTBEAT_DEMO=1` does the same thing. It serves a
 deterministic synthetic dataset — the same records on every machine, every run — so demo
 output can be pasted into a bug report as a shared baseline. Nothing is fetched and nothing
 is decrypted; there is no private key involved at all. Every payload carries `demo_mode:
@@ -117,9 +121,9 @@ below). Binding a non-loopback address fails closed unless you pass both a token
 2. The iOS app scans that payload and calls the `mcp-bind-local` Edge Function.
 3. The local service polls the `mcp-poll-binding` Edge Function.
 4. Once bound, the local config stores `serverID` and `serverToken`.
-5. All read commands call the `mcp-sync` Edge Function, decrypt the returned envelopes
-   locally, and return plaintext JSON. (All privileged routes are Supabase Edge
-   Functions at `/functions/v1/<name>`.)
+5. Every read tool calls the `mcp-sync` Edge Function, decrypts the returned envelopes
+   locally, and returns plaintext JSON to the agent. (All privileged routes are Supabase
+   Edge Functions at `/functions/v1/<name>`.)
 
 ### Troubleshooting: the QR code looks wrong (Windows / non-UTF-8 terminals)
 
@@ -250,15 +254,16 @@ markdown managed by the user's agent, not in an E2EE cloud round trip.)
 Every health kind shares one decryption path (Curve25519 ECDH + HKDF-SHA256 + AES-GCM);
 the server routes on `encrypted_sleep_blobs.metric_type` (the live kind list is whatever `check_metric_type_contract.py` prints — see
 `KNOWN_METRIC_TYPES` in `service.py`) and only the per-kind JSON decode/aggregate
-differs. The same service-layer functions back both the MCP tools and the matching CLI
-subcommands — no duplicated logic.
+differs. The service layer holds that logic and the MCP tools are its only callers —
+until 0.7.4 a parallel set of CLI subcommands called the same functions, which is what
+gave health data two exits.
 
 **Local record cache (2026-07-09):** all reads are cache-first. Decrypted records are
 kept per metric type under `~/.tether/mcp-local/cache/` (owner-only 0600 files, 0700
 dir, stamped with server_id + fetch time + the fetch's decrypt-error list). Default TTL
 600 s — override with `VAULTBEAT_MCP_CACHE_TTL` (0 disables). Within the TTL a repeat query
-is answered locally with zero network (~0.2 s vs 5-35 s); pass `--fresh` (CLI) or
-`fresh=true` (MCP tools) to force a cloud round trip. (Re)binding clears the cache.
+is answered locally with zero network (~0.2 s vs 5-35 s); pass `fresh=true` on any read
+tool to force a cloud round trip. (Re)binding clears the cache.
 `mcp-sync` also accepts `?metric_type=` so single-metric fetches stop paying for every
 other kind's ciphertext; the client keeps its own post-decrypt filter, so older edge
 deployments stay correct.
