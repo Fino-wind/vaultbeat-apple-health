@@ -43,8 +43,8 @@ Until 0.7.4 this package shipped fifteen data subcommands (`sleep`, `water`, `we
 `menstrual`, `hrv`, …) that printed decrypted health JSON to stdout. **They were removed,
 and nothing was lost**: every one of them had an MCP tool doing the same job
 (`sleep` → `vaultbeat_sync_sleep`, `water` → `get_water_intake`, and so on), while the MCP
-side additionally carries nine capabilities the CLI never had — food, basal energy, total
-energy, VO₂ max, the metric-series tools, and the six `log_*` writers.
+side additionally carries whole capabilities the CLI never had — food, basal energy, total
+energy, VO₂ max, the metric-series tools, and every `log_*` writer.
 
 The CLI half was not a second feature, it was **a second door into the same room** —
 and a door that skipped everything the MCP tools state about what they return: how many

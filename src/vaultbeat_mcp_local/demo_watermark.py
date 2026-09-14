@@ -39,13 +39,14 @@ honestly: `demo.py` is the natural home — it already owns `DEMO_BANNER`,
 merging this file into it would cost nothing and remove a hop. It was kept
 separate only because this change landed alongside concurrent edits to that
 file, and an append there risked a silent clobber. **Folding it in is correct
-whenever someone is next editing `demo.py` anyway** — the import site count is
-two.
+whenever someone is next editing `demo.py` anyway** — the production import
+site count is one (`mcp_server.py`), down from two when `cli.py` still
+serialised health payloads.
 
 Nothing here reads the environment. Callers decide whether demo mode is on and
 say so by calling; that keeps this file a pure formatter and keeps the decision
-where it can be seen (`run_mcp_server` freezes it once at startup, `cli.py` asks
-`demo_enabled()` at the one point a payload is serialised).
+where it can be seen (`run_mcp_server` freezes it once at startup; `cli.py` no
+longer calls `demo_enabled()` at all — it only sets `DEMO_ENV` in `main()`).
 """
 
 from __future__ import annotations
@@ -58,7 +59,7 @@ __all__ = ["mark_demo_rows", "watermark_demo_result"]
 
 
 def watermark_demo_result(result: Any) -> Any:
-    """Stamp a synthetic-data marker onto a tool or subcommand result.
+    """Stamp a synthetic-data marker onto a tool result.
 
     Add-only and non-destructive, same discipline as `_annotate_if_empty`: it
     never reads, edits or drops an existing key. The marker goes FIRST in the
@@ -72,12 +73,13 @@ def watermark_demo_result(result: Any) -> Any:
     is free; which of the two goes first is not.
 
     ⚠️ That ordering guarantee is a property of the SERIALISER, not of this
-    function, and the two exits disagree about it by default: the MCP SDK dumps
-    with insertion order, while `cli.py` dumps with `sort_keys=True`, under
-    which `count` beats `demo_warning` to the front. `cli.py` turns sorting off
-    for stamped payloads for exactly this reason — see `_health_json` there. A
-    future caller that sorts is not wrong, but it has silently downgraded the
-    marker to something you have to go looking for.
+    function. Since 0.7.4 there is only one exit for health data and it is the
+    MCP SDK, which dumps in insertion order — but `cli.py`'s remaining
+    `_print_json` still passes `sort_keys=True`, under which `demo_warning`
+    would sink into the middle of a payload. Nothing stamped reaches that
+    printer today; a future caller that routes one through it is not wrong, but
+    it has silently downgraded the marker to something you have to go looking
+    for.
 
     A result that already carries `demo_mode` (`vaultbeat_status`,
     `vaultbeat_doctor`, `_demo_write_refusal`, which build a richer block of

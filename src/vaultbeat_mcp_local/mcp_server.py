@@ -114,12 +114,18 @@ _DEMO_DOC_PREFIX = (
 
 
 # `_watermark_demo` / `_mark_demo_rows` used to live here. They moved to
-# `demo_watermark.py` on 2026-08-27 because the CLI's data subcommands need the
-# same stamp and cannot import this module — `cli.py` keeps `mcp_server` behind a
-# lazy import inside `handle_serve` precisely so the MCP SDK's import chain stays
+# `demo_watermark.py` on 2026-08-27 because the CLI's data subcommands NEEDED the
+# same stamp and could not import this module — `cli.py` keeps `mcp_server` behind
+# a lazy import inside `handle_serve` precisely so the MCP SDK's import chain stays
 # off the data path (verified: importing `cli` loads no `mcp.*` module). A
 # judgement with one home that only one of two callers can reach is the
 # Invariant 58 (one-funnel-per-event) failure, not the fix.
+#
+# ⚠️ Past tense since 0.7.4: those subcommands are gone (Invariant 81
+# (health-data-has-one-exit)), so this module is the only importer left. The
+# split is KEPT anyway — the lazy-import property it protects is still real, and
+# re-inlining it would have to be undone by the next caller that needs the stamp
+# outside the SDK's import chain.
 
 
 def _demo_wrap(function: _F) -> _F:
@@ -582,7 +588,11 @@ def run_mcp_server(
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
 
         🔑 **Pass `summary_only=True` when you only want the SIDE EFFECT.** A default
         call returns every decrypted session — measured at 76,446 characters, which
@@ -627,7 +637,7 @@ def run_mcp_server(
 
     @tool(title="Water intake", annotations=_read_only_tool())
     async def get_water_intake(
-        limit: int = 30, owner: str | None = None, fresh: bool = False
+        limit: int = 90, owner: str | None = None, fresh: bool = False
     ) -> dict[str, Any]:
         """Decrypt recent daily water intake locally and compute the average.
 
@@ -641,7 +651,11 @@ def run_mcp_server(
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
         """
 
         return _annotate_if_empty(
@@ -666,7 +680,11 @@ def run_mcp_server(
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
         """
 
         return _annotate_if_empty(
@@ -691,7 +709,11 @@ def run_mcp_server(
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
         """
 
         return await service.symptom_summary(limit=limit, fresh=fresh)
@@ -711,7 +733,11 @@ def run_mcp_server(
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
         """
 
         return await service.notes_summary(limit=limit, target_kind=target_kind, fresh=fresh)
@@ -732,7 +758,11 @@ def run_mcp_server(
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
         """
 
         return _annotate_if_empty(
@@ -831,7 +861,11 @@ def run_mcp_server(
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
         """
 
         return _annotate_if_empty(
@@ -1036,7 +1070,7 @@ def run_mcp_server(
 
     @tool(title="Menstrual cycle", annotations=_read_only_tool())
     async def get_menstrual_cycle(
-        limit: int = 60, owner: str | None = None, fresh: bool = False
+        limit: int = 90, owner: str | None = None, fresh: bool = False
     ) -> dict[str, Any]:
         """Decrypt recent menstrual cycle data locally and predict the next period.
 
@@ -1047,7 +1081,11 @@ def run_mcp_server(
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
         """
 
         return await service.menstrual_cycle_summary(limit=limit, owner=owner, fresh=fresh)
@@ -1194,7 +1232,11 @@ def run_mcp_server(
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
         """
 
         return await service.sleep_detail_records(
@@ -1202,7 +1244,7 @@ def run_mcp_server(
         )
 
     @tool(title="Activity rings", annotations=_read_only_tool())
-    async def get_activity(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def get_activity(limit: int = 90, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent daily activity rings (steps, active energy kcal, exercise minutes,
         stand hours, distance km). One entry per day, newest first.
         Use `owner` prefix to filter by person. Each record carries `owner_user_id`.
@@ -1210,7 +1252,11 @@ def run_mcp_server(
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
         """
 
         return _annotate_if_empty(
@@ -1220,34 +1266,42 @@ def run_mcp_server(
         )
 
     @tool(title="Resting heart rate", annotations=_read_only_tool())
-    async def get_resting_hr(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def get_resting_hr(limit: int = 90, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent resting heart rate samples (bpm). Returns per-day records
         plus average over the window. Use `owner` prefix to filter by person.
 
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
         """
 
         return await service.resting_hr_records(limit=limit, owner=owner, fresh=fresh)
 
     @tool(title="Workouts", annotations=_read_only_tool())
-    async def get_workouts(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def get_workouts(limit: int = 90, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent workout sessions (type, duration, calories, distance).
         Use `owner` prefix to filter by person.
 
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
         """
 
         return await service.workout_records(limit=limit, owner=owner, fresh=fresh)
 
     @tool(title="Heart rate variability", annotations=_read_only_tool())
     async def get_hrv(
-        limit: int = 30,
+        limit: int = 168,
         owner: str | None = None,
         fresh: bool = False,
         granularity: str = "hourly",
@@ -1287,7 +1341,11 @@ def run_mcp_server(
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
         """
 
         if granularity == "raw":
@@ -1322,7 +1380,7 @@ def run_mcp_server(
         return raw
 
     @tool(title="Wrist temperature", annotations=_read_only_tool())
-    async def get_wrist_temp(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def get_wrist_temp(limit: int = 90, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent sleeping wrist temperature samples — ABSOLUTE °C.
 
         ⚠️ These are absolute skin temperatures (~35.5-36.5 °C), NOT baseline
@@ -1335,7 +1393,11 @@ def run_mcp_server(
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
         """
 
         return await service.wrist_temp_records(limit=limit, owner=owner, fresh=fresh)
@@ -1358,7 +1420,11 @@ def run_mcp_server(
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
         """
 
         return _annotate_if_empty(
@@ -1368,7 +1434,7 @@ def run_mcp_server(
         )
 
     @tool(title="Total energy burned (TDEE)", annotations=_read_only_tool())
-    async def get_total_energy_burned(days: int = 7, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def get_total_energy_burned(days: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """TDEE (total daily energy expenditure) = basal + active per day, last N days.
 
         The truthful daily calorie burn from Watch's actual measurements — not
@@ -1389,13 +1455,17 @@ def run_mcp_server(
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
         """
 
         return await service.total_energy_burned(days=days, owner=owner, fresh=fresh)
 
     @tool(title="VO₂ max", annotations=_read_only_tool())
-    async def get_vo2max(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def get_vo2max(limit: int = 90, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent VO2Max samples (Apple Watch cardiorespiratory fitness).
         Unit: mL/(kg·min); higher = better. Male 20-29 reference: <35 poor,
         35-42 fair, 42-46 good, 46-50 excellent, 50+ superior. Returns
@@ -1407,7 +1477,11 @@ def run_mcp_server(
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
         """
 
         return _annotate_if_empty(
@@ -1417,14 +1491,18 @@ def run_mcp_server(
         )
 
     @tool(title="Mindfulness", annotations=_read_only_tool())
-    async def get_mindfulness(limit: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def get_mindfulness(limit: int = 90, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent daily mindfulness summaries (session count, total minutes).
         Use `owner` prefix to filter by person.
 
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
         the row count) and `coverage.span_days` beside any average or trend, and read
         `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind.
+        missing kind. 🔴 Before saying how far back someone's data goes, read
+        `coverage.more_available`: `true` means this server can decrypt days OLDER
+        than `first_day` that your `limit` left behind — re-read with a larger
+        `limit`, or quote `coverage.oldest_available` as the real start of their
+        history. Never report a `limit`-shaped window as the extent of their data.
         """
 
         return await service.mindfulness_summary(limit=limit, owner=owner, fresh=fresh)
