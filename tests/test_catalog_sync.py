@@ -149,9 +149,11 @@ def _seed(cloud: CatalogCloudClient, public_key: str, days: list[str]) -> None:
 def test_unchanged_library_transfers_no_blobs_at_all(tmp_path: Path) -> None:
     """The whole point: a second read of unchanged data fetches zero ciphertext.
 
-    `fresh=True` deliberately, to prove --fresh no longer means "re-download
+    `fresh=True` deliberately, to prove it no longer means "re-download
     everything" — the digest re-verifies against the server, which is strictly
     stronger than a TTL, so honouring it costs 119 bytes instead of 12 MB.
+    (Named for the `--fresh` CLI flag, which 0.7.4 removed along with the data
+    subcommands; the argument itself is on every read tool.)
     """
     service, cloud, public_key = _catalog_service(tmp_path)
     _seed(cloud, public_key, ["2026-07-20", "2026-07-21", "2026-07-22"])

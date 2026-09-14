@@ -3811,6 +3811,117 @@ def test_coverage_window_satisfied_is_false_when_history_is_short(tmp_path: Path
     assert coverage["span_days"] == 11
 
 
+def test_coverage_says_older_days_exist_behind_the_limit(tmp_path: Path) -> None:
+    """The 2026-09-14 bug, pinned: 2 of 5 days, and the answer must say so.
+
+    A paying user's agent called `get_activity()`, took the default `limit`, and
+    was handed thirty days of an 822-day history. Every field in the block was
+    true by its own definition — `days_covered: 30`, `days_missing_in_span: 0`,
+    `window_satisfied: true` — so it reported "you only have the last month" to
+    someone who had bought full history. Nothing was wrong; nothing could see
+    the cut either.
+    """
+    service, cloud, public_key = _bound_service(tmp_path)
+    days = [f"2026-07-0{i}T16:00:00Z" for i in range(1, 6)]
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _body_payload(f"body-{i}", day, 80.0 + i),
+            metric_type="body",
+            envelope_id=f"env-body-{i}",
+            blob_id=f"body-{i}",
+            owner_user_id=_TEST_OWNER,
+        )
+        for i, day in enumerate(days)
+    ]
+
+    coverage = asyncio.run(service.weight_trend_summary(limit=2, owner="a1a1"))["coverage"]
+
+    assert coverage["days_covered"] == 2, "the caller asked for 2 and got 2"
+    assert coverage["more_available"] is True, "3 older days are sealed and readable"
+    assert coverage["total_available"] == 5
+    # A RELATION, not a date literal: `_coverage_day_of` resolves an ISO instant to
+    # the reader's LOCAL day, so `…T16:00:00Z` is the 2nd in UTC+8 and the 1st in
+    # UTC. Pinning the string passes in Shanghai and fails on a UTC runner — which
+    # is exactly what it did, one push after this file went green locally. The
+    # relation below is what `more_available` actually means, and it holds in every
+    # timezone.
+    assert coverage["oldest_available"] < coverage["first_day"]
+    # 🔴 The half that makes the rest reachable. `counted >= requested` was true
+    # here and read as an all-clear, which is how a slice got reported as a
+    # history. A read that leaves older days behind is not a satisfied window,
+    # however many rows it returned.
+    assert coverage["window_satisfied"] is False
+
+
+def test_coverage_does_not_cry_wolf_when_the_history_really_ended(
+    tmp_path: Path,
+) -> None:
+    """Everything there is, returned — `more_available` must stay False.
+
+    The mirror of the test above, and the more important one to keep: a flag
+    that fires on every read teaches agents to ignore it, which would leave the
+    real case (above) just as invisible as before while looking fixed.
+    """
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _body_payload(f"body-{i}", day, 80.0 + i),
+            metric_type="body",
+            envelope_id=f"env-body-{i}",
+            blob_id=f"body-{i}",
+            owner_user_id=_TEST_OWNER,
+        )
+        for i, day in enumerate(["2026-07-01T16:00:00Z", "2026-07-02T16:00:00Z"])
+    ]
+
+    coverage = asyncio.run(service.weight_trend_summary(limit=2, owner="a1a1"))["coverage"]
+
+    assert coverage["more_available"] is False
+    # Same timezone reasoning as the test above: assert the relation the field
+    # encodes — nothing older than what came back — not a literal local day.
+    assert coverage["oldest_available"] == coverage["first_day"]
+    assert coverage["window_satisfied"] is True, "asked for 2, got 2, nothing older"
+
+
+def test_coverage_compares_days_not_rows_so_a_dedupe_is_not_hidden_history(
+    tmp_path: Path,
+) -> None:
+    """Four blobs over two days, `limit=4`: fewer ROWS survive, no day is hidden.
+
+    Counting rows here would report `more_available` on every deduping reader —
+    water, weight, menstrual, symptom, strength, food all collapse after the cut
+    — and a flag that is true on ordinary reads is a flag nobody reads. Only a
+    day OLDER than `first_day` means history was withheld.
+    """
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            _body_payload(f"body-{i}", day, 80.0 + i),
+            metric_type="body",
+            envelope_id=f"env-body-{i}",
+            blob_id=f"body-{i}",
+            owner_user_id=_TEST_OWNER,
+        )
+        for i, day in enumerate(
+            [
+                "2026-07-01T16:00:00Z",
+                "2026-07-01T18:00:00Z",
+                "2026-07-02T16:00:00Z",
+                "2026-07-02T18:00:00Z",
+            ]
+        )
+    ]
+
+    coverage = asyncio.run(service.weight_trend_summary(limit=4, owner="a1a1"))["coverage"]
+
+    assert coverage["days_covered"] == 2
+    assert coverage["total_available"] == 4, "four rows really did exist"
+    assert coverage["more_available"] is False, "no day older than first_day was cut"
+
+
 def test_coverage_survives_the_dedup_that_runs_after_the_cut(tmp_path: Path) -> None:
     """Four blobs, two dayIDs → two days, and the window is NOT satisfied.
 
@@ -4228,6 +4339,19 @@ def test_every_read_tool_reports_coverage() -> None:
             # narrower set than the rows beside it, which is the one direction
             # that makes an agent under-trust real data.
             assert coverage["days_in_payload"] <= coverage["days_covered"], name
+            # Every reader must SAY what was behind the cut. `None` here means a
+            # tool was added without being taught to look, and it is invisible
+            # from the outside — the response is well-formed and simply never
+            # mentions the older days it declined to fetch.
+            assert coverage["total_available"] is not None, (
+                f"{name} does not report how much was available before `limit`"
+            )
+            assert coverage["more_available"] is not None, name
+            assert coverage["total_available"] >= coverage["rows_counted"], name
+            if coverage["more_available"]:
+                assert coverage["window_satisfied"] is not True, (
+                    f"{name} calls the window satisfied while withholding older days"
+                )
             if coverage["days_covered"]:
                 # Arithmetic that has to hold on its own: a span can never be
                 # shorter than the number of distinct days inside it.

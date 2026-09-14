@@ -1320,6 +1320,31 @@ def _cut_newest_by(
     return sorted(items, key=lambda i: key(i) or "", reverse=True)[:limit]
 
 
+def _cut_newest_by_with_span(
+    items: list[_T], limit: int | None, *, key: Callable[[_T], str | None]
+) -> tuple[list[_T], int, str | None]:
+    """`_cut_newest_by`, plus the two facts the cut destroys.
+
+    Returns `(kept, total_before_cut, oldest_date_before_cut)` — exactly the pair
+    `_attach_coverage` needs for `more_available`, taken at the only moment they
+    are still knowable. Feeding them from the caller instead would mean sorting
+    the list a second time, and a second sort is a second chance for the two
+    orderings to disagree about which row is oldest.
+
+    The `limit is None` branch returns `items` UNSORTED, matching
+    `_cut_newest_by` exactly: callers pass the result straight to a
+    `summarize_*` that does its own grouping, and quietly reordering it here
+    would change output that has nothing to do with this feature. The span facts
+    are still computed from the sorted view, so they are correct either way.
+    """
+
+    ordered = sorted(items, key=lambda i: key(i) or "", reverse=True)
+    oldest = key(ordered[-1]) if ordered else None
+    if limit is None:
+        return items, len(items), oldest
+    return ordered[:limit], len(items), oldest
+
+
 def _attach_errors(summary: dict[str, Any], errors: list[str]) -> dict[str, Any]:
     """Standard error reporting: the raw list plus, when non-empty, a note that
     explains what an error means so callers stop treating two stale-key blobs
@@ -1406,12 +1431,23 @@ _COVERAGE_NOTE = (
     "against `days_covered`, never against what is printed; a missing day means "
     "EITHER nothing was recorded, OR `requested_unit` is not \"days\" and the limit "
     "cut those rows off — it NEVER means nothing happened. "
-    "`window_satisfied` is false when fewer rows "
-    "than requested came back, which usually means that is all the history this "
-    "server holds (a freshly paired server is still sealing its copy, so re-check "
-    "after a re-sync rather than concluding the data does not exist); it is null "
-    "when no limit was requested. None of these fields is a quality judgement — "
-    "sparse is normal for kinds the Watch only measures occasionally."
+    "🔴 `more_available` is the one to read before you say how much history "
+    "exists: it is true when this server can decrypt days OLDER than "
+    "`first_day` that your `limit` left behind, and `oldest_available` names "
+    "the earliest day it holds. If it is true, DO NOT tell the user this is all "
+    "their data — re-read with a larger `limit`, or quote `oldest_available` as "
+    "the real start of their history. `total_available` is how many rows existed "
+    "before the cut, so 30 of 3251 is visibly a slice and not a history. "
+    "`window_satisfied` is false when fewer rows than requested came back OR "
+    "when `more_available` is true; it is null when no limit was requested. It "
+    "is true ONLY when you got everything you asked for AND nothing older is "
+    "being withheld by the limit, so it is the single field to check before "
+    "concluding a history is short. A short history with `more_available: false` "
+    "really is all this server holds (a freshly paired server is still sealing "
+    "its copy, so re-check after a re-sync rather than concluding the data does "
+    "not exist; an unpaid account seals only its last 7 days). None of these "
+    "fields is a quality judgement — sparse is normal for kinds the Watch only "
+    "measures occasionally."
 )
 
 
@@ -1443,7 +1479,11 @@ def _rows_returned(summary: dict[str, Any], spec: Any) -> int:
 
 
 def _attach_series_coverage(
-    result: dict[str, Any], points: dict[str, float], *, requested: int
+    result: dict[str, Any],
+    points: dict[str, float],
+    *,
+    requested: int,
+    source: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The standard coverage block, over an already-bucketed `{day: value}` map.
 
@@ -1457,13 +1497,24 @@ def _attach_series_coverage(
     The rows handed in are synthetic one-per-day stubs because the days ARE the
     rows at this layer — the real ones were collapsed by `daily_series`, and
     passing those instead would count samples where the caller asked for days.
+
+    *source* is the underlying read tool's own summary (`_series_points`'s third
+    return value), and `more_available` is INHERITED from it rather than
+    recomputed. It has to be: by this layer the rows are already bucketed into
+    `{day: value}`, so nothing here can still see what the fetch left behind —
+    and the fetch already worked it out. Re-deriving it from `points` would only
+    ever report on the slice this layer was handed, which is the bug the field
+    exists to expose, reintroduced one level up.
     """
 
+    source_coverage = (source or {}).get("coverage") or {}
     return _attach_coverage(
         result,
         rows=[{"local_date": day} for day in sorted(points)],
         requested=requested,
         unit="days",
+        total_available=source_coverage.get("total_available"),
+        oldest_raw=source_coverage.get("oldest_available"),
     )
 
 
@@ -1509,6 +1560,8 @@ def _attach_coverage(
     unit: str,
     cut_count: int | None = None,
     displayed: Any = None,
+    total_available: int | None = None,
+    oldest_raw: str | None = None,
 ) -> dict[str, Any]:
     """Attach a `coverage` block stating how many days this result rests on.
 
@@ -1555,6 +1608,47 @@ def _attach_coverage(
     (`target_kind` discards kinds the caller did not ask for, which is not
     scarcity) and `basal_energy_records` (`limit` caps SAMPLES while the rows
     are days).
+
+    *total_available* and *oldest_raw* are read one line BEFORE `limit` cuts,
+    and they answer the one question this block could never answer before: **is
+    there older history behind the cut?** Every other field here describes what
+    came back; `oldest_available` / `total_available` / `more_available` describe
+    what was there to come back. They are two scalars rather than the pre-cut
+    list because Invariant 38 has already sorted it by business day descending —
+    so its length and its LAST element are the whole answer, and no reader pays
+    to re-serialise a list it is about to throw away. *oldest_raw* is that last
+    element's own date string, in whatever shape the reader already holds
+    (bare day or ISO instant); this function normalises it through the same
+    `_coverage_day_of` every other field uses, so a caller cannot introduce a
+    second notion of what day a row falls on.
+
+    🔴 **Why it was added (2026-09-14, a real and silent product failure).** A
+    paying user's agent called `get_activity()`, took the default `limit=30`,
+    and received thirty days out of the 822 this server could decrypt. Nothing
+    in the response was false and nothing was missing by its own definition —
+    `days_covered: 30`, `days_missing_in_span: 0`, `window_satisfied: true` —
+    so the agent reported "you only have the last month", which is the exact
+    sentence a user who bought full history must never read. On the sample
+    kinds it is starker still: `get_hrv(limit=45)` is six days of a 357-day
+    history, and the same three fields go green. **`limit` counts rows; the
+    agent is reasoning about time; and until this field existed no part of the
+    payload knew the difference.** Compare with Invariant 63 (a-slow-backfill-may-be-a-wall)
+    — that one warns against widening a window that is really a paywall. This
+    is its mirror: a window that is really just an argument default. The
+    distinguishing question is whether the data is THERE, and `more_available`
+    is now literally the answer to it.
+
+    ⚠️ **`more_available` is computed from THIS server's decryptable set**, so it
+    cannot leak across the paywall: a free account has only 7 days sealed for
+    it (Invariant 72 (free-tier-uploads-seven-days)), so the field reads `false`
+    for exactly the reason it should — there is no more, not "we won't say".
+
+    ⚠️ **It compares DAYS, not row counts**, and that is deliberate. A
+    `limit` that lands mid-day, or a dedupe that runs after the cut, both shrink
+    the row count without hiding any history; only `oldest_available < first_day`
+    means an older day exists that the caller did not get. Counting rows here
+    would fire `true` on every deduped read and teach agents to ignore it —
+    Invariant 62's "a flag that cries wolf gets tuned out" applied to a new field.
     """
 
     # Materialised up front: `rows` is iterated twice below, and a caller passing
@@ -1584,6 +1678,22 @@ def _attach_coverage(
             missing = max(span_days - len(days), 0)
 
     counted = cut_count if cut_count is not None else len(row_list)
+
+    # What was there BEFORE the cut. `None` throughout when the caller did not
+    # say — an honest "not stated" rather than a fabricated `false`, which would
+    # assert there is no more history on exactly the readers that have not been
+    # taught to look.
+    oldest_available = _coverage_day_of({"date": oldest_raw}) if oldest_raw else None
+    more_available: bool | None = None
+    if total_available is not None:
+        # Strictly older, by day. See the docstring: rows lost to a mid-day cut
+        # or to a post-cut dedupe are not hidden history.
+        more_available = bool(
+            oldest_available is not None
+            and first_day is not None
+            and oldest_available < first_day
+        )
+
     summary["coverage"] = {
         "days_covered": len(days),
         "days_in_payload": days_in_payload,
@@ -1594,7 +1704,16 @@ def _attach_coverage(
         "rows_counted": counted,
         "requested": requested,
         "requested_unit": unit,
-        "window_satisfied": None if requested is None else counted >= requested,
+        "oldest_available": oldest_available,
+        "total_available": total_available,
+        "more_available": more_available,
+        # Both halves, and the second half is the 2026-09-14 fix: "you got the
+        # number of rows you asked for" was answering a question nobody asked
+        # while reading as an all-clear. A read that leaves older days behind is
+        # NOT a satisfied window, however many rows it returned.
+        "window_satisfied": (
+            None if requested is None else (counted >= requested and not more_available)
+        ),
         "note": _COVERAGE_NOTE,
     }
     return summary
@@ -2760,7 +2879,9 @@ class VaultbeatLocalService:
         # `fresh=True` still comes through here on purpose: it means "do not
         # trust age", not "re-download everything". The digest re-verifies
         # against the server, which is strictly stronger than a TTL, so honouring
-        # --fresh no longer has to cost 12 MB.
+        # it no longer has to cost 12 MB. (It reaches this code as every read
+        # tool's `fresh` argument; the `--fresh` CLI flag it was named for went
+        # with the data subcommands in 0.7.4.)
         #
         # Every branch degrades to the full fetch, never to an error: an older
         # edge deployment (no catalog mode), a cache with no stored digest, an
@@ -3118,6 +3239,8 @@ class VaultbeatLocalService:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
 
         daily_summary = _select_primary_sessions(sessions)
+        _avail = len(daily_summary)
+        _oldest = _coverage_day_of(daily_summary[-1]) if daily_summary else None
 
         if limit is not None:
             daily_summary = daily_summary[:limit]
@@ -3132,7 +3255,7 @@ class VaultbeatLocalService:
         # Coverage counts NIGHTS, not blobs: `sessions` holds 2-3 blobs per night
         # (Watch stages + iPhone inBed + possibly OtterLife), so `count` above is
         # not a number of nights and must never be read as one.
-        _attach_coverage(summary, rows=daily_summary, requested=limit, unit="nights")
+        _attach_coverage(summary, rows=daily_summary, requested=limit, unit="nights", total_available=_avail, oldest_raw=_oldest)
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3358,6 +3481,8 @@ class VaultbeatLocalService:
             ))
             result_nights.append(best)
 
+        _avail = len(result_nights)
+        _oldest = _coverage_day_of(result_nights[-1]) if result_nights else None
         if limit is not None:
             result_nights = result_nights[:limit]
 
@@ -3376,7 +3501,7 @@ class VaultbeatLocalService:
             # fresh=True chasing a sync problem that does not exist.
             "timeline_included": include_timeline,
         }
-        _attach_coverage(summary, rows=result_nights, requested=limit, unit="nights")
+        _attach_coverage(summary, rows=result_nights, requested=limit, unit="nights", total_available=_avail, oldest_raw=_oldest)
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3397,12 +3522,13 @@ class VaultbeatLocalService:
         # so a backfill batch could drop the newest days — same bug the other
         # eight kinds had fixed on 2026-07-24.
         days.sort(key=lambda d: d.day_start_date, reverse=True)
+        _avail, _oldest = len(days), (days[-1].day_start_date if days else None)
         if limit is not None:
             days = days[:limit]
         summary = summarize_water_intake(days)
         # From the summary's OWN rows, not from `days`: summarize_water_intake
         # dedups by dayID, so len(days) can exceed what the average divides by.
-        _attach_coverage(summary, rows=summary["days"], requested=limit, unit="days")
+        _attach_coverage(summary, rows=summary["days"], requested=limit, unit="days", total_available=_avail, oldest_raw=_oldest)
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3432,13 +3558,14 @@ class VaultbeatLocalService:
         # while keeping the older 07-10 one, because the created_at cut landed
         # before the parse.
         days.sort(key=lambda d: d.day_start_date, reverse=True)
+        _avail, _oldest = len(days), (days[-1].day_start_date if days else None)
         if limit is not None:
             days = days[:limit]
         summary = summarize_weight_trend(days, goal_kg=goal_kg)
         # The trend line and `weekly_change_kg` are fitted over these rows, so
         # coverage has to describe the same set — two weigh-ins 40 days apart and
         # 40 daily ones produce an identically-shaped slope.
-        _attach_coverage(summary, rows=summary["days"], requested=limit, unit="days")
+        _attach_coverage(summary, rows=summary["days"], requested=limit, unit="days", total_available=_avail, oldest_raw=_oldest)
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3468,6 +3595,7 @@ class VaultbeatLocalService:
         # so a backfill batch could hide the most recent cycle days — and the
         # prediction is only as good as the newest bleeding day it can see.
         days.sort(key=lambda d: d.day_start_date, reverse=True)
+        _avail, _oldest = len(days), (days[-1].day_start_date if days else None)
         if limit is not None:
             days = days[:limit]
         # Owners come from the days that survived the cut, so the wrist-temp
@@ -3475,7 +3603,7 @@ class VaultbeatLocalService:
         menstrual_owners = {d.owner_user_id for d in days if d.owner_user_id}
         wrist_readings = await self._wrist_readings_for_owner(menstrual_owners, errors, fresh=fresh)
         summary = summarize_menstrual_cycle(days, wrist_readings=wrist_readings)
-        _attach_coverage(summary, rows=summary["days"], requested=limit, unit="days")
+        _attach_coverage(summary, rows=summary["days"], requested=limit, unit="days", total_available=_avail, oldest_raw=_oldest)
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3525,10 +3653,11 @@ class VaultbeatLocalService:
         # matching business time and a created_at cut can drop the newest days
         # (2026-07-24: mindfulness/vo2max came back visibly shuffled).
         days.sort(key=lambda d: d.day_start_date, reverse=True)
+        _avail, _oldest = len(days), (days[-1].day_start_date if days else None)
         if limit is not None:
             days = days[:limit]
         summary = {"days": [d.to_dict() for d in days], "count": len(days)}
-        _attach_coverage(summary, rows=summary["days"], requested=limit, unit="days")
+        _attach_coverage(summary, rows=summary["days"], requested=limit, unit="days", total_available=_avail, oldest_raw=_oldest)
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3546,6 +3675,7 @@ class VaultbeatLocalService:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
         # Business-time sort before the cut (see activity_summary's comment).
         hr_records.sort(key=lambda r: r.date, reverse=True)
+        _avail, _oldest = len(hr_records), (hr_records[-1].date if hr_records else None)
         if limit is not None:
             hr_records = hr_records[:limit]
         bpms = [r.bpm for r in hr_records]
@@ -3558,7 +3688,7 @@ class VaultbeatLocalService:
         # `limit` counts SAMPLES here, so days_covered can be far below it without
         # anything being missing — `requested_unit` is what stops that reading as
         # a gap.
-        _attach_coverage(summary, rows=summary["records"], requested=limit, unit="samples")
+        _attach_coverage(summary, rows=summary["records"], requested=limit, unit="samples", total_available=_avail, oldest_raw=_oldest)
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3576,6 +3706,7 @@ class VaultbeatLocalService:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
         # Business-time sort before the cut (see activity_summary's comment).
         workouts.sort(key=lambda w: w.start_date, reverse=True)
+        _avail, _oldest = len(workouts), (workouts[-1].start_date if workouts else None)
         if limit is not None:
             workouts = workouts[:limit]
         total_duration = sum(w.duration_seconds for w in workouts)
@@ -3584,7 +3715,7 @@ class VaultbeatLocalService:
             "count": len(workouts),
             "total_duration_hours": round(total_duration / 3600, 2),
         }
-        _attach_coverage(summary, rows=summary["workouts"], requested=limit, unit="workouts")
+        _attach_coverage(summary, rows=summary["workouts"], requested=limit, unit="workouts", total_available=_avail, oldest_raw=_oldest)
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3602,6 +3733,7 @@ class VaultbeatLocalService:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
         # Business-time sort before the cut (see activity_summary's comment).
         days.sort(key=lambda d: d.day_start_date, reverse=True)
+        _avail, _oldest = len(days), (days[-1].day_start_date if days else None)
         if limit is not None:
             days = days[:limit]
         total_minutes = sum(d.total_minutes for d in days)
@@ -3610,7 +3742,7 @@ class VaultbeatLocalService:
             "count": len(days),
             "total_minutes": round(total_minutes, 1),
         }
-        _attach_coverage(summary, rows=summary["days"], requested=limit, unit="days")
+        _attach_coverage(summary, rows=summary["days"], requested=limit, unit="days", total_available=_avail, oldest_raw=_oldest)
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3628,6 +3760,7 @@ class VaultbeatLocalService:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
         # Business-time sort before the cut (see activity_summary's comment).
         hrv_list.sort(key=lambda r: r.date, reverse=True)
+        _avail, _oldest = len(hrv_list), (hrv_list[-1].date if hrv_list else None)
         if limit is not None:
             hrv_list = hrv_list[:limit]
         sdnns = [r.sdnn_ms for r in hrv_list]
@@ -3640,7 +3773,7 @@ class VaultbeatLocalService:
         # The headline case for this whole field: "average HRV" over 3 days and over
         # 30 days are the same number of digits, and `limit` counts samples, so a
         # 100-sample read can be a single night.
-        _attach_coverage(summary, rows=summary["records"], requested=limit, unit="samples")
+        _attach_coverage(summary, rows=summary["records"], requested=limit, unit="samples", total_available=_avail, oldest_raw=_oldest)
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3678,6 +3811,7 @@ class VaultbeatLocalService:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
         # Business-time sort before the cut (see activity_summary's comment).
         buckets.sort(key=lambda b: b.date, reverse=True)
+        _avail, _oldest = len(buckets), (buckets[-1].date if buckets else None)
         if limit is not None:
             buckets = buckets[:limit]
         # Sample-weighted average so a hour with 12 samples counts more than
@@ -3694,7 +3828,9 @@ class VaultbeatLocalService:
             "average_sdnn_ms": round(average, 1) if average is not None else None,
         }
         _attach_coverage(
-            summary, rows=summary["records"], requested=limit, unit="hourly buckets"
+            summary, rows=summary["records"], requested=limit, unit="hourly buckets",
+            total_available=_avail,
+            oldest_raw=_oldest,
         )
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
@@ -3713,6 +3849,7 @@ class VaultbeatLocalService:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
         # Business-time sort before the cut (see activity_summary's comment).
         temp_list.sort(key=lambda r: r.date, reverse=True)
+        _avail, _oldest = len(temp_list), (temp_list[-1].date if temp_list else None)
         if limit is not None:
             temp_list = temp_list[:limit]
         deltas = [r.temperature_delta_celsius for r in temp_list]
@@ -3722,7 +3859,7 @@ class VaultbeatLocalService:
             "count": len(temp_list),
             "average_delta_celsius": round(average_delta, 2) if average_delta is not None else None,
         }
-        _attach_coverage(summary, rows=summary["records"], requested=limit, unit="samples")
+        _attach_coverage(summary, rows=summary["records"], requested=limit, unit="samples", total_available=_avail, oldest_raw=_oldest)
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -3773,6 +3910,7 @@ class VaultbeatLocalService:
         # which on a backfill batch throws away the newest samples and makes the
         # per-day sums below silently short.
         parsed.sort(key=lambda r: r.date, reverse=True)
+        _avail, _oldest = len(parsed), (parsed[-1].date if parsed else None)
         if limit is not None:
             parsed = parsed[:limit]
 
@@ -3865,6 +4003,8 @@ class VaultbeatLocalService:
             requested=limit,
             unit="samples",
             cut_count=len(parsed),
+            total_available=_avail,
+            oldest_raw=_oldest,
         )
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
@@ -3872,7 +4012,7 @@ class VaultbeatLocalService:
     async def total_energy_burned(
         self,
         *,
-        days: int = 7,
+        days: int = 30,
         owner: str | None = None,
         fresh: bool = False,
     ) -> dict[str, Any]:
@@ -3936,7 +4076,13 @@ class VaultbeatLocalService:
                 continue
             active_by_day[day_key] = d.get("active_energy_kcal", 0.0)
 
-        all_days = sorted(set(basal_by_day) | set(active_by_day), reverse=True)[:days]
+        # Both upstream reads above are deliberately UNLIMITED, so this union is
+        # every day either stream can account for — which makes it the honest
+        # denominator for `more_available`. The `[:days]` on the next line is the
+        # only cut in this tool, and it is the one the caller needs told about.
+        _universe = sorted(set(basal_by_day) | set(active_by_day), reverse=True)
+        _avail, _oldest = len(_universe), (_universe[-1] if _universe else None)
+        all_days = _universe[:days]
 
         # Today is a PARTIAL day (its basal/active are still accumulating) —
         # 2026-07-24 at 11:40 it showed 213 kcal and dragged a ~2617 average
@@ -4021,7 +4167,10 @@ class VaultbeatLocalService:
         # `window_satisfied=false` says the history is shorter than the question.
         # Note this counts days with ANY data; `average_day_count` (fewer) is the
         # divisor, and `average_excluded_days` says which ones dropped out.
-        _attach_coverage(summary, rows=out, requested=days, unit="days")
+        _attach_coverage(
+            summary, rows=out, requested=days, unit="days",
+            total_available=_avail, oldest_raw=_oldest,
+        )
         return summary
 
     async def vo2max_records(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
@@ -4047,6 +4196,7 @@ class VaultbeatLocalService:
         # that (2026-07-24: vo2max came back visibly shuffled) and `latest`
         # is defined as values[0], so the sort is what makes it truthful.
         vo2_list.sort(key=lambda r: r.date, reverse=True)
+        _avail, _oldest = len(vo2_list), (vo2_list[-1].date if vo2_list else None)
         if limit is not None:
             vo2_list = vo2_list[:limit]
         values = [r.vo2_max_ml_kg_min for r in vo2_list]
@@ -4065,7 +4215,7 @@ class VaultbeatLocalService:
         # VO2Max is measured only during outdoor brisk bouts, so a wide span with
         # few days is NORMAL here rather than a sync failure — which is exactly
         # why the span has to be visible next to `peak` and `trough`.
-        _attach_coverage(summary, rows=summary["records"], requested=limit, unit="samples")
+        _attach_coverage(summary, rows=summary["records"], requested=limit, unit="samples", total_available=_avail, oldest_raw=_oldest)
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -4088,7 +4238,7 @@ class VaultbeatLocalService:
                 days.append(parse_symptom_day(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
-        days = _cut_newest_by(days, limit, key=lambda d: d.day_start_date)
+        days, _avail, _oldest = _cut_newest_by_with_span(days, limit, key=lambda d: d.day_start_date)
         summary = summarize_symptoms(days)
         # Rows live one level down, grouped per owner. Flattened here so coverage
         # describes the days actually reported, which after the per-owner dedup is
@@ -4100,6 +4250,8 @@ class VaultbeatLocalService:
             rows=[d for o in summary["owners"] for d in o["days"]],
             requested=limit,
             unit="days",
+            total_available=_avail,
+            oldest_raw=_oldest,
         )
         return _attach_errors(summary, errors)
 
@@ -4128,6 +4280,18 @@ class VaultbeatLocalService:
                 notes.append(parse_note(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        # Span facts come from the notes the caller ASKED FOR, not from every
+        # note fetched — the one reader where those differ. `target_kind` filters
+        # AFTER the cut, so measuring `more_available` over the unfiltered pool
+        # reports the caller's own narrowing as hidden history: a `limit=4` read
+        # of 2 general + 2 sleep notes gets both sleep notes (everything there
+        # is) and would still be told older days were withheld. Same reasoning as
+        # the `cut_count` override two lines below, which Invariant 64 already
+        # carves out for exactly this tool — a filter is a narrower question, not
+        # a shorter history.
+        _pool = notes if target_kind is None else [n for n in notes if n.target_kind == target_kind]
+        _avail = len(_pool)
+        _oldest = min((n.target_date for n in _pool if n.target_date), default=None)
         notes = _cut_newest_by(notes, limit, key=lambda n: n.target_date)
         summary = summarize_notes(notes, target_kind=target_kind)
         # `target_kind` filters AFTER the cut, so the returned rows can be far
@@ -4140,6 +4304,8 @@ class VaultbeatLocalService:
             requested=limit,
             unit="notes",
             cut_count=len(notes),
+            total_available=_avail,
+            oldest_raw=_oldest,
         )
         return _attach_errors(summary, errors)
 
@@ -4165,7 +4331,7 @@ class VaultbeatLocalService:
                 entries.append(parse_strength(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
-        entries = _cut_newest_by(entries, limit, key=lambda e: e.date)
+        entries, _avail, _oldest = _cut_newest_by_with_span(entries, limit, key=lambda e: e.date)
         summary = summarize_strength(entries, limit_days=limit_days)
         # Two caps stack: `limit` cuts blobs, then `limit_days` cuts sessions after
         # dedup — report whichever is binding. Coverage counts the sessions the
@@ -4177,6 +4343,8 @@ class VaultbeatLocalService:
             rows=summary["sessions"],
             requested=limit_days if limit_days is not None else limit,
             unit="sessions",
+            total_available=_avail,
+            oldest_raw=_oldest,
         )
         return _attach_errors(summary, errors)
 
@@ -4376,7 +4544,7 @@ class VaultbeatLocalService:
                 entries.append(parse_food(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
-        entries = _cut_newest_by(entries, limit, key=lambda e: e.date)
+        entries, _avail, _oldest = _cut_newest_by_with_span(entries, limit, key=lambda e: e.date)
         summary = summarize_food(entries, limit_days=limit_days)
         # Same double cap as strength_summary — see the note there.
         _attach_coverage(
@@ -4384,6 +4552,8 @@ class VaultbeatLocalService:
             rows=summary["days"],
             requested=limit_days if limit_days is not None else limit,
             unit="days",
+            total_available=_avail,
+            oldest_raw=_oldest,
         )
         return _attach_errors(summary, errors)
 
@@ -5133,14 +5303,14 @@ class VaultbeatLocalService:
         spec = series_lookup(series)
         if spec is None:
             return self._unknown_series(series)
-        points, consumed, _ = await self._series_points(
+        points, consumed, raw = await self._series_points(
             spec, days=days, owner=owner, fresh=fresh
         )
         result = trend(points, spec)
         result["requested_days"] = days
         result["rows_consumed"] = consumed
         result["note"] = _SERIES_NOTE
-        _attach_series_coverage(result, points, requested=days)
+        _attach_series_coverage(result, points, requested=days, source=raw)
         return result
 
     async def metric_compare_periods(
@@ -5158,7 +5328,7 @@ class VaultbeatLocalService:
         spec = series_lookup(series)
         if spec is None:
             return self._unknown_series(series)
-        points, consumed, _ = await self._series_points(
+        points, consumed, raw = await self._series_points(
             spec, days=days * 2, owner=owner, fresh=fresh
         )
         ordered = sorted(points)
@@ -5179,6 +5349,7 @@ class VaultbeatLocalService:
             result,
             {d: points[d] for d in recent_days + previous_days},
             requested=days * 2,
+            source=raw,
         )
         return result
 
@@ -5197,7 +5368,7 @@ class VaultbeatLocalService:
         spec_b = series_lookup(series_b)
         if spec_b is None:
             return self._unknown_series(series_b)
-        a_points, a_rows, _ = await self._series_points(
+        a_points, a_rows, a_raw = await self._series_points(
             spec_a, days=days, owner=owner, fresh=fresh
         )
         b_points, b_rows, _ = await self._series_points(
@@ -5212,7 +5383,7 @@ class VaultbeatLocalService:
         # describe the set the numbers come from rather than the set that was
         # fetched. A union here would report 30 days behind an r built on 11.
         shared = {d: a_points[d] for d in sorted(set(a_points) & set(b_points))}
-        _attach_series_coverage(result, shared, requested=days)
+        _attach_series_coverage(result, shared, requested=days, source=a_raw)
         return result
 
     async def doctor(self) -> dict[str, Any]:
