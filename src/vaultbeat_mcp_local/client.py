@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 if TYPE_CHECKING:
     import httpx
@@ -413,23 +415,81 @@ class VaultbeatCloudClient:
         return [row for row in catalog if isinstance(row, dict)]
 
     # Kept in step with mcp-sync's MAX_BLOB_IDS. Exceeding it is a 400, so the
-    # caller chunks; this constant is what it chunks by.
+    # caller chunks; this is the COUNT ceiling, and it is the second of two.
     MAX_BLOB_IDS_PER_REQUEST = 500
+
+    # 🔴 The binding constraint is URL LENGTH, not the count above — and packing
+    # to the count alone is what took `get_basal_energy` down for this account
+    # from 2026-09-13 until this changed.
+    #
+    # Measured 2026-09-15 against production, same account, one variable moved
+    # at a time (mcp-sync request URL / verdict):
+    #
+    #   basal 475 ids  14,334  200 ✅      sleep 450 ids  14,565  200 ✅
+    #   basal 490 ids  14,854  500 ❌      sleep 475 ids  15,365  500 ❌
+    #   basal 500 ids  15,184  500 ❌      basal 499 ids  15,148  500 ❌
+    #
+    # Sorted by URL length the column is monotonic and the flip sits between
+    # 14,565 and 14,854, while every other candidate explanation was ruled out
+    # BY those same rows:
+    #   · not the count — 450 and 490 land on opposite sides, and 475 lands on
+    #     BOTH depending on which kind's ids are being sent
+    #   · not the response size — sleep 450 returns 8.5 MB and passes; basal 490
+    #     returns nothing and fails
+    #   · not the database — the identical 500-id query issued straight at
+    #     PostgREST returns 387 KB in 1.4 s, while the same ids through the edge
+    #     function burn 11 s and 500. The limit lives in the edge runtime's
+    #     outbound fetch, so it cannot be seen from a psql session.
+    # A failure costs ~11 s and returns `envelope_query_failed`, which reads as
+    # a database fault and sent an earlier session looking at query plans.
+    #
+    # Budget is the ENCODED length of the `blob_ids` value (commas become %2C),
+    # so a kind with longer ids automatically gets fewer per request instead of
+    # silently crossing the line — the whole reason a count could not do this
+    # job. 11,000 leaves ~24% under the lowest observed failure.
+    MAX_BLOB_IDS_URL_BUDGET = 11_000
+
+    @classmethod
+    def _chunk_blob_ids(cls, blob_ids: list[str]) -> Iterator[list[str]]:
+        """Split ids into requests bounded by encoded URL length AND count.
+
+        Both ceilings are real: the server rejects >500 ids with a 400, and the
+        edge runtime drops the outbound fetch somewhere past ~14.5 KB of URL.
+        An id longer than the whole budget still goes out alone rather than
+        being dropped — a 500 on one request beats losing a row silently
+        (Invariant 45 (catalog-diff-is-additive-only) is about the diff, but the
+        same "never silently omit" reasoning applies to the fetch it drives).
+        """
+
+        chunk: list[str] = []
+        encoded = 0
+        for blob_id in blob_ids:
+            # +3 for the "%2C" that joins it to the previous id.
+            cost = len(quote(blob_id, safe="")) + 3
+            if chunk and (
+                encoded + cost > cls.MAX_BLOB_IDS_URL_BUDGET
+                or len(chunk) >= cls.MAX_BLOB_IDS_PER_REQUEST
+            ):
+                yield chunk
+                chunk, encoded = [], 0
+            chunk.append(blob_id)
+            encoded += cost
+        if chunk:
+            yield chunk
 
     async def sync_blobs(
         self, server_token: str, *, blob_ids: list[str], metric_type: str | None = None
     ) -> list[dict[str, Any]]:
         """Fetch ONLY these blobs, in the same envelope shape as a full sync.
 
-        Chunked at MAX_BLOB_IDS_PER_REQUEST so the caller never has to think
-        about URL limits.
+        Chunked by `_chunk_blob_ids` so the caller never has to think about URL
+        limits.
         """
 
         if not blob_ids:
             return []
         collected: list[dict[str, Any]] = []
-        for start in range(0, len(blob_ids), self.MAX_BLOB_IDS_PER_REQUEST):
-            chunk = blob_ids[start : start + self.MAX_BLOB_IDS_PER_REQUEST]
+        for chunk in self._chunk_blob_ids(blob_ids):
             params: dict[str, str] = {"blob_ids": ",".join(chunk)}
             if metric_type:
                 params["metric_type"] = metric_type
