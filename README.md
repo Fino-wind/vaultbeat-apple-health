@@ -391,6 +391,16 @@ Claude Desktop's config only speaks stdio, so bridge it to the HTTP server with
 
 Reveal the stored token any time with `vaultbeat-apple-health serve --show-token`.
 
+## Reporting issues
+
+**This repo is for the MCP server itself** — install failures, tool errors, binding
+that never completes, `doctor` reporting something wrong. Open an issue here.
+
+For the iPhone app (UI, subscriptions, HealthKit permission prompts, sync not showing
+up on the phone), use
+[Fino-wind/vaultbeat-community](https://github.com/Fino-wind/vaultbeat-community)
+instead.
+
 ## Verification
 
 ```bash
