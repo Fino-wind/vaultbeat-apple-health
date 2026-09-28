@@ -1,0 +1,71 @@
+# Push a Bark notification to the maintainer's phone when someone outside
+# opens an issue, starts a discussion, or replies to a discussion.
+#
+# For the MCP repo, the source of truth is the Vaultbeat monorepo's
+# mcp-local-server/.github/ — it reaches the public repo through the export.
+# vaultbeat-community and memepouch-community carry identical copies.
+#
+# Why this exists: GitHub's own notification mail for this account lands in an
+# inbox nobody reads, so an outside user's post could sit for weeks unseen.
+#
+# Security: titles and comment bodies are attacker-controlled. They reach the
+# script only through `env:` and are JSON-encoded by Python — never interpolate
+# ${{ github.event.* }} text directly into `run:`, that is shell injection.
+name: Notify maintainer of community activity
+
+on:
+  issues:
+    types: [opened]
+  discussion:
+    types: [created]
+  discussion_comment:
+    types: [created]
+  workflow_dispatch: # manual test: sends one push with placeholder text
+
+permissions: {}
+
+jobs:
+  bark:
+    # Skip anything the maintainer does himself.
+    if: github.event_name == 'workflow_dispatch' || github.event.sender.login != 'Fino-wind'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Send Bark push
+        env:
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.event.repository.name }}
+          NUMBER: ${{ github.event.issue.number || github.event.discussion.number }}
+          TITLE: ${{ github.event.issue.title || github.event.discussion.title }}
+          REPLY: ${{ github.event.comment.body }}
+          AUTHOR: ${{ github.event.sender.login }}
+          URL: ${{ github.event.comment.html_url || github.event.issue.html_url || github.event.discussion.html_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY' > payload.json
+          import json, os
+          e = os.environ
+          event, repo = e.get("EVENT", ""), e["REPO"]
+          number = e.get("NUMBER") or "test"
+          headline = {
+              "issues": f"{repo} 新 issue #{number}",
+              "discussion": f"{repo} 新讨论 #{number}",
+              "discussion_comment": f"{repo} 讨论 #{number} 有新回复",
+          }.get(event, f"{repo} 测试推送")
+          lines = [e.get("TITLE") or "（workflow_dispatch 测试推送）"]
+          reply = " ".join((e.get("REPLY") or "").split())
+          if reply:
+              lines.append(reply[:140] + ("…" if len(reply) > 140 else ""))
+          lines.append(f"— {e.get('AUTHOR') or 'manual'}")
+          print(json.dumps({
+              "device_key": e["BARK_KEY"],
+              "title": headline,
+              "body": "\n".join(lines),
+              "group": "GitHub 社区",
+              "url": e.get("URL") or e["RUN_URL"],
+          }, ensure_ascii=False))
+          PY
+          curl -fsS --max-time 20 --retry 3 --retry-all-errors \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            --data-binary @payload.json https://push.globaltop.top/push
