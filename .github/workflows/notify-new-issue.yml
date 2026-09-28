@@ -1,0 +1,49 @@
+# Push a Bark notification to the maintainer's phone when someone opens an issue.
+#
+# Why this exists: GitHub's own notification mail for this account lands in an
+# inbox nobody reads, so an outside user's issue could sit for weeks unseen.
+#
+# Security: the issue title is attacker-controlled. It reaches the script only
+# through `env:` and is JSON-encoded by Python — never interpolate
+# ${{ github.event.issue.* }} directly into `run:`, that is shell injection.
+name: Notify maintainer of new issue
+
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch: # manual test: sends one push with placeholder text
+
+permissions: {}
+
+jobs:
+  bark:
+    # Skip issues the maintainer files himself.
+    if: github.event_name == 'workflow_dispatch' || github.event.issue.user.login != 'Fino-wind'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Send Bark push
+        env:
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+          REPO: ${{ github.event.repository.name }}
+          NUMBER: ${{ github.event.issue.number }}
+          TITLE: ${{ github.event.issue.title }}
+          AUTHOR: ${{ github.event.issue.user.login }}
+          URL: ${{ github.event.issue.html_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY' > payload.json
+          import json, os
+          e = os.environ
+          number = e.get("NUMBER") or "test"
+          print(json.dumps({
+              "device_key": e["BARK_KEY"],
+              "title": f"{e['REPO']} 新 issue #{number}",
+              "body": f"{e.get('TITLE') or '（workflow_dispatch 测试推送）'}\n— {e.get('AUTHOR') or 'manual'}",
+              "group": "GitHub issues",
+              "url": e.get("URL") or e["RUN_URL"],
+          }, ensure_ascii=False))
+          PY
+          curl -fsS --max-time 20 --retry 3 --retry-all-errors \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            --data-binary @payload.json https://push.globaltop.top/push
