@@ -1,0 +1,37 @@
+name: 📱 iPhone app bug
+description: Something in the Vaultbeat app is wrong — display, sync, subscription, permissions
+title: "[App] "
+labels: ["bug", "app"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is a public repo. **Never paste health values, pairing codes or account details** — blur them in screenshots.
+  - type: input
+    id: screen
+    attributes:
+      label: Which screen
+      placeholder: "e.g. Sleep detail, Settings → Membership"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, then what you saw. Screenshots help.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: false
+  - type: input
+    id: versions
+    attributes:
+      label: App version and iOS version
+      description: "The app version is shown in Settings, under the Vaultbeat name (e.g. 1.2.8 / 1)."
+      placeholder: "e.g. Vaultbeat 1.2.8, iOS 26.6"
+    validations:
+      required: false

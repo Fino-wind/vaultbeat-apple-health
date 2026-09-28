@@ -393,13 +393,15 @@ Reveal the stored token any time with `vaultbeat-apple-health serve --show-token
 
 ## Reporting issues
 
-**This repo is for the MCP server itself** — install failures, tool errors, binding
-that never completes, `doctor` reporting something wrong. Open an issue here.
+**This repo takes issues for both the MCP server and the Vaultbeat iPhone app** —
+install failures, tool errors, binding that never completes, `doctor` reporting
+something wrong, and app problems too (UI, subscriptions, HealthKit permission
+prompts, sync not showing up on the phone).
+[Open an issue](https://github.com/Fino-wind/vaultbeat-apple-health/issues/new/choose)
+and pick the template that fits. Questions and ideas can go in
+[Discussions](https://github.com/Fino-wind/vaultbeat-apple-health/discussions).
 
-For the iPhone app (UI, subscriptions, HealthKit permission prompts, sync not showing
-up on the phone), use
-[Fino-wind/vaultbeat-community](https://github.com/Fino-wind/vaultbeat-community)
-instead.
+This is a public repo: never paste health data, pairing codes or account details.
 
 ## Verification
 

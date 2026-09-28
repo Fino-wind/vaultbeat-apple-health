@@ -3,7 +3,7 @@
 #
 # For the MCP repo, the source of truth is the Vaultbeat monorepo's
 # mcp-local-server/.github/ — it reaches the public repo through the export.
-# vaultbeat-community and memepouch-community carry identical copies.
+# memepouch-community carries an identical copy.
 #
 # Why this exists: GitHub's own notification mail for this account lands in an
 # inbox nobody reads, so an outside user's post could sit for weeks unseen.
