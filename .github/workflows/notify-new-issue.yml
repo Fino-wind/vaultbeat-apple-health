@@ -1,5 +1,8 @@
 # Push a Bark notification to the maintainer's phone when someone opens an issue.
 #
+# For the MCP repo, the source of truth is the Vaultbeat monorepo's
+# mcp-local-server/.github/ — it reaches the public repo through the export.
+#
 # Why this exists: GitHub's own notification mail for this account lands in an
 # inbox nobody reads, so an outside user's issue could sit for weeks unseen.
 #
