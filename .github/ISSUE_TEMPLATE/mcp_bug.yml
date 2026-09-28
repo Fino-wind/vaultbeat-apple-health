@@ -1,0 +1,39 @@
+name: 🤖 MCP server bug
+description: Install fails, a tool errors, pairing never completes, or doctor reports a problem
+title: "[MCP] "
+labels: ["bug", "mcp"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is a public repo. **Never paste health values, pairing codes or tokens.**
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command or tool you ran, and the error you got.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `vaultbeat-apple-health doctor`
+      description: Read it before pasting and remove anything you would rather not share.
+      render: text
+    validations:
+      required: false
+  - type: input
+    id: client
+    attributes:
+      label: Agent / client
+      placeholder: "e.g. Claude Code, Claude Desktop, Codex, Hermes"
+    validations:
+      required: false
+  - type: input
+    id: versions
+    attributes:
+      label: Package version and OS
+      description: "`vaultbeat-apple-health --version`"
+      placeholder: "e.g. 0.8.1 on macOS 26"
+    validations:
+      required: false
