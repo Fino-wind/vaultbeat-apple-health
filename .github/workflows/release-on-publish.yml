@@ -1,0 +1,39 @@
+# Tag + GitHub Release for whatever version PyPI serves, so the public repo's
+# "Latest" can no longer fall behind PyPI (it once sat 21 versions behind).
+#
+# Source of truth: the Vaultbeat monorepo's mcp-local-server/.github/ — this
+# file reaches the public repo through the normal export. Edit it THERE.
+# Logic and rationale: .github/scripts/release_on_publish.py.
+name: Release when a version reaches PyPI
+
+on:
+  push:
+    branches: [main]
+    paths: [pyproject.toml, server.json]
+  schedule:
+    - cron: "17 1 * * *" # daily: catches a push that landed before `uv publish`
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-on-publish
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag and release the version PyPI serves
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python3 .github/scripts/release_on_publish.py
