@@ -491,6 +491,54 @@ def test_doctor_round_trip_fails_with_the_rebind_hint_when_nothing_decrypts(tmp_
     assert roundtrip["hint"].index("bind") < roundtrip["hint"].index("Deleting")
 
 
+def test_doctor_samples_the_newest_blobs_not_the_stale_backfill(tmp_path: Path) -> None:
+    """Review R11: blobs sealed for an old envelope key fail to decrypt harmlessly,
+    and they are the OLD ones. Three of them at the head of the catalog used to
+    be enough to tell the user their key was dead and to re-bind."""
+    service, cloud, public_key = _doctor_ready(tmp_path)
+    cloud.envelopes = _library(public_key, {"water": 6}, foreign={"water": 3})
+    cloud.xmins = {f"blob-water-{index}": str(100 + index) for index in range(6)}
+
+    roundtrip = _check(asyncio.run(service.doctor()), "data_roundtrip")
+
+    assert roundtrip["ok"] is True
+    assert roundtrip["detail"] == "decrypted 3 of 3 sampled water record(s)"
+
+
+def test_doctor_asks_a_second_kind_before_blaming_the_key(tmp_path: Path) -> None:
+    service, cloud, public_key = _doctor_ready(tmp_path)
+    cloud.envelopes = _library(public_key, {"water": 4, "sleep": 9}, foreign={"water": 4})
+
+    roundtrip = _check(asyncio.run(service.doctor()), "data_roundtrip")
+
+    assert roundtrip["ok"] is True, roundtrip
+    assert roundtrip["detail"] == "decrypted 3 of 6 sampled water and sleep record(s)"
+    assert cloud.catalog_calls == ["water", "sleep"]
+
+
+def test_a_failed_sample_keeps_the_counts_the_digests_returned(tmp_path: Path) -> None:
+    """Review R11: the digests answered, then fetching the sample dropped. The
+    capability report re-raised that failure and showed no counts at all."""
+    from vaultbeat_mcp_local.client import VaultbeatCloudError
+
+    service, cloud, public_key = _doctor_ready(tmp_path)
+    cloud.envelopes = _library(public_key, {"sleep": 5, "water": 5})
+
+    async def dropped(*_args: Any, **_kwargs: Any) -> Any:
+        raise VaultbeatCloudError("Cloud request failed: HTTP 503")
+
+    cloud.sync_blobs = dropped  # type: ignore[method-assign]
+
+    report = asyncio.run(service.doctor())
+
+    roundtrip = _check(report, "data_roundtrip")
+    assert roundtrip["ok"] is False
+    assert "Do not re-pair" in roundtrip["hint"]
+    caps = report["capabilities"]
+    assert caps["record_counts"] == {"sleep": 5, "water": 5}
+    assert caps["kinds_with_data"] == ["sleep", "water"]
+
+
 def test_doctor_with_nothing_sealed_says_decryption_was_not_tested(tmp_path: Path) -> None:
     """A brand-new binding holds nothing yet. Passing is fair — the cloud took
     the token — but the detail must not claim a decryption that never ran."""

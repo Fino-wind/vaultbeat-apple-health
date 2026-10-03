@@ -302,8 +302,9 @@ PROMPTS: tuple[VaultbeatPrompt, ...] = (
             "exist. 🔴 Treat the `flag` column as its own categories: `unworn` nights "
             "recorded time in bed without ever measuring sleep, and folding them in as "
             "zero-minute nights invents bad nights that did not happen; `daytime` is a "
-            "nap that was the only sleep that day, not a bedtime; `no_stages` has a "
-            "total but no breakdown. Say how many nights of the window actually "
+            "nap that was the only sleep that day — not a night, but mention it; `short` is under 3 h "
+            "with no stages — a nap or a partly recorded night, not a short night you "
+            "can count on; `no_stages` has a total but no breakdown. Say how many nights of the window actually "
             "carried measurements before you describe any trend."
             + STYLE
             + ABSENCE

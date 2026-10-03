@@ -794,7 +794,11 @@ class FoodRecord:
     def to_dict(self) -> dict[str, Any]:
         return {
             "entry_id": self.entry_id,
-            "date": self.date,
+            # The local day, as strength gives it: the wire value is the UTC
+            # instant of local midnight, which reads as the day BEFORE for every
+            # UTC+ user, and an agent joining food to strength by `date` was off
+            # by one (release gate G5 / review R9 on #9).
+            "date": _local_date_fields(self.date).get("local_date", self.date),
             **_local_date_fields(self.date),
             "meals": self.meals,
             "note": self.note,
@@ -2157,7 +2161,8 @@ _COVERAGE_NOTE = (
     "happened. 🔴 Read `more_available` before saying how much history exists: true "
     "means older days are decryptable right now and your `limit` left them behind — "
     "ask for more, or quote `oldest_available` as the real start; never report a "
-    "limit-shaped window as all their data (`total_available` is the pre-cut count). "
+    "limit-shaped window as all their data (`total_available` is the pre-cut count, "
+    "in `total_available_unit` — samples on the dense kinds, not days). "
     "`window_satisfied` is true only when you got everything you asked for AND "
     "nothing older is withheld. `more_available: false` with a short history really "
     "is all this server holds — a freshly paired server may still be sealing its "
@@ -2258,6 +2263,32 @@ def _period_key(day: str, granularity: str) -> tuple[str, str, str, int]:
     return start.strftime("%Y-%m"), start.isoformat(), end.isoformat(), (nxt - start).days
 
 
+def _exclusions_in_window(
+    raw: dict[str, Any],
+    spec: Any,
+    points: dict[str, float],
+    windows: list[tuple[str | None, str | None]] | None,
+) -> list[dict[str, str]]:
+    """The days `spec.exclude_when` dropped, limited to the days this read covered.
+
+    A calendar read covers its `since`..`until` windows, so an exclusion is
+    listed when it falls inside one of them — including the window's own first
+    day, which is not in `points` precisely because it was excluded. A "newest
+    N days" read has no window: it covers everything from its oldest kept day
+    on. Bounding by the kept points alone listed days after `until` (release
+    gate G7 on #9: a trend over September named October days).
+    """
+
+    found = series_excluded_days(raw, spec)
+    if windows:
+        return [
+            e for e in found
+            if any((lo is None or e["day"] >= lo) and (hi is None or e["day"] <= hi) for lo, hi in windows)
+        ]
+    oldest = min(points) if points else None
+    return [e for e in found if oldest is None or e["day"] >= oldest]
+
+
 def _aggregate(fn: str, points: dict[str, float], spec: Any) -> dict[str, Any]:
     """One number over a set of days, or null with the reason it was refused."""
 
@@ -2300,6 +2331,8 @@ def _metric_entry(
     aggregation: str,
     granularity: str,
     today: str,
+    since: str | None = None,
+    until: str | None = None,
 ) -> dict[str, Any]:
     """One series' block in a `get_metric` reply."""
 
@@ -2316,11 +2349,7 @@ def _metric_entry(
     partial = today if spec.cumulative and today in points else None
     complete = {d: v for d, v in points.items() if d != partial}
 
-    oldest_kept = min(points) if points else None
-    excluded = [
-        e for e in series_excluded_days(raw, spec)
-        if oldest_kept is None or e["day"] >= oldest_kept
-    ]
+    excluded = _exclusions_in_window(raw, spec, points, [(since, until)] if since or until else None)
     if partial is not None:
         excluded.append({"day": partial, "reason": "partial_today"})
     if excluded:
@@ -2454,14 +2483,15 @@ def _attach_series_exclusions(
     spec: Any,
     *,
     partial_today: str | None = None,
+    windows: list[tuple[str | None, str | None]] | None = None,
 ) -> None:
     """Name the days the arithmetic dropped on purpose (see `SeriesSpec.exclude_when`),
-    plus today on an accruing series — same `partial_today` reason `get_metric` gives."""
+    plus today on an accruing series — same `partial_today` reason `get_metric` gives.
 
-    oldest = min(points) if points else None
-    dropped = [
-        e for e in series_excluded_days(raw, spec) if oldest is None or e["day"] >= oldest
-    ]
+    *windows* are the calendar windows a `since` / `until` read covered; see
+    `_exclusions_in_window`."""
+
+    dropped = _exclusions_in_window(raw, spec, points, windows)
     if partial_today is not None:
         dropped.append({"day": partial_today, "reason": "partial_today"})
     if dropped:
@@ -2537,6 +2567,8 @@ def _attach_series_coverage(
         unit="days",
         total_available=source_coverage.get("total_available"),
         oldest_raw=source_coverage.get("oldest_available"),
+        # Inherited with the count: the reader's unit, not this layer's days.
+        total_unit=source_coverage.get("total_available_unit") or source_coverage.get("requested_unit"),
     )
 
 
@@ -2584,6 +2616,7 @@ def _attach_coverage(
     displayed: Any = None,
     total_available: int | None = None,
     oldest_raw: str | None = None,
+    total_unit: str | None = None,
 ) -> dict[str, Any]:
     """Attach a `coverage` block stating how many days this result rests on.
 
@@ -2729,6 +2762,10 @@ def _attach_coverage(
         "requested_unit": unit,
         "oldest_available": oldest_available,
         "total_available": total_available,
+        # What `total_available` counts. It is the reader's pre-cut row count, so
+        # on the sample kinds it is samples — 18,791 basal readings beside
+        # `requested_unit: "days"` read as 18,791 days (release gate G9 on #9).
+        "total_available_unit": (total_unit or unit) if total_available is not None else None,
         "more_available": more_available,
         # Both halves, and the second half is the 2026-09-14 fix: "you got the
         # number of rows you asked for" was answering a question nobody asked
@@ -3419,18 +3456,25 @@ def _apply_range_coverage(result: dict[str, Any], since: str | None, until: str 
     result["range"] = {"since": since, "until": until}
     coverage = result.get("coverage")
     if isinstance(coverage, dict):
-        first = coverage.get("first_day") or since
+        # Against the window's first day, never the first day that came back: a
+        # window whose oldest day was excluded as incomplete starts its points a
+        # day late, and "history is older than the first point" then reported
+        # withheld history for a window read in full (#9, after round 2). With
+        # no `since` the window reaches back to the start, so nothing is older.
         oldest = coverage.get("oldest_available")
-        coverage["more_available"] = bool(oldest and first and oldest < first)
+        coverage["more_available"] = bool(since and oldest and oldest < since)
         coverage["window_satisfied"] = None
         coverage["requested"] = None
         coverage["requested_unit"] = "date range"
 
 
-def _hoist_common_exclusions(metrics: list[dict[str, Any]]) -> list[dict[str, str]]:
-    """Move exclusions shared by every listing series to one top-level list."""
+def _hoist_common_exclusions(metrics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Move exclusions shared by every listing series to one top-level list.
 
-    lists: list[list[dict[str, str]]] = [m["excluded_days"] for m in metrics if m.get("excluded_days")]
+    An entry keeps its other fields (a night's times and minutes): they are
+    facts of the row, identical on every series that dropped it."""
+
+    lists: list[list[dict[str, Any]]] = [m["excluded_days"] for m in metrics if m.get("excluded_days")]
     if len(lists) < 2:
         return []
     keyed = [{(e["day"], e["reason"]) for e in lst} for lst in lists]
@@ -3444,7 +3488,8 @@ def _hoist_common_exclusions(metrics: list[dict[str, Any]]) -> list[dict[str, st
                 m["excluded_days"] = rest
             else:
                 m.pop("excluded_days")
-    return [{"day": d, "reason": r} for d, r in sorted(shared, reverse=True)]
+    full = {(e["day"], e["reason"]): e for e in lists[0]}
+    return [full[key] for key in sorted(shared, reverse=True)]
 
 
 def _attach_sources(result: dict[str, Any], points: dict[str, float], raw: dict[str, Any]) -> None:
@@ -3487,6 +3532,29 @@ def _sessions_overlap(a: dict[str, Any], b: dict[str, Any]) -> bool:
 # upper bound is needed: a real night that starts in the evening ends on the
 # NEXT day, so its bedtime is negative here.
 _DAYTIME_START_MIN = 8 * 60
+
+# A main sleep shorter than this with no stage breakdown is flagged
+# `short_unstaged`. Apple does not stage a short sleep, so the record is a nap
+# or the part of a night the Watch caught (taken off to charge, battery out) —
+# and the two look the same. Read off both accounts on 2026-10-03: every one of
+# the owner's 18 stage-less Watch nights was 69-178 min against 1 of 302 staged
+# ones under 180; the partner's were 61-177 (8 of 10) against a shortest staged
+# night of 179. Averaged in as nights they pulled the owner's mean sleep down
+# by about a quarter of an hour (release gate G6 on #9).
+_SHORT_UNSTAGED_MAX_MIN = 180
+
+
+def _is_short_unstaged(asleep: Any, *, staged: bool, in_bed_only: bool) -> bool:
+    """A main sleep under `_SHORT_UNSTAGED_MAX_MIN` that Apple never staged.
+
+    Kept in the table; left out of the duration and clock series, where it read
+    as a short night — it may as well be a nap or a partly recorded one.
+    """
+    return (
+        not staged and not in_bed_only
+        and isinstance(asleep, (int, float)) and not isinstance(asleep, bool)
+        and 0 < asleep < _SHORT_UNSTAGED_MAX_MIN
+    )
 
 
 def _session_zone(session: dict[str, Any]) -> tzinfo | None:
@@ -3567,9 +3635,10 @@ def sleep_night_row(night: dict[str, Any]) -> dict[str, Any]:
     """One night as the flat record the sleep series and `get_sleep_nights` read.
 
     `None` means "not measured", never zero: stage minutes are None on a night
-    without stage detail (iPhone-only), and every sleep field is None on an
-    in-bed-only night (the Watch was not worn). The two flags travel with the
-    row so `SeriesSpec.exclude_when` can name why a night was left out.
+    without stage detail (Apple did not stage it — a short sleep, or a source
+    that does not stage), and every sleep field is None on an in-bed-only night
+    (the Watch was not worn). The flags travel with the row so
+    `SeriesSpec.exclude_when` can name why a night was left out.
     """
 
     stages = night.get("stage_minutes") or {}
@@ -3624,13 +3693,13 @@ def sleep_night_row(night: dict[str, Any]) -> dict[str, Any]:
         "has_stage_detail": staged,
         "is_in_bed_only": in_bed_only,
         "no_stage_detail": not staged,
-        # The day's MAIN sleep began at or after 08:00 on the day it ended — a
-        # nap (daytime or evening) that was the only sleep recorded that day.
-        # Real, so it stays in the table and in `sleep_minutes`; left out of the
-        # clock series, where one 12:34 "bedtime" moved a whole month's average
-        # past 03:30 (2026-09-24, 6 of 323 real nights), and an 18:28 one did
-        # the same to November 2025 (see `_DAYTIME_START_MIN`).
+        # The day's only sleep began at or after 08:00 and ended that day: a nap.
+        # Kept in the table; out of the clock series (one 12:34 "bedtime" moved
+        # a month's average past 03:30, see `_DAYTIME_START_MIN`) and, since
+        # 2026-10-03, out of the duration series — owner: a nap is not a night,
+        # but it stays visible (`excluded_days` names it with times and minutes).
         "daytime_main_sleep": bed_min is not None and bed_min >= _DAYTIME_START_MIN,
+        "short_unstaged": _is_short_unstaged(asleep, staged=staged, in_bed_only=in_bed_only),
         # Guessed from the phone lying still, not measured by a wearable. Kept in
         # the table; left out of the sleep series, because stillness is not
         # sleep and the guess runs long (real data: 474 min on average against
@@ -4620,8 +4689,13 @@ class VaultbeatLocalService:
     async def sleep_detail_records(
         self, *, limit: int | None = None, fresh: bool = False,
         owner: str | None = None, include_timeline: bool = False,
+        since: str | None = None, until: str | None = None,
     ) -> dict[str, Any]:
         """Return per-night time-aligned HR + RR + sleep stage data.
+
+        *since* / *until* ("YYYY-MM-DD", local days, inclusive) pick nights by
+        date. Without them a night 19 days back took `limit=20` — about 50k
+        characters for the one night wanted (release gate G8 on #9).
 
         Each vital-sign sample is tagged with the sleep stage active at that
         moment.  Output is one object per night (primary session only), sorted
@@ -4647,6 +4721,9 @@ class VaultbeatLocalService:
         is still computed either way — ``stage_vitals`` is aggregated from it.
         """
 
+        since, until, bad = _parse_day_range(since, until)
+        if bad:
+            return bad
         records, errors = await self._records_for_metric(METRIC_SLEEP, limit=None, fresh=fresh)
         if owner:
             records = _select_owner(records, owner)
@@ -4917,6 +4994,11 @@ class VaultbeatLocalService:
 
         _avail = len(result_nights)
         _oldest = _coverage_day_of(result_nights[-1]) if result_nights else None
+        if since or until:
+            result_nights = [
+                n for n in result_nights
+                if (since is None or n["local_date"] >= since) and (until is None or n["local_date"] <= until)
+            ]
         if limit is not None:
             result_nights = result_nights[:limit]
 
@@ -4936,6 +5018,7 @@ class VaultbeatLocalService:
             "timeline_included": include_timeline,
         }
         _attach_coverage(summary, rows=result_nights, requested=limit, unit="nights", total_available=_avail, oldest_raw=_oldest)
+        _apply_range_coverage(summary, since, until)
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
@@ -7007,7 +7090,13 @@ class VaultbeatLocalService:
             response = httpx.get(
                 api_base_url.rstrip("/") + "/mcp-sync", timeout=10.0
             )
-            return True, f"cloud answered HTTP {response.status_code}"
+            # Unauthenticated on purpose, so a 401 here is the expected answer and
+            # says nothing about this server's token — the old "cloud answered
+            # HTTP 401" read as an auth failure (release gate G9 on #9).
+            return True, (
+                f"reachable (an unauthenticated probe got HTTP {response.status_code}, "
+                "as expected; this does not test your pairing)"
+            )
         except httpx.HTTPError as error:
             return False, f"{type(error).__name__}: {error}"
 
@@ -7411,7 +7500,10 @@ class VaultbeatLocalService:
         result = trend(points, spec)
         result["requested_days"] = days
         result["rows_consumed"] = consumed
-        _attach_series_exclusions(result, points, raw, spec, partial_today=partial)
+        _attach_series_exclusions(
+            result, points, raw, spec, partial_today=partial,
+            windows=[(since, until)] if since or until else None,
+        )
         _attach_sources(result, points, raw)
         result["note"] = _SERIES_NOTE
         _attach_series_coverage(result, points, requested=days, source=raw)
@@ -7496,7 +7588,10 @@ class VaultbeatLocalService:
         result["baseline"] = {"since": b_since, "until": b_until}
         result["rows_consumed"] = consumed
         both = {**earlier, **recent}
-        _attach_series_exclusions(result, both, raw, spec, partial_today=partial)
+        _attach_series_exclusions(
+            result, both, raw, spec, partial_today=partial,
+            windows=[(p_since, p_until), (b_since, b_until)],
+        )
         _attach_sources(result, both, raw)
         result["note"] = _SERIES_NOTE
         _attach_series_coverage(result, both, requested=None, source=raw)
@@ -7698,6 +7793,8 @@ class VaultbeatLocalService:
                 aggregation=aggregation,
                 granularity=granularity,
                 today=today,
+                since=since,
+                until=until,
             )
             _apply_range_coverage(entry, since, until)
             # "Not shared" only when the partner's kind came back with no rows at
@@ -8085,7 +8182,10 @@ class VaultbeatLocalService:
                 else:
                     add("data_roundtrip", True, roundtrip_detail)
             except VaultbeatTrialExpiredError as error:
-                counts_failure = error
+                # Counts the digests already returned stay good whatever the
+                # sample step did after them (review R11 on #9); only when they
+                # were never had does the capability report need the reason.
+                counts_failure = error if counts is None else None
                 # 🔴 Must precede the generic handler below, which would call
                 # this a dead server token and prescribe a re-bind. That advice
                 # is worse than useless here: re-binding SUCCEEDS, the trial does
@@ -8101,7 +8201,7 @@ class VaultbeatLocalService:
                     "Re-running `bind` will not help.",
                 )
             except Exception as error:  # noqa: BLE001 — diagnostic surface, report everything
-                counts_failure = error
+                counts_failure = error if counts is None else None
                 if isinstance(error, VaultbeatCloudError) and error.code == "rate_limited":
                     # mcp-sync limits an address only after repeated rejected
                     # tokens, so "nothing points at the pairing" would be the
@@ -8327,6 +8427,14 @@ class VaultbeatLocalService:
         every kind, so which kind proves it does not matter. Nothing is cached
         and nothing is reported as damaged: this is a probe, and the next real
         read of the kind does both.
+
+        🔴 A failed sample is what makes the doctor say "the stored key can no
+        longer decrypt your data — re-bind", so three records must not be able
+        to say it on their own (review R11 on #9). A blob sealed for an old
+        envelope key fails to decrypt harmlessly (`_ERRORS_NOTE`), and those are
+        the OLD blobs — the catalog's first rows. So the sample is the most
+        recently written blobs (highest `xmin`), and when none of them decrypts,
+        a second kind is tried before the key is blamed.
         """
         client = self._client(config)
         if not all(callable(getattr(client, name, None)) for name in ("sync_catalog", "sync_blobs")):
@@ -8334,26 +8442,42 @@ class VaultbeatLocalService:
         filled = sorted((count, kind) for kind, count in counts.items() if count)
         if not filled:
             return "", 0, 0, []
-        _, kind = next(
+        _, first = next(
             ((count, kind) for count, kind in filled if count >= self.ROUNDTRIP_SAMPLE),
             filled[-1],
         )
+        # The first choice, then the largest other kind as the second opinion.
+        kinds = [first] + [kind for _, kind in reversed(filled) if kind != first][:1]
         token = config.server_token or ""
-        catalog = await client.sync_catalog(token, metric_type=kind)
-        if catalog is None:
-            return None
-        blob_ids = [str(row["blob_id"]) for row in catalog if row.get("blob_id")][: self.ROUNDTRIP_SAMPLE]
-        rows = await client.sync_blobs(token, blob_ids=blob_ids, metric_type=kind) if blob_ids else []
-        decrypted = 0
-        errors: list[str] = []
-        for row in rows:
+
+        def written(row: dict[str, Any]) -> int:
             try:
-                self._decrypt_row(row, config)
-            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
-                errors.append(f"{_safe_row_id(row.get('id', '<unknown>'))}: decrypt_failed ({type(error).__name__})")
-            else:
-                decrypted += 1
-        return kind, decrypted, len(rows), errors
+                return int(str(row.get("xmin")))
+            except ValueError:
+                return -1
+
+        result: tuple[str, int, int, list[str]] | None = None
+        for kind in kinds:
+            catalog = await client.sync_catalog(token, metric_type=kind)
+            if catalog is None:
+                return result
+            newest = sorted((row for row in catalog if row.get("blob_id")), key=written, reverse=True)
+            blob_ids = [str(row["blob_id"]) for row in newest][: self.ROUNDTRIP_SAMPLE]
+            rows = await client.sync_blobs(token, blob_ids=blob_ids, metric_type=kind) if blob_ids else []
+            decrypted = 0
+            errors: list[str] = list(result[3]) if result else []
+            for row in rows:
+                try:
+                    self._decrypt_row(row, config)
+                except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
+                    errors.append(f"{_safe_row_id(row.get('id', '<unknown>'))}: decrypt_failed ({type(error).__name__})")
+                else:
+                    decrypted += 1
+            sampled = len(rows) + (result[2] if result else 0)
+            result = (kind if result is None else f"{result[0]} and {kind}", decrypted, sampled, errors)
+            if decrypted or not rows:
+                break
+        return result
 
     async def _capability_report(
         self,

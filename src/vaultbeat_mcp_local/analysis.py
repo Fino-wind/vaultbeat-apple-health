@@ -147,8 +147,11 @@ SERIES: tuple[SeriesSpec, ...] = (
     # the read tool knew, the series did not.
     SeriesSpec("sleep_minutes", "sleep_nights", "nights", "asleep_minutes", "minutes",
                "higher means more time asleep that night; nights the Watch was not worn are "
-               "excluded and listed, never read as zero",
-               exclude_when=("is_in_bed_only", "motion_inferred",)),
+               "excluded and listed, never read as zero; so are days whose only sleep was in the "
+               "daytime (`daytime_main_sleep`: a nap, not a night) and main sleeps under 3 h with "
+               "no stage breakdown (`short_unstaged`: a nap or a partly recorded night). Each "
+               "excluded day is listed with its times and minutes, and stays in `get_sleep_nights`",
+               exclude_when=("is_in_bed_only", "motion_inferred", "daytime_main_sleep", "short_unstaged")),
     # ── Sleep structure and timing (2026-09-24) ─────────────────────────────
     # Every one reads `sleep_nights`, the same rows `get_sleep_nights` prints,
     # so `get_metric` fetches them in ONE decrypt and an average can always be
@@ -157,21 +160,22 @@ SERIES: tuple[SeriesSpec, ...] = (
     # Clock series are MINUTES FROM THE MIDNIGHT THAT OPENS THE WAKE DAY,
     # negative before it: a clock time cannot be averaged as a clock time
     # (23:50 and 00:10 average to noon). Stage series are excluded, not
-    # zeroed, on nights without stage detail (iPhone-only) — the same trap
+    # zeroed, on nights without stage detail (Apple did not stage them) — the same trap
     # `sleep_minutes` fell into with unworn nights.
     SeriesSpec("bedtime_minutes", "sleep_nights", "nights", "bedtime_minutes", "minutes from midnight",
                "when sleep began, in minutes from the midnight opening the wake day: -30 = 23:30, "
                "90 = 01:30. Averages across midnight correctly this way; convert back to a clock "
                "time before telling the user. Days whose only main sleep began after 08:00 and "
-               "ended the same day (a daytime or evening nap) are excluded and listed",
-               exclude_when=("is_in_bed_only", "motion_inferred", "daytime_main_sleep")),
+               "ended the same day (a daytime or evening nap), and main sleeps under 3 h with no "
+               "stage breakdown, are excluded and listed",
+               exclude_when=("is_in_bed_only", "motion_inferred", "daytime_main_sleep", "short_unstaged")),
     SeriesSpec("wake_minutes", "sleep_nights", "nights", "wake_minutes", "minutes from midnight",
                "when the night's main sleep ended, minutes from that day's midnight (450 = 07:30)",
-               exclude_when=("is_in_bed_only", "motion_inferred", "daytime_main_sleep")),
+               exclude_when=("is_in_bed_only", "motion_inferred", "daytime_main_sleep", "short_unstaged")),
     SeriesSpec("sleep_midpoint_minutes", "sleep_nights", "nights", "midpoint_minutes", "minutes from midnight",
                "halfway between bedtime and wake, minutes from midnight — the usual measure of "
                "sleep timing; compare weekdays with weekends for social jet lag",
-               exclude_when=("is_in_bed_only", "motion_inferred", "daytime_main_sleep")),
+               exclude_when=("is_in_bed_only", "motion_inferred", "daytime_main_sleep", "short_unstaged")),
     SeriesSpec("deep_sleep_minutes", "sleep_nights", "nights", "deep_minutes", "minutes",
                "Watch-staged nights only", exclude_when=("is_in_bed_only", "motion_inferred", "no_stage_detail")),
     SeriesSpec("rem_sleep_minutes", "sleep_nights", "nights", "rem_minutes", "minutes",
@@ -196,8 +200,13 @@ SERIES: tuple[SeriesSpec, ...] = (
                exclude_when=("is_in_bed_only", "motion_inferred", "no_stage_detail")),
     SeriesSpec("sleep_24h_minutes", "sleep_nights", "nights", "total_sleep_24h_minutes", "minutes",
                "ALL measured sleep that day — the main sleep plus naps and the other half of a "
-               "broken night. `sleep_minutes` is the main sleep alone",
-               exclude_when=("is_in_bed_only", "motion_inferred",)),
+               "broken night. `sleep_minutes` is the main sleep alone, over the same days: a day "
+               "with no night sleep (only a daytime nap or a short fragment) is excluded from both "
+               "and listed",
+               # The same days as `sleep_minutes`, so the day's total can never
+               # average BELOW its main sleep: with the short fragments in here and
+               # out of there, a year read 393 against 403 minutes (2026-10-03).
+               exclude_when=("is_in_bed_only", "motion_inferred", "daytime_main_sleep", "short_unstaged")),
     SeriesSpec("sleep_segments", "sleep_nights", "nights", "sleep_segments", "count",
                "separate sleeps that day; 1 = one unbroken main sleep, 2+ = naps or a broken night",
                exclude_when=("is_in_bed_only", "motion_inferred",)),
@@ -334,7 +343,12 @@ def daily_series(summary: dict[str, Any], spec: SeriesSpec) -> tuple[dict[str, f
     return {day: sum(vs) / len(vs) for day, vs in buckets.items()}, consumed
 
 
-def excluded_days(summary: dict[str, Any], spec: SeriesSpec) -> list[dict[str, str]]:
+#: What an excluded night carries besides its day and reason. `other_sleep_minutes`
+#: only when there is some: a split night's second half is sleep the day did have.
+_NIGHT_EXCLUSION_FACTS = ("bedtime", "wake_time", "asleep_minutes", "other_sleep_minutes")
+
+
+def excluded_days(summary: dict[str, Any], spec: SeriesSpec) -> list[dict[str, Any]]:
     """The days `daily_series` dropped on purpose, each with the flag that dropped it.
 
     Named rather than counted: the caller is an LLM that cannot see the days it
@@ -347,15 +361,26 @@ def excluded_days(summary: dict[str, Any], spec: SeriesSpec) -> list[dict[str, s
     rows = summary.get(spec.array)
     if not isinstance(rows, list):
         return []
-    out: list[dict[str, str]] = []
+    out: list[dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
         day = _day_of(row)
         reason = next((flag for flag in spec.exclude_when if row.get(flag)), None)
         if day is not None and reason is not None:
-            out.append({"day": day, "reason": reason})
+            entry: dict[str, Any] = {"day": day, "reason": reason}
+            # A night left out is still a sleep somebody had: name it, so an
+            # agent can say "plus a 15:09-18:36 nap" without a second read
+            # (owner, 2026-10-03: naps stay out of nightly sleep, but people and
+            # the AI must still see them). Facts of the ROW, so they are the
+            # same on every sleep series and survive being hoisted.
+            if spec.array == "nights":
+                for key in _NIGHT_EXCLUSION_FACTS:
+                    if row.get(key):
+                        entry[key] = row[key]
+            out.append(entry)
     return out
+
 
 
 def _linear_fit(xs: list[float], ys: list[float]) -> tuple[float, float] | None:

@@ -56,6 +56,7 @@ class LocalRecordCache:
             _ttl_from_env(DEFAULT_TTL_SECONDS) if ttl_seconds is None else max(ttl_seconds, 0.0)
         )
         self._sweep_abandoned_temps()
+        self._sweep_stale_unfiltered()
 
     #: A temp older than this outlived its writer. `write_secret_file` publishes
     #: with `os.replace` inside the same call, so a live write holds its temp for
@@ -84,6 +85,30 @@ class LocalRecordCache:
                     path.unlink()
             except OSError:
                 continue
+
+    def _sweep_stale_unfiltered(self) -> None:
+        """Delete `records-all.json` once its TTL has run out.
+
+        It is every kind's decrypted plaintext in one file. Up to 0.8.x the
+        doctor fetched the unfiltered set on every run, so most installs hold
+        one (20 MB on the owner's machine); from 0.9.0 nothing but a digest-less
+        fallback writes it, and a per-kind read never opens it — so the copy an
+        upgrade leaves behind would sit there for good (review R8 on #9). Past
+        its TTL it is only ever a miss, so deleting it loses nothing that a
+        fallback run would not fetch again. Per-kind files stay: their digests
+        make an incremental sync possible (`load_persisted`).
+        """
+
+        path = self._path(None)
+        try:
+            age = time.time() - path.stat().st_mtime
+        except OSError:
+            return
+        if not self.enabled or age > self.ttl_seconds:
+            try:
+                path.unlink()
+            except OSError as error:
+                _LOG.warning("Could not remove stale %s (%s)", path.name, type(error).__name__)
 
     @property
     def enabled(self) -> bool:

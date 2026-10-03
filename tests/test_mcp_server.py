@@ -501,6 +501,39 @@ def test_an_empty_since_keeps_the_two_week_default(monkeypatch: Any, tmp_path: P
     assert calls[-1]["since"] is None and calls[-1]["until"] is None
 
 
+def test_a_since_is_not_cut_by_the_default_limit(monkeypatch: Any, tmp_path: Path) -> None:
+    """Release gate round 4 on #9: `get_sleep_nights(since="2025-11-01")` came back
+    starting in June, because the default 120 still applied — while the tool told
+    agents to use `since` rather than guess a limit. Same rule for sleep detail."""
+    tools = _capture_tools(monkeypatch)
+    calls: dict[str, list[dict[str, Any]]] = {"nights": [], "detail": []}
+
+    async def nights(**kw: Any) -> dict[str, Any]:
+        calls["nights"].append(kw)
+        return {"nights": [], "count": 0, "errors": []}
+
+    async def detail(**kw: Any) -> dict[str, Any]:
+        calls["detail"].append(kw)
+        return {"nights": [], "count": 0, "errors": []}
+
+    monkeypatch.setattr("vaultbeat_mcp_local.service.VaultbeatLocalService.sleep_nights",
+                        lambda self, **kw: nights(**kw))
+    monkeypatch.setattr("vaultbeat_mcp_local.service.VaultbeatLocalService.sleep_detail_records",
+                        lambda self, **kw: detail(**kw))
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    asyncio.run(tools["get_sleep_nights"]())
+    asyncio.run(tools["get_sleep_nights"](since="2025-11-01"))
+    asyncio.run(tools["get_sleep_nights"](since="2025-11-01", limit=10))
+    asyncio.run(tools["get_sleep_nights"](since=""))
+    assert [c["limit"] for c in calls["nights"]] == [120, None, 10, 120]
+
+    asyncio.run(tools["get_sleep_detail"]())
+    asyncio.run(tools["get_sleep_detail"](since="2026-09-14", until="2026-09-14"))
+    asyncio.run(tools["get_sleep_detail"](until="2026-09-14", limit=3))
+    assert [c["limit"] for c in calls["detail"]] == [2, None, 3]
+
+
 def test_narrow_hints_name_only_real_parameters_and_values(monkeypatch: Any, tmp_path: Path) -> None:
     """A `result_too_large` hint is followed to the letter, so every parameter it
     names must exist on that tool and every value it suggests must be accepted.
@@ -1217,9 +1250,26 @@ def test_tools_reject_arguments_they_do_not_declare() -> None:
         return await server.call_tool("get_food_log", arguments)
 
     assert asyncio.run(call({"limit": 3})) is not None
-    for extra in ({"partner": True}, {"owner": "partner"}):
+    for extra in ({"partner": True}, {"partner": "true"}, {"owner": "partner"}, {"owner": "me"}):
         with pytest.raises(ToolError, match="Extra inputs are not permitted"):
             asyncio.run(call({"limit": 3, **extra}))
+
+    # `partner=false` asks for what this tool returns anyway — the user's own
+    # data — so it is dropped rather than refused (review R12 on #9).
+    for own in ({"partner": False}, {"partner": "false"}):
+        assert asyncio.run(call({"limit": 3, **own})) is not None
+
+    # …and on a tool that HAS `partner`, false still reaches the tool.
+    @server.tool()
+    async def get_notes(partner: bool = True) -> dict[str, Any]:
+        return {"partner": partner}
+
+    reply = asyncio.run(server.call_tool("get_notes", {"partner": False}))
+    assert '"partner":false' in str(reply).replace(" ", "")
+
+    # A second call wraps the SDK's step, not the previous wrapper.
+    _forbid_unknown_arguments()
+    assert asyncio.run(call({"limit": 3, "partner": False})) is not None
 
 
 def test_a_result_too_large_for_a_client_says_how_to_ask_for_less() -> None:
