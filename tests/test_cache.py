@@ -321,6 +321,33 @@ def test_abandoned_temps_are_swept_on_start_but_fresh_ones_are_not(tmp_path: Pat
     assert kept.exists()
 
 
+def test_a_stale_unfiltered_cache_is_deleted_on_start(tmp_path: Path) -> None:
+    """Review R8: 0.8.x's doctor left every kind's plaintext in `records-all.json`,
+    which 0.9.0 never reads again. Past its TTL it goes; within it, and the
+    per-kind files whatever their age, stay."""
+    import os
+    import time
+
+    unfiltered = tmp_path / "records-all.json"
+    per_kind = tmp_path / "records-sleep.json"
+    for path in (unfiltered, per_kind):
+        path.write_text("{}")
+    a_day_ago = time.time() - 86_400
+    for path in (unfiltered, per_kind):
+        os.utime(path, (a_day_ago, a_day_ago))
+
+    LocalRecordCache(tmp_path, ttl_seconds=3 * 86_400)
+    assert unfiltered.exists(), "still inside its TTL: a fallback run may reuse it"
+
+    LocalRecordCache(tmp_path, ttl_seconds=600)
+    assert not unfiltered.exists()
+    assert per_kind.exists(), "per-kind digests drive the incremental sync"
+
+    unfiltered.write_text("{}")
+    LocalRecordCache(tmp_path, ttl_seconds=0)
+    assert not unfiltered.exists(), "with the cache off it can never be a hit"
+
+
 def test_the_newest_starting_fetch_wins_the_cache_across_processes(tmp_path: Path) -> None:
     """Review V5: two MCP processes share one pairing (two Claude Code sessions).
     A plain read that BEGAN before the other process's write and finished after

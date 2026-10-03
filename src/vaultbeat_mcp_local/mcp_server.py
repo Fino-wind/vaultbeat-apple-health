@@ -278,9 +278,14 @@ _SLEEP_NIGHT_LEGEND = {
             "`unworn` = the Watch was not worn, sleep was never measured — NOT zero sleep; "
             "`motion_inferred` = guessed from phone motion, runs long; `get_metric` leaves these "
             "nights out of every sleep average, so leave them out of any average you compute here; "
-            "`no_stages` = total known but no stage breakdown (iPhone-only), so stage columns are null; "
-            "`daytime` = the day's main sleep began after 08:00 and ended the same day, a daytime "
-            "or evening nap that was the only sleep recorded that day — real, but not a bedtime",
+            "`no_stages` = total known but no stage breakdown (Apple does not stage a short sleep, "
+            "and some sources never do), so stage columns are null; "
+            "`short` = a main sleep under 3 h with no stages — a nap or the part of a night the Watch "
+            "caught, which look the same; `get_metric` leaves it out of `sleep_minutes`, "
+            "`sleep_24h_minutes` and the bedtime/wake/midpoint series; "
+            "`daytime` = the day's only sleep began after 08:00 and ended the same day — a daytime "
+            "or evening nap, not a night: `get_metric` leaves it out of every nightly series and "
+            "lists it, and it stays here as a row. Naps on a day that also had a night are in `other`",
     "null": "not measured. Never read a null as zero",
 }
 
@@ -307,6 +312,7 @@ def _sleep_nights_table(summary: dict[str, Any], since: str | None) -> dict[str,
                 ("unworn", n.get("is_in_bed_only")),
                 ("motion_inferred", n.get("motion_inferred")),
                 ("daytime", n.get("daytime_main_sleep")),
+                ("short", n.get("short_unstaged")),
                 ("no_stages", n.get("no_stage_detail") and not n.get("is_in_bed_only")),
             ) if on
         ]
@@ -619,11 +625,29 @@ def _forbid_unknown_arguments() -> None:
     argument model is created from it at registration. Pinned by
     `test_tools_reject_arguments_they_do_not_declare`, which fails if an SDK
     upgrade moves or renames the base.
+
+    One extra is dropped instead of refused: `partner=false` on a tool that has
+    no `partner`. It asks for exactly what that tool returns — the user's own
+    data — and an agent passing the same flag to every call it makes would
+    otherwise fail on the five own-data tools for no reason (review R12 on #9).
+    Dropped before validation, in the SDK's own pre-parse step; idempotent.
     """
     from mcp.server.mcpserver.utilities import func_metadata
 
     base = func_metadata.ArgModelBase
     base.model_config = {**base.model_config, "extra": "forbid"}
+
+    meta = func_metadata.FuncMetadata
+    original = getattr(meta.pre_parse_json, "__wrapped__", meta.pre_parse_json)
+
+    def pre_parse_json(self: Any, data: dict[str, Any]) -> dict[str, Any]:
+        asks_for_own = data.get("partner") is False or data.get("partner") == "false"
+        if asks_for_own and "partner" not in self.arg_model.model_fields:
+            data = {key: value for key, value in data.items() if key != "partner"}
+        return original(self, data)
+
+    pre_parse_json.__wrapped__ = original  # type: ignore[attr-defined]
+    meta.pre_parse_json = pre_parse_json  # type: ignore[method-assign]
 
 
 def _compact_tool_results() -> None:
@@ -669,8 +693,8 @@ _NARROW_HINTS: dict[str, str] = {
         "fewer `series` (name the ones you need), fewer `days` or a `since`/`until` window, "
         "or `aggregation=\"avg\"` with `granularity=\"week\"` or `\"month\"`"
     ),
-    "get_sleep_nights": "a smaller `limit`, or `since`",
-    "get_sleep_detail": "a smaller `limit`, without `include_timeline`",
+    "get_sleep_nights": "a later `since`, or a smaller `limit`",
+    "get_sleep_detail": "a smaller `limit` or a narrower `since` / `until`, without `include_timeline`",
     "get_intraday": "a smaller `limit`",
     "get_workouts": "a smaller `limit`",
     "get_strength_log": "a smaller `limit` or `limit_days`",
@@ -1110,10 +1134,15 @@ def run_mcp_server(
     ) -> dict[str, Any]:
         """Decrypt daily food-intake logs locally (newest first).
 
-        `limit` = days: the newest two weeks by default. `since` / `until`
+        `limit` counts LOGGED days: by default the newest 14 days that have a
+        log — not a calendar fortnight. Days with nothing logged are skipped, so
+        the 14 can reach further back; `coverage.span_days` and
+        `coverage.days_missing_in_span` say how far. `since` / `until`
         ("YYYY-MM-DD", local days, both inclusive) read a calendar window
         instead — "what did I eat in the first week of August" — and then
-        `limit` applies only if you pass it. A logged day is roughly 0.5-1k
+        `limit` applies only if you pass it. Each day's `date` is its local
+        calendar day (the same as `local_date`, and the form `log_food_entry`
+        and `get_strength_log` use). A logged day is roughly 0.5-1k
         tokens (more with notes, and Chinese text counts more), so a month can
         already be past what a client takes in one result — it then comes back
         as `result_too_large`; ask for fewer days or a narrower window.
@@ -1530,10 +1559,12 @@ def run_mcp_server(
 
     @tool(title="Sleep stage detail", annotations=_read_only_tool())
     async def get_sleep_detail(
-        limit: int = 2,
+        limit: int | None = None,
         partner: bool = False,
         fresh: bool = False,
         include_timeline: bool = False,
+        since: str | None = None,
+        until: str | None = None,
     ) -> dict[str, Any]:
         """Per-night sleep stages with per-stage HR/RR — depth on a few nights.
 
@@ -1556,6 +1587,12 @@ def run_mcp_server(
         Returns `stage_intervals` (contiguous stage bands with start/end),
         `stage_minutes`, and `stage_vitals` (per-stage HR/RR min/mean/max). Reads
         YOUR nights by default; `partner=true` reads your partner's shared sleep.
+
+        `limit` = the newest N nights, 2 by default. To read a particular night,
+        pass its date as `since` and `until` ("YYYY-MM-DD", the local day the
+        night ENDS on — the `local_date` / `date` column of `get_sleep_nights`);
+        a wider `since` / `until` reads every night in that window, and `limit`
+        then applies only if you pass it.
 
         ⚠️ SIZE: each night is ~3k characters as returned (a week ~21k). Setting
         `include_timeline=True` adds the raw per-sample array (hr, rr, stage,
@@ -1582,19 +1619,24 @@ def run_mcp_server(
         their data.
         """
 
+        since, until = since or None, until or None
+        if limit is None and since is None and until is None:
+            limit = 2
         return _partner_note(
             await service.sleep_detail_records(
                 limit=limit,
                 owner=service.person_owner(partner=partner),
                 fresh=fresh,
                 include_timeline=include_timeline,
+                since=since,
+                until=until,
             ),
             partner,
         )
 
     @tool(title="Sleep, every night", annotations=_read_only_tool())
     async def get_sleep_nights(
-        limit: int = 120, since: str | None = None, partner: bool = False, fresh: bool = False,
+        limit: int | None = None, since: str | None = None, partner: bool = False, fresh: bool = False,
     ) -> dict[str, Any]:
         """Every night as one compact row — the tool for reading a sleep HISTORY.
 
@@ -1616,15 +1658,19 @@ def run_mcp_server(
           per-stage vitals).
 
         `limit` = newest N nights (default 120; pass 400 for everything, and
-        check `coverage.more_available`). `since` = "YYYY-MM-DD" keeps nights on
-        or after that day — use it for "last month" rather than guessing a limit.
+        check `coverage.more_available`). `since` = "YYYY-MM-DD" keeps every
+        night on or after that day — use it for "last month" rather than
+        guessing a limit; with `since`, `limit` applies only if you pass it.
 
-        Read `legend` once. Four flags, comma-separated when a night has several:
+        Read `legend` once. Five flags, comma-separated when a night has several:
         `unworn` means sleep was never measured that night (not zero sleep),
         `motion_inferred` means phone motion guessed it (leave it out of averages,
-        as `get_metric` does), `daytime` means the day's main sleep was a daytime
-        nap (real, but not a bedtime), `no_stages` means the total is known but
-        the stage columns are null. A null anywhere is "not measured",
+        as `get_metric` does), `daytime` means the day's only sleep was a daytime
+        nap (real, but not a night — out of `get_metric`'s nightly series, still
+        a row here), `short` means a main sleep under 3 h with
+        no stages — a nap or a partly recorded night, left out of `get_metric`'s
+        sleep-duration and clock series — and `no_stages` means the total is
+        known but the stage columns are null. A null anywhere is "not measured",
         never zero. Reads YOUR nights; `partner=true` reads your partner's
         shared sleep.
 
@@ -1633,6 +1679,12 @@ def run_mcp_server(
         the history goes.
         """
 
+        # With a `since`, the default 120 used to cut the window anyway: since
+        # 2025-11-01 returned nights from June on, the instruction above being
+        # "use since rather than guessing a limit" (#9, release gate round 4).
+        since = since or None
+        if limit is None and since is None:
+            limit = 120
         if since is not None:
             # Compared as a string against zero-padded dates, so "2026-8-1"
             # would silently select the wrong nights rather than fail.

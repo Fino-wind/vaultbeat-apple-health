@@ -29,7 +29,7 @@ name = "vaultbeat-apple-health"
 # A comment cannot enforce this. `scripts/ci/check_mcp_registry_current.py`
 # now does, with one rule per failure above; if that guard is ever deleted,
 # this paragraph is what comes back.
-version = "0.9.0"
+version = "0.9.1"
 description = "Apple Health MCP server for Claude Code, Claude Desktop and any MCP agent — your end-to-end-encrypted HealthKit data (sleep, HRV, cycle, weight, workouts), decrypted only on your machine"
 readme = "README.md"
 keywords = ["apple health", "mcp", "mcp server", "healthkit", "apple health mcp", "claude", "claude code", "model context protocol", "health data", "e2ee"]

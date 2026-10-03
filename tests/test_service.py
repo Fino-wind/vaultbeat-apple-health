@@ -1734,6 +1734,9 @@ def test_food_summary_reads_a_calendar_window(tmp_path: Path) -> None:
     summary = asyncio.run(service.food_summary(since="2026-08-01", until="2026-08-05"))
 
     assert [d["local_date"] for d in summary["days"]] == ["2026-08-05", "2026-08-01"]
+    # `date` is the local day too, as on strength — not local midnight in UTC,
+    # which reads as the day before east of Greenwich (#9 G5 / R9).
+    assert [d["date"] for d in summary["days"]] == ["2026-08-05", "2026-08-01"]
     assert summary["range"] == {"since": "2026-08-01", "until": "2026-08-05"}
     # Older days exist beyond `since`; that is what `more_available` must say,
     # computed from the whole history rather than from the window.
@@ -2784,6 +2787,48 @@ def test_basal_energy_series_reads_the_whole_history_not_a_display_page(tmp_path
         assert oldest in json.dumps(result), result
 
 
+def test_a_calendar_window_bounds_its_exclusions_and_its_more_available(tmp_path: Path) -> None:
+    """Two #9 findings on the same window. G7: `excluded_days` listed short days
+    after `until`. After round 2: a window whose FIRST day was short started its
+    points a day late, and `more_available` compared history with that point
+    instead of with `since` — reporting withheld history for a window read in
+    full. G9 rides along: `total_available` here counts hourly samples, and the
+    block now says so."""
+    from datetime import date as _date_type, timedelta as _td
+
+    service, cloud, public_key = _bound_service(tmp_path)
+    today = _date_type.today()
+    first, last = today - _td(days=10), today - _td(days=5)
+    envelopes: list[dict[str, Any]] = []
+    for back in range(1, 11):
+        day = today - _td(days=back)
+        short = day in (first, today - _td(days=3))  # the window's first day, and one after `until`
+        envelopes += _basal_day_envelopes(
+            public_key, day, 2000.0, hours=12 if short else 24, tag=f"w{back}", with_activity=False
+        )
+    cloud.envelopes = envelopes
+
+    result = asyncio.run(service.metric_values(
+        series="basal_energy", since=first.isoformat(), until=last.isoformat(), owner="a1a1",
+    ))
+    entry = result["metrics"][0]
+    assert [e["day"] for e in entry.get("excluded_days", [])] == [first.isoformat()], entry
+    assert entry["coverage"]["more_available"] is False, "the window was read from its own first day"
+    assert entry["coverage"]["total_available_unit"] == "samples"
+
+    trend = asyncio.run(service.metric_trend(
+        series="basal_energy", since=first.isoformat(), until=last.isoformat(), owner="a1a1",
+    ))
+    assert [e["day"] for e in trend.get("excluded_days", [])] == [first.isoformat()]
+    assert trend["coverage"]["more_available"] is False
+
+    # History older than `since` is still reported as such.
+    later = asyncio.run(service.metric_values(
+        series="basal_energy", since=(first + _td(days=1)).isoformat(), owner="a1a1",
+    ))
+    assert later["metrics"][0]["coverage"]["more_available"] is True
+
+
 def test_basal_energy_records_reports_coverage_and_a_denominator(tmp_path: Path) -> None:
     """The newest day is the one most likely to be quoted bare, and to be short."""
     from datetime import date as _date_type, timedelta as _td
@@ -3179,6 +3224,26 @@ def test_sleep_detail_in_bed_only_night_carries_the_same_labels(tmp_path: Path) 
 
     assert older["duration_label"] == "7h00m"
     assert older["total_sleep_minutes"] == 420
+
+
+def test_sleep_detail_reads_a_night_by_date(tmp_path: Path) -> None:
+    """Release gate G8 on #9: a night 19 days back took `limit=20`, ~50k characters
+    for the one night wanted. `since` / `until` pick it by its local day."""
+    service, cloud, public_key = _bound_service(tmp_path)
+    cloud.envelopes = _sleep_envelopes(public_key)
+    newest_day, older_day = [n["local_date"] for n in asyncio.run(
+        service.sleep_detail_records(limit=None, owner="a1a1"))["nights"]]
+
+    one = asyncio.run(service.sleep_detail_records(since=older_day, until=older_day, owner="a1a1"))
+    assert [n["local_date"] for n in one["nights"]] == [older_day]
+    assert one["range"] == {"since": older_day, "until": older_day}
+    assert one["coverage"]["more_available"] is False, "nothing is older than that night"
+
+    newer = asyncio.run(service.sleep_detail_records(since=newest_day, owner="a1a1"))
+    assert [n["local_date"] for n in newer["nights"]] == [newest_day]
+    assert newer["coverage"]["more_available"] is True
+
+    assert asyncio.run(service.sleep_detail_records(since="2026-7-1"))["error"] == "invalid_since"
 
 
 def _short_samples_payload() -> bytes:
@@ -4969,6 +5034,74 @@ def test_unworn_nights_are_excluded_from_sleep_minutes_not_read_as_zero() -> Non
     assert lookup("in_bed_minutes") is None, "0 on every Watch night; not a nightly series"
 
 
+def test_a_short_unstaged_main_sleep_is_flagged_and_left_out_of_the_night_series() -> None:
+    """Release gate G6 on #9: a 69-178 minute stage-less Watch record — a nap or the
+    part of a night the Watch caught — was averaged in as a night. It is flagged,
+    left out of `sleep_minutes`, `sleep_24h_minutes` (which must cover the same
+    days, or the day's total averages below its main sleep) and the clock series."""
+    from vaultbeat_mcp_local.analysis import daily_series, excluded_days, lookup
+    from vaultbeat_mcp_local.service import sleep_night_row
+
+    def night(day: str, bed: str, wake: str, asleep: int, *, staged: bool) -> dict[str, Any]:
+        return sleep_night_row({
+            "local_date": day, "bedtime": f"{day}T{bed}", "wake_time": f"{day}T{wake}",
+            "total_sleep_minutes": asleep, "has_stage_detail": staged, "is_in_bed_only": False,
+            "stage_minutes": {"asleepDeep": 60, "asleepREM": 90, "asleepCore": 270} if staged else {},
+            "source": "apple",
+        })
+
+    rows = [
+        night("2026-06-27", "00:30", "07:30", 420, staged=True),
+        night("2026-06-28", "02:34", "03:43", 69, staged=False),
+        night("2026-06-29", "01:00", "05:00", 240, staged=False),  # 4 h stage-less: a short night, kept
+        night("2026-06-30", "00:30", "03:30", 179, staged=True),   # staged: Apple saw a night, kept
+    ]
+    assert [r["short_unstaged"] for r in rows] == [False, True, False, False]
+    summary = {"nights": rows}
+
+    for name in ("sleep_minutes", "sleep_24h_minutes", "bedtime_minutes", "wake_minutes", "sleep_midpoint_minutes"):
+        spec = lookup(name)
+        points, _ = daily_series(summary, spec)
+        assert "2026-06-28" not in points, name
+        assert ("2026-06-28", "short_unstaged") in {(e["day"], e["reason"]) for e in excluded_days(summary, spec)}, name
+    assert daily_series(summary, lookup("sleep_minutes"))[0]["2026-06-29"] == 240.0
+    assert rows[1]["total_sleep_24h_minutes"] == 69, "still in the table"
+    # A split night's second half rides along on the exclusion; a zero does not.
+    split = dict(rows[1], other_sleep_minutes=118)
+    listed = excluded_days({"nights": [split]}, lookup("sleep_minutes"))
+    assert listed[0]["other_sleep_minutes"] == 118
+    assert "other_sleep_minutes" not in excluded_days(summary, lookup("sleep_minutes"))[0]
+    assert set(lookup("sleep_minutes").exclude_when) == set(lookup("sleep_24h_minutes").exclude_when)
+
+
+def test_a_daytime_nap_is_not_a_night_but_stays_visible() -> None:
+    """Owner, 2026-10-03: a nap does not enter nightly sleep, but people and the AI
+    must still see it. A day whose only sleep was 15:09-18:36 (staged, 205 min —
+    real, on the owner's account) is out of `sleep_minutes` and `sleep_24h_minutes`,
+    and every exclusion list names it with its times and minutes — including the
+    list `get_metric` hoists when several series drop the same day."""
+    from vaultbeat_mcp_local.analysis import daily_series, excluded_days, lookup
+    from vaultbeat_mcp_local.service import _hoist_common_exclusions, sleep_night_row
+
+    nap = sleep_night_row({
+        "local_date": "2026-09-29", "bedtime": "2026-09-29T15:09", "wake_time": "2026-09-29T18:36",
+        "total_sleep_minutes": 205, "has_stage_detail": True, "is_in_bed_only": False,
+        "stage_minutes": {"asleepDeep": 30, "asleepREM": 45, "asleepCore": 130}, "source": "apple",
+    })
+    assert nap["daytime_main_sleep"] and not nap["short_unstaged"]
+    summary = {"nights": [nap]}
+    expected = {"day": "2026-09-29", "reason": "daytime_main_sleep",
+                "bedtime": "15:09", "wake_time": "18:36", "asleep_minutes": 205}
+
+    lists = []
+    for name in ("sleep_minutes", "sleep_24h_minutes", "bedtime_minutes"):
+        spec = lookup(name)
+        assert daily_series(summary, spec)[0] == {}, name
+        assert excluded_days(summary, spec) == [expected], name
+        lists.append({"series": name, "excluded_days": excluded_days(summary, spec)})
+    assert _hoist_common_exclusions(lists) == [expected]
+
+
 def test_wrist_temp_series_reads_the_honest_field_and_says_it_is_absolute() -> None:
     from vaultbeat_mcp_local.analysis import lookup
 
@@ -5328,10 +5461,13 @@ def test_a_daytime_main_sleep_is_not_a_bedtime() -> None:
     assert nap["daytime_main_sleep"] is True
     summary = {"nights": [nap]}
     assert daily_series(summary, lookup("bedtime_minutes"))[0] == {}
-    assert excluded_days(summary, lookup("bedtime_minutes")) == [
-        {"day": "2026-09-22", "reason": "daytime_main_sleep"}
+    assert [(e["day"], e["reason"]) for e in excluded_days(summary, lookup("bedtime_minutes"))] == [
+        ("2026-09-22", "daytime_main_sleep")
     ]
-    assert daily_series(summary, lookup("sleep_minutes"))[0] == {"2026-09-22": 269.0}
+    # Until 2026-10-03 the nap stayed in `sleep_minutes` as that day's "night";
+    # the owner decided then that a nap is not a night's sleep (see
+    # `test_a_daytime_nap_is_not_a_night_but_stays_visible`).
+    assert daily_series(summary, lookup("sleep_minutes"))[0] == {}
 
 
 def test_an_evening_nap_is_not_a_bedtime_but_an_evening_night_is() -> None:

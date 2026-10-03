@@ -85,12 +85,12 @@ uvx vaultbeat-apple-health@latest --demo serve --transport stdio   # wire this i
 | Tool | What it returns |
 | --- | --- |
 | `get_sleep_nights` *partner* | Every night as one compact row: bed and wake time, asleep, deep / REM / core / awake, awakenings, longest unbroken sleep, heart and breathing rate while asleep, naps. A year fits in one call; `since="YYYY-MM-DD"` for a calendar window. |
-| `get_sleep_detail` *partner* | One or two nights in depth: stage intervals with per-stage heart and breathing rate. |
+| `get_sleep_detail` *partner* | One or two nights in depth: stage intervals with per-stage heart and breathing rate. The newest nights, or any night by date (`since` / `until`). |
 | `get_menstrual_cycle` *partner* | Cycle samples and a next-period prediction. Sensitive. |
 | `get_symptoms` *partner* | Symptoms from Apple Health, and beside them the episodes a person reported (type, severity, onset and end, place, suspected triggers). Sensitive. |
 | `get_notes` *partner* | Free-text notes on days, with who wrote them. Sensitive. |
 | `get_strength_log` | Strength sessions: exercises, sets × reps, volume per session. |
-| `get_food_log` | Meals and items per day, with optional kcal / protein / fat / carbs. The newest 14 days by default, or a `since` / `until` window. |
+| `get_food_log` | Meals and items per day, with optional kcal / protein / fat / carbs. The 14 newest days that have a log by default (not a calendar fortnight), or a `since` / `until` window. |
 | `get_workouts` | Workouts: type, duration, calories, distance. |
 | `get_user_profile` | Sex, age, date of birth and height. Needs Vaultbeat for iOS 1.2.9 or later. |
 
