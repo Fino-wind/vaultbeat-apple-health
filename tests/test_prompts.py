@@ -27,7 +27,8 @@ from vaultbeat_mcp_local.prompts import (
     render_prompt,
 )
 
-from mcp.server.fastmcp import FastMCP
+from mcp import Client
+from mcp.server.mcpserver import MCPServer
 
 from vaultbeat_mcp_local.mcp_server import run_mcp_server
 from vaultbeat_mcp_local.store import ConfigStore
@@ -47,7 +48,7 @@ def _build_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     """
 
     captured: dict[str, Any] = {}
-    monkeypatch.setattr(FastMCP, "run", lambda self, **kwargs: captured.__setitem__("mcp", self))
+    monkeypatch.setattr(MCPServer, "run", lambda self, **kwargs: captured.__setitem__("mcp", self))
     run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
     return captured["mcp"]
 
@@ -230,18 +231,20 @@ def test_a_supplied_argument_is_substituted_verbatim() -> None:
 
 
 def _list_prompts(server: Any) -> list[mcp_types.Prompt]:
-    handler = server._mcp_server.request_handlers[mcp_types.ListPromptsRequest]
-    request = mcp_types.ListPromptsRequest(method="prompts/list")
-    return list(asyncio.run(handler(request)).root.prompts)
+    # Through SDK 2.x's in-process Client — the protocol path a client takes.
+    async def _go() -> Any:
+        async with Client(server) as client:
+            return await client.list_prompts()
+
+    return list(asyncio.run(_go()).prompts)
 
 
 def _get_prompt(server: Any, name: str, arguments: dict[str, str] | None = None) -> str:
-    handler = server._mcp_server.request_handlers[mcp_types.GetPromptRequest]
-    request = mcp_types.GetPromptRequest(
-        method="prompts/get",
-        params=mcp_types.GetPromptRequestParams(name=name, arguments=arguments),
-    )
-    result = asyncio.run(handler(request)).root
+    async def _go() -> Any:
+        async with Client(server) as client:
+            return await client.get_prompt(name, arguments)
+
+    result = asyncio.run(_go())
     return "".join(
         m.content.text for m in result.messages if isinstance(m.content, mcp_types.TextContent)
     )
@@ -312,7 +315,12 @@ def test_a_real_server_does_not_prefix_the_prompts(
 
 
 def _handshake_instructions(server: Any) -> str:
-    return server._mcp_server.create_initialization_options().instructions or ""
+    # What a client actually receives in `initialize`, not what the server holds.
+    async def _go() -> str | None:
+        async with Client(server) as client:
+            return client.instructions
+
+    return asyncio.run(_go()) or ""
 
 
 def test_the_handshake_actually_carries_the_instructions(
@@ -370,3 +378,15 @@ def test_a_real_server_does_not_watermark_the_handshake(
 ) -> None:
     text = _handshake_instructions(_build_server(tmp_path, monkeypatch))
     assert "SYNTHETIC" not in text
+
+
+def test_the_plan_boundary_promises_no_deletion_the_app_does_not_do() -> None:
+    """P1 (2026-10-03): the instructions told agents a lapsed account's cloud copy
+    is removed after three days. The owner moved deletion past app 1.2.9
+    (GitHub #46, Invariant 94), so 0.9.0 shipping beside 1.2.9 would have told
+    every agent something false about the user's data."""
+    from vaultbeat_mcp_local.prompts import SERVER_INSTRUCTIONS
+
+    text = SERVER_INSTRUCTIONS.lower()
+    assert "removed" not in text and "deleted" not in text and "three days after" not in text
+    assert "stays readable" in text

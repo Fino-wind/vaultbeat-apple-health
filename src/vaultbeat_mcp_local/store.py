@@ -11,10 +11,25 @@ from typing import Any
 
 import keyring
 
+from vaultbeat_mcp_local.app_paths import CONNECT_SERVER
 from vaultbeat_mcp_local.crypto import generate_x25519_keypair, public_key_from_private
 
 
-DEFAULT_API_BASE_URL = "https://wjpnyxglgtmtgjuuhwru.supabase.co/functions/v1"
+# Our own domain since 2026-10 (GitHub #28): it forwards to the backend, so the
+# backend can move without another release of this package.
+DEFAULT_API_BASE_URL = "https://api.vaultbeat.app/functions/v1"
+# What every config paired before then holds, read as DEFAULT_API_BASE_URL. The
+# file is written at pairing and never again by an upgrade, so a new default
+# alone would leave every paired server on the Supabase address — the one that
+# keeps writing to the old database once the backend has moved.
+LEGACY_API_BASE_URLS = frozenset({"https://wjpnyxglgtmtgjuuhwru.supabase.co/functions/v1"})
+
+
+def current_api_base_url(stored: str) -> str:
+    """The address to use for a stored one: a legacy default becomes today's,
+    anything else (a `--api-base-url` override) is kept."""
+    url = stored.rstrip("/")
+    return DEFAULT_API_BASE_URL if url in LEGACY_API_BASE_URLS else url
 CONFIG_ENV = "VAULTBEAT_MCP_CONFIG"
 
 # Slug-free id-only form — survives any future App Store rename (the slugged
@@ -37,10 +52,10 @@ PAIRING_GUIDANCE = (
     "the health data comes from, and scanning a QR code with it is the only "
     f"way to authorize this server. Install it from {APP_STORE_URL}, then run "
     "`uvx vaultbeat-apple-health@latest bind` in a real terminal and scan the QR it "
-    "prints (in the app: Settings → Data & AI → Connect an AI server). The "
-    "`vaultbeat_start_binding` / `vaultbeat_poll_binding` tools do the same, "
-    "but a QR relayed through an agent's output often does not render — the "
-    "terminal command is the reliable path. No iPhone or no app yet? Restart "
+    f"prints (in the app: {CONNECT_SERVER}). An agent "
+    "without a terminal should hand the user that command to run themselves — "
+    "pairing is a one-time setup step, not something done from chat. No iPhone "
+    "or no app yet? Restart "
     "this MCP server with VAULTBEAT_DEMO=1 in its environment (CLI flag: "
     "--demo) to explore every read tool on synthetic data."
 )
@@ -476,7 +491,7 @@ class ConfigStore:
 
         return LocalServerConfig(
             server_name=str(raw.get("server_name", "Local AI Server")).strip() or "Local AI Server",
-            api_base_url=str(raw.get("api_base_url", DEFAULT_API_BASE_URL)).rstrip("/"),
+            api_base_url=current_api_base_url(str(raw.get("api_base_url", DEFAULT_API_BASE_URL))),
             private_key_base64=private_key_base64,
             public_key_base64=public_key_base64,
             poll_id=raw.get("poll_id"),

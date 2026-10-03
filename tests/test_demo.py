@@ -56,8 +56,8 @@ from typing import Any
 
 import pytest
 
-import mcp.server.fastmcp as fastmcp_module
-import mcp.types as mcp_types
+from mcp import Client
+from mcp.server.mcpserver import MCPServer
 import vaultbeat_mcp_local.demo as demo_module
 import vaultbeat_mcp_local.service as service_module
 from vaultbeat_mcp_local.client import PollBindingResult
@@ -99,6 +99,9 @@ _ARGS: dict[str, dict[str, Any]] = {
     "log_note": {"text": "恶心"},
     "log_note_append": {"text": "恶心"},
     "log_weight_entry": {"weight_kg": 72.5},
+    "log_symptom": {"symptom_type": "headache"},
+    "update_symptom": {"entry_id": "symptom-00000000000000000000000000000000", "severity": "mild"},
+    "delete_symptom": {"entry_id": "symptom-00000000000000000000000000000000"},
     # READ tools with a required argument. The analysis trio takes a `series`
     # on purpose (no sensible default quantity to trend, and a default would let
     # a typo silently return a different metric), so every sweep below has to
@@ -115,7 +118,7 @@ _ARGS: dict[str, dict[str, Any]] = {
 #: Tools that write to the cloud on a real install, mapped to the service method
 #: whose demo guard actually refuses them. In demo mode every one must refuse.
 #:
-#: SEVEN tools, FOUR methods — `log_*_append` is the same method called with
+#: TEN tools, SEVEN methods — `log_*_append` is the same method called with
 #: `merge=True`, published as a separate tool because an ARGUMENT cannot be
 #: annotated non-destructive. They share the refusal, so asserting only the four
 #: methods would leave three published tools unproven at the layer a client sees.
@@ -133,6 +136,9 @@ _WRITE_TOOLS: dict[str, str] = {
     "log_note": "log_note",
     "log_note_append": "log_note",
     "log_weight_entry": "log_weight_entry",
+    "log_symptom": "log_symptom",
+    "update_symptom": "update_symptom",
+    "delete_symptom": "delete_symptom",
 }
 
 #: The synthetic-data sentence travels under ONE key everywhere: `demo_warning`.
@@ -173,7 +179,7 @@ def _banner(structured: dict[str, Any]) -> str:
 #: Derived at runtime from the registered tool list, never typed out here.
 def _read_tool_names(server: Any) -> list[str]:
     names = sorted(tool.name for tool in asyncio.run(server.list_tools()))
-    return [n for n in names if n.startswith("get_") or n in ("vaultbeat_sync_sleep",)]
+    return [n for n in names if n.startswith("get_")]
 
 
 class _RecordingCloud:
@@ -290,7 +296,7 @@ def _build_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     def fake_run(self: Any, **kwargs: Any) -> None:
         captured["mcp"] = self
 
-    monkeypatch.setattr(fastmcp_module.FastMCP, "run", fake_run)
+    monkeypatch.setattr(MCPServer, "run", fake_run)
     run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
     return captured["mcp"]
 
@@ -298,20 +304,19 @@ def _build_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
 def _call(server: Any, name: str, arguments: dict[str, Any] | None = None) -> Any:
     """Invoke one tool the way a client does, returning the `CallToolResult`.
 
-    Goes through the low-level `CallToolRequest` handler rather than
-    `FastMCP.call_tool`, because only the handler builds the result object that
-    carries BOTH `content` and `structuredContent` — the two copies this file
-    exists to check. `FastMCP.call_tool` returns a bare tuple with no
-    `isError`, so a failing tool would surface as a raised exception rather than
-    the error result a client would actually see.
+    Goes through SDK 2.x's in-process `Client`, i.e. the real protocol path a
+    client takes, because only that builds the result object carrying BOTH
+    `content` and `structuredContent` — the two copies this file exists to
+    check — and reports a failing tool as `isError` rather than as a raised
+    exception. (Under SDK 1.x this reached into `_mcp_server.request_handlers`,
+    a private table 2.x no longer has.)
     """
 
-    handler = server._mcp_server.request_handlers[mcp_types.CallToolRequest]
-    request = mcp_types.CallToolRequest(
-        method="tools/call",
-        params=mcp_types.CallToolRequestParams(name=name, arguments=arguments or {}),
-    )
-    return asyncio.run(handler(request)).root
+    async def _go() -> Any:
+        async with Client(server) as client:
+            return await client.call_tool(name, arguments or {})
+
+    return asyncio.run(_go())
 
 
 def _assert_identical(first: bytes, second: bytes, label: str) -> None:
@@ -351,7 +356,7 @@ def _assert_args_cover_every_tool(server: Any) -> None:
 
     gaps: list[str] = []
     for tool in asyncio.run(server.list_tools()):
-        required = set(tool.inputSchema.get("required", []))
+        required = set(tool.input_schema.get("required", []))
         supplied = set(_ARGS.get(tool.name, {}))
         if not required <= supplied:
             gaps.append(f"{tool.name} needs {sorted(required - supplied)}")
@@ -388,7 +393,7 @@ def test_every_registered_tool_answers_in_demo_mode_without_binding(
     failures: list[str] = []
     for name in ordered:
         result = _call(server, name, _ARGS.get(name))
-        if result.isError:
+        if result.is_error:
             detail = result.content[0].text if result.content else "<no content>"
             failures.append(f"{name}: {detail[:160]}")
 
@@ -437,16 +442,16 @@ def test_watermark_is_present_in_both_wire_copies_of_every_tool_result(
     unmarked_text: list[str] = []
     for name in ordered:
         result = _call(server, name, _ARGS.get(name))
-        assert not result.isError, name
+        assert not result.is_error, name
 
-        structured = result.structuredContent
+        structured = result.structured_content
         if not (isinstance(structured, dict) and structured.get("demo_mode") is True):
             unmarked_structured.append(name)
         elif "SYNTHETIC" not in _banner(structured):
             unmarked_structured.append(f"{name} (no banner sentence)")
 
         text = result.content[0].text if result.content else ""
-        if '"demo_mode": true' not in text or "SYNTHETIC" not in text:
+        if not text or json.loads(text).get("demo_mode") is not True or "SYNTHETIC" not in text:
             unmarked_text.append(name)
 
     assert unmarked_structured == []
@@ -469,15 +474,15 @@ def test_write_refusals_carry_the_watermark_too(
 
     for name in _WRITE_TOOLS:
         result = _call(server, name, _ARGS[name])
-        assert not result.isError, f"{name} must REFUSE, not raise"
+        assert not result.is_error, f"{name} must REFUSE, not raise"
 
-        structured = result.structuredContent
+        structured = result.structured_content
         assert isinstance(structured, dict), name
         assert structured["demo_mode"] is True, name
         assert "SYNTHETIC" in _banner(structured), name
 
         text = result.content[0].text
-        assert '"demo_mode": true' in text, name
+        assert json.loads(text).get("demo_mode") is True, name
         assert "SYNTHETIC" in text, name
 
 
@@ -503,9 +508,9 @@ def test_write_tools_refuse_and_no_write_ever_reaches_the_cloud(
 
     for name, refusing_method in _WRITE_TOOLS.items():
         result = _call(server, name, _ARGS[name])
-        structured = result.structuredContent
+        structured = result.structured_content
 
-        assert result.isError is False, f"{name} raised instead of refusing"
+        assert result.is_error is False, f"{name} raised instead of refusing"
         assert structured["ok"] is False, name
         assert structured["error"] == "demo_mode_is_read_only", name
         assert structured["tool"] == refusing_method, name
@@ -535,105 +540,16 @@ def test_the_recording_cloud_is_actually_wired_in(
     """
 
     monkeypatch.delenv(DEMO_ENV, raising=False)
-    server = _build_server(tmp_path, monkeypatch)
-
-    # Open a session first so `poll_binding` has a poll_id to ask about;
-    # without one it refuses locally and never reaches the client.
-    _call(server, "vaultbeat_start_binding", _ARGS.get("vaultbeat_start_binding"))
-    _call(server, "vaultbeat_poll_binding", _ARGS.get("vaultbeat_poll_binding"))
+    # Pairing left the tool surface in 0.9.0 (it is `vaultbeat-apple-health bind`
+    # now), so the witness drives the same service methods that command uses.
+    service = service_module.VaultbeatLocalService(ConfigStore(tmp_path / "config.json"))
+    service.start_binding(server_name="witness")
+    asyncio.run(service.poll_once())
 
     assert "poll_binding" in recording_cloud.calls, (
         "the fake cloud client is no longer substituted in — every "
         "`recording_cloud.calls == []` assertion in this file is now vacuous"
     )
-
-
-# ── 3b. Pairing refuses, and the disk is untouched ───────────────────────────
-
-
-#: The two tools that must refuse for the OPPOSITE reason to the write tools:
-#: not "demo mode has no account to write to", but "demo mode needs no account".
-#: Both write disk on the way through — `start_binding` calls
-#: `store.ensure_initialized` (config.json + the 0600 identity.key) and
-#: `poll_binding` overwrites the credentials on success.
-_PAIRING_TOOLS = ("vaultbeat_start_binding", "vaultbeat_poll_binding")
-
-
-def test_pairing_tools_refuse_in_demo_and_write_nothing_to_disk(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, demo_on: None
-) -> None:
-    """Two claims, and the second is the one that needed a new kind of assertion.
-
-    The return value proves the tool answered. It proves nothing about whether
-    a keypair was minted and a config file written on the way to answering —
-    an implementation that ran the body and then stamped the result would pass
-    a return-value-only check while leaving both artefacts behind. So this
-    asserts the FILESYSTEM, which is a statement about what happened rather
-    than about what was said. Same reasoning as
-    `test_write_tools_refuse_and_no_write_ever_reaches_the_cloud` recording the
-    wire instead of trusting the answer.
-
-    Why it matters more here than for the write tools: a demo `log_*` that
-    leaked would post synthetic data to a real account, which is loud. A demo
-    `start_binding` that leaked is silent in both directions — on a fresh
-    machine it leaves a real key behind after a "look what this does" run, and
-    on a paired one it rewrites `poll_id` and invalidates a QR the user is
-    looking at (Invariant 54), while the same session's `doctor` goes on
-    reporting demo mode as holding no key.
-    """
-
-    config_path = tmp_path / "config.json"
-    server = _build_server(tmp_path, monkeypatch)
-
-    # The premise of the disk assertion below. If constructing the server had
-    # already written a config, "still absent afterwards" would be vacuous.
-    assert not config_path.exists(), "premise broken: config existed before any tool ran"
-
-    for name in _PAIRING_TOOLS:
-        result = _call(server, name, _ARGS.get(name))
-
-        assert result.isError is False, f"{name} raised instead of refusing"
-        structured = result.structuredContent
-        assert isinstance(structured, dict), name
-        assert structured["ok"] is False, name
-        # The specific code, not just any refusal: it proves the call went
-        # through the pairing branch rather than failing for some other reason
-        # (an unbound machine refuses plenty of things).
-        assert structured["error"] == "demo_mode_needs_no_pairing", name
-        assert structured["tool"] == name, name
-        assert DEMO_ENV in structured["detail"], name
-        assert "SYNTHETIC" in _banner(structured), name
-
-    # The claim the return values cannot make.
-    assert not config_path.exists(), "demo mode wrote a config file"
-    assert not (tmp_path / "identity.key").exists(), "demo mode minted an identity key"
-    assert sorted(q.name for q in tmp_path.iterdir()) == [], "demo mode left files behind"
-
-
-def test_pairing_tools_still_write_when_demo_is_off(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The control. Without it the test above passes for the wrong reason.
-
-    A typo in a tool name, a decorator that silently dropped its body, or a
-    `blocked_in_demo` that blocked everything would all leave the disk clean —
-    and "clean disk" is exactly what the previous test calls success. This
-    pins that the untouched filesystem is demo mode's doing and not the
-    harness's, by running the same tool with demo OFF and requiring the write
-    it is supposed to make.
-    """
-
-    config_path = tmp_path / "config.json"
-    monkeypatch.delenv(DEMO_ENV, raising=False)
-    server = _build_server(tmp_path, monkeypatch)
-
-    result = _call(server, "vaultbeat_start_binding", _ARGS.get("vaultbeat_start_binding"))
-
-    assert result.isError is False
-    structured = result.structuredContent
-    assert isinstance(structured, dict)
-    assert structured.get("poll_id"), "real mode must open a pairing session"
-    assert config_path.exists(), "real mode must persist the session it just opened"
 
 
 # ── 4. The demo covers the whole product — the anti-rot guard ────────────────
@@ -708,7 +624,7 @@ def test_two_independent_services_produce_byte_identical_output(
     def render(directory: Path) -> bytes:
         server = _build_server(directory, monkeypatch)
         payload = {
-            name: _call(server, name, _ARGS.get(name)).structuredContent
+            name: _call(server, name, _ARGS.get(name)).structured_content
             for name in _read_tool_names(server)
         }
         return json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
@@ -792,9 +708,8 @@ def test_a_full_read_pass_writes_nothing_to_disk(
 
     server = _build_server(tmp_path, monkeypatch)
     for name in _read_tool_names(server):
-        assert not _call(server, name, _ARGS.get(name)).isError, name
-    for name in ("vaultbeat_status", "vaultbeat_doctor"):
-        assert not _call(server, name).isError, name
+        assert not _call(server, name, _ARGS.get(name)).is_error, name
+    assert not _call(server, "vaultbeat_doctor").is_error
 
     assert snapshot() == before
     assert not config_path.exists()
@@ -818,7 +733,8 @@ def test_status_still_reports_unbound_in_demo_mode(
     """
 
     server = _build_server(tmp_path, monkeypatch)
-    status = _call(server, "vaultbeat_status").structuredContent
+    # `vaultbeat_status` was folded into the doctor's `binding` block in 0.9.0.
+    status = _call(server, "vaultbeat_doctor").structured_content["binding"]
 
     assert status["demo_mode"] is True
     assert status["bound"] is False
@@ -864,7 +780,8 @@ def test_the_real_binding_facts_win_over_anything_the_demo_block_says(
     )
 
     server = _build_server(tmp_path, monkeypatch)
-    status = _call(server, "vaultbeat_status").structuredContent
+    # `vaultbeat_status` was folded into the doctor's `binding` block in 0.9.0.
+    status = _call(server, "vaultbeat_doctor").structured_content["binding"]
 
     assert status["bound"] is False, "a demo block must never be able to claim a binding"
     assert status["initialized"] is False
@@ -890,7 +807,7 @@ def test_doctor_does_not_report_a_round_trip_it_never_made(
     """
 
     server = _build_server(tmp_path, monkeypatch)
-    report = _call(server, "vaultbeat_doctor").structuredContent
+    report = _call(server, "vaultbeat_doctor").structured_content
 
     assert report["demo_mode"] is True
     checked = {check["name"] for check in report["checks"]}
@@ -945,11 +862,11 @@ def test_the_wrapper_and_the_service_share_one_demo_decision(
     # One value, two consumers. The wrapper is only installed when demo mode is
     # on, so "is this tool wrapped" and "does the service serve demo data" must
     # agree — that agreement is what a mid-session flip used to break.
-    tool_fn = server._tool_manager.get_tool("get_activity").fn
+    tool_fn = server._tool_manager.get_tool("get_metric").fn
     assert hasattr(tool_fn, "__wrapped__"), "demo mode must install the wrapper"
     assert service._demo is True
 
-    result = _call(server, "get_activity").structuredContent
+    result = _call(server, "get_metric").structured_content
     assert result["demo_mode"] is True
 
 
@@ -1029,12 +946,10 @@ def test_two_services_with_different_modes_coexist_in_one_process(
 
 
 _ALL_DEMO_TOOLS = (
-    "vaultbeat_status",
     "vaultbeat_doctor",
-    "get_activity",
+    "get_metric",
+    "get_intraday",
     "get_sleep_detail",
-    "get_basal_energy",
-    "get_total_energy_burned",
     "log_note",
 )
 
@@ -1088,8 +1003,8 @@ def test_the_banner_travels_under_exactly_one_key(
     is not a cosmetic split — it is a surface whose banner never prints."""
 
     server = _build_server(tmp_path, monkeypatch)
-    for tool_name in ("vaultbeat_status", "vaultbeat_doctor", "get_activity"):
-        structured = _call(server, tool_name).structuredContent
+    for tool_name in ("vaultbeat_doctor", "get_metric"):
+        structured = _call(server, tool_name).structured_content
         assert "demo_banner" not in structured, tool_name
         assert "demo_warning" in structured, tool_name
 
@@ -1105,20 +1020,29 @@ def test_every_read_tool_marks_the_rows_it_returns(
 
     The top-level banner covers a result quoted whole; it does not survive one
     row being lifted out. Most tools self-identify via `owner_user_id`
-    (`demo0001-…`), but `get_basal_energy` and `get_total_energy_burned` build
-    fresh dicts and drop that field, so their rows were indistinguishable from
-    real ones.
+    (`demo0001-…`), but the basal and TDEE rows were built fresh without that
+    field (as `get_basal_energy` / `get_total_energy_burned`, before those were
+    folded into `get_metric`), so their rows were indistinguishable from real ones.
     """
 
     server = _build_server(tmp_path, monkeypatch)
     checked = 0
-    for tool_name in (
-        "get_basal_energy",
-        "get_total_energy_burned",
-        "get_activity",
-        "get_sleep_detail",
+    for tool_name, args in (
+        # basal and TDEE are the two whose rows never carried `owner_user_id`;
+        # through `get_metric` every point is a fresh dict of the same kind.
+        ("get_metric", {"series": ["basal_energy", "total_energy", "steps"], "days": 14}),
+        ("get_metric", {"series": "resting_hr", "days": 60, "granularity": "week"}),
+        ("get_intraday", {}),
+        ("get_sleep_detail", {}),
     ):
-        structured = _call(server, tool_name).structuredContent
+        structured = _call(server, tool_name, args).structured_content
+        if "columns" in structured and "rows" in structured:
+            # `get_intraday` is one table: the mark is a `synthetic` column.
+            assert structured["rows"], f"{tool_name}: no rows to check"
+            mark = structured["columns"].index("synthetic")
+            assert all(row[mark] is True for row in structured["rows"]), f"{tool_name} row unmarked"
+            checked += 1
+            continue
         for key, value in structured.items():
             if not isinstance(value, list) or not value:
                 continue
@@ -1128,6 +1052,16 @@ def test_every_read_tool_marks_the_rows_it_returns(
             checked += 1
             for row in rows:
                 assert row.get("synthetic") is True, f"{tool_name}.{key} row unmarked"
+                # `get_metric`'s values sit one level down and are what gets quoted.
+                for nested in ("points", "buckets"):
+                    table = row.get(nested)
+                    if not table:
+                        continue
+                    # Tables since 2026-10-02: the mark is a `synthetic` column.
+                    mark = table["columns"].index("synthetic")
+                    for inner in table["rows"]:
+                        checked += 1
+                        assert inner[mark] is True, f"{tool_name}.{key}[].{nested} row unmarked"
     assert checked >= 4, "expected to have checked several row lists"
 
 
@@ -1187,7 +1121,7 @@ def test_demo_wording_tells_the_agent_not_to_persist_silently(
 
     # And the short one really does ride a result, rather than only existing.
     server = _build_server(tmp_path, monkeypatch)
-    assert "Do not save" in _banner(_call(server, "get_activity").structuredContent)
+    assert "Do not save" in _banner(_call(server, "get_metric").structured_content)
 
 
 # ── 13. `status` survives an unreadable key, and says where numbers come from ─
@@ -1331,7 +1265,7 @@ def test_the_demo_decision_is_read_once_and_passed_down(
     server = _build_server(tmp_path, monkeypatch)
 
     assert calls["n"] >= 2, "expected the stub to be consulted more than once"
-    wrapper_installed = hasattr(server._tool_manager.get_tool("get_activity").fn, "__wrapped__")
+    wrapper_installed = hasattr(server._tool_manager.get_tool("get_metric").fn, "__wrapped__")
     assert wrapper_installed is True, "the first read said demo; the tools must be wrapped"
     assert built[0]._demo is True, (
         "the service re-read the environment instead of being handed the decision"

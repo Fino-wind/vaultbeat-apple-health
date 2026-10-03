@@ -1,6 +1,6 @@
 """LocalRecordCache + service cache-wiring tests.
 
-The cache is the CLAUDE.md "MCP Local Server Performance" fix: within the TTL a
+The cache is the "MCP Local Server Performance" fix (docs/sync-egress-redesign.md): within the TTL a
 repeat query must answer from local plaintext with ZERO cloud round trips, and
 `fresh=True` must force one. Reuses `FakeCloudClient` / `_make_envelope` from
 test_service so the envelopes are real E2EE ciphertext, not stubs.
@@ -71,7 +71,7 @@ def test_metric_keys_are_isolated_and_narrow_server_side(tmp_path: Path) -> None
     ]
 
     water = asyncio.run(service.water_intake_summary())
-    sleep = asyncio.run(service.sleep_records())
+    sleep = asyncio.run(service.sleep_detail_records())
     water_again = asyncio.run(service.water_intake_summary())
 
     assert water["day_count"] == 1
@@ -287,3 +287,79 @@ def test_menstrual_summary_reuses_cache_across_internal_queries(tmp_path: Path) 
 
     assert first_round == ["menstrual", "wrist_temp"]
     assert cloud.sync_calls == first_round  # second call fully cache-served
+
+
+def test_clear_also_removes_interrupted_write_temps(tmp_path: Path) -> None:
+    """A temp holds decrypted plaintext too; rebinding must not leave it behind."""
+    from vaultbeat_mcp_local.cache import LocalRecordCache
+
+    cache = LocalRecordCache(tmp_path)
+    (tmp_path / "records-sleep.json").write_text("{}")
+    (tmp_path / "records-activity.json.tmp-3741-717ba21d").write_text("{}")
+    cache.clear()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_abandoned_temps_are_swept_on_start_but_fresh_ones_are_not(tmp_path: Path) -> None:
+    import os
+    import time
+
+    from vaultbeat_mcp_local.cache import LocalRecordCache
+
+    old = tmp_path / "records-sleep.json.tmp-1-aaaaaaaa"
+    fresh = tmp_path / "records-hrv.json.tmp-2-bbbbbbbb"
+    kept = tmp_path / "records-sleep.json"
+    for path in (old, fresh, kept):
+        path.write_text("{}")
+    an_hour_ago = time.time() - 3600
+    os.utime(old, (an_hour_ago, an_hour_ago))
+
+    LocalRecordCache(tmp_path)
+
+    assert not old.exists(), "a temp older than any live write is abandoned"
+    assert fresh.exists(), "a concurrent writer's in-flight temp must survive"
+    assert kept.exists()
+
+
+def test_the_newest_starting_fetch_wins_the_cache_across_processes(tmp_path: Path) -> None:
+    """Review V5: two MCP processes share one pairing (two Claude Code sessions).
+    A plain read that BEGAN before the other process's write and finished after
+    it must not replace the cache that write's re-read left — while the writer's
+    re-read must still beat an older fetch that merely finished later."""
+    cache = LocalRecordCache(tmp_path, ttl_seconds=3600)
+    path = tmp_path / "records-strength.json"
+
+    cache.save([{"v": "written"}], server_id="s", metric_type="strength", started_at=2000.0)
+    cache.save([{"v": "stale"}], server_id="s", metric_type="strength", started_at=1000.0)
+    assert json.loads(path.read_text())["records"] == [{"v": "written"}], "a fetch begun earlier lost"
+
+    cache.save([{"v": "newer"}], server_id="s", metric_type="strength", started_at=3000.0)
+    assert json.loads(path.read_text())["records"] == [{"v": "newer"}]
+
+
+def test_a_committed_write_expires_its_kind_but_keeps_the_rows(tmp_path: Path) -> None:
+    """Review V6: a write whose re-read failed left the pre-write snapshot
+    answering plain reads for the whole TTL. The kind now expires the moment
+    the write returns — the TTL read misses — while the digest path keeps its
+    rows, so the next read still fetches only what changed."""
+    service, cloud, public_key = _bound(tmp_path, ttl_seconds=3600)
+    cloud.envelopes = [_make_envelope(
+        public_key, _water_payload("water-1784505600", "2026-07-20T00:00:00Z", 0.5, 2), metric_type="water",
+    )]
+    asyncio.run(service.sync_decrypted_records(metric_type="water"))
+    server_id = service.store.require_bound().server_id or ""
+    assert service.cache.load(server_id=server_id, metric_type="water") is not None
+
+    async def accepted() -> dict[str, int]:
+        return {"upserted_blobs": 1}
+
+    generation_before = service._sync_generation.get("water", 0)
+    service._inflight_syncs["water"] = "a download begun before the write"  # type: ignore[assignment]
+    assert asyncio.run(service._committed("water", accepted())) == {"upserted_blobs": 1}
+    assert "water" not in service._inflight_syncs, "no plain read may join a pre-write download"
+
+    assert service.cache.load(server_id=server_id, metric_type="water") is None
+    persisted = service.cache.load_persisted(server_id=server_id, metric_type="water")
+    assert persisted is not None and len(persisted[0]) == 1
+    assert service._sync_generation.get("water", 0) == generation_before + 1, \
+        "a fetch begun before the write may no longer save"

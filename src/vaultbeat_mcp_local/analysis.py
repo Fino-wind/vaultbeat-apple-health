@@ -49,6 +49,7 @@ __all__ = [
     "compare_periods",
     "correlate",
     "daily_series",
+    "excluded_days",
     "series_catalog",
     "trend",
 ]
@@ -99,41 +100,179 @@ class SeriesSpec:
     ("higher is better") — the second is a verdict and does not belong here.
     """
 
+    exclude_when: tuple[str, ...] = ()
+    """Row flags that mean "this day's value is not a real day's value".
+
+    A row carrying any of these set truthy is dropped BEFORE bucketing and
+    reported by `excluded_days`. It exists for the kinds whose short days are
+    short because the DATA is short (Invariant 62 (coverage-before-average)):
+    basal energy on a day the Watch spent on the charger reads as a low
+    metabolism, and averaging it in drags every number built on it down — in
+    one direction only, so the error never cancels. The read method already
+    computes the flag; this is how the arithmetic layer honours it instead of
+    re-deriving a threshold of its own.
+    """
+
+    cumulative: bool = False
+    """True when a day's value is a total ACCUMULATED over that day.
+
+    Steps and energy accrue: a day's number is the sum of everything that
+    happened, and a half-finished day reads as a low day rather than a missing
+    one. Resting heart rate and VO2max are measurements of a state instead —
+    today's value does not grow as the day goes on, so a fresh one is as
+    complete as it will ever be.
+
+    The distinction is load-bearing for the reader, not decorative: on a
+    cumulative series the newest value is routinely a partial day and must not
+    be compared against completed ones, which is exactly the mistake an agent
+    makes when it reports "steps are down today" at 9am.
+    """
+
 
 #: Every quantity that is genuinely one-number-per-day.
 #:
-#: Kinds with an irreducibly richer shape (sleep stages, strength sets, food
+#: Sleep is present as per-night numbers read from `sleep_nights` (duration,
+#: timing, stages, awakenings, vitals); its night-by-night table is its own tool.
+#: Kinds with an irreducibly richer shape (strength sets, food
 #: entries, notes, symptoms, cycle, workouts) are deliberately ABSENT: flattening
 #: a workout into "duration" would answer a question nobody asked while hiding
 #: the ones they did. Their tools stay the way to read them.
 SERIES: tuple[SeriesSpec, ...] = (
-    SeriesSpec("sleep_minutes", "sleep_records", "daily_summary", "total_sleep_minutes", "minutes",
-               "higher means more time asleep that night"),
-    SeriesSpec("in_bed_minutes", "sleep_records", "daily_summary", "in_bed_minutes", "minutes"),
+    # 🔴 A night the Watch was not worn carries `total_sleep_minutes: 0` and
+    # `is_in_bed_only: true` — sleep was never MEASURED, not zero (Invariant 39
+    # (in-bed-is-not-zero)). The sleep tools have said so since 2026-07-27;
+    # this spec did not, so from 0.7.0 every average / trend / correlation over
+    # sleep counted those nights as zero sleep (2026-09-24: 18 of 400 nights,
+    # mean 416 → 435 min once excluded). Same shape as the wrist-temp note:
+    # the read tool knew, the series did not.
+    SeriesSpec("sleep_minutes", "sleep_nights", "nights", "asleep_minutes", "minutes",
+               "higher means more time asleep that night; nights the Watch was not worn are "
+               "excluded and listed, never read as zero",
+               exclude_when=("is_in_bed_only", "motion_inferred",)),
+    # ── Sleep structure and timing (2026-09-24) ─────────────────────────────
+    # Every one reads `sleep_nights`, the same rows `get_sleep_nights` prints,
+    # so `get_metric` fetches them in ONE decrypt and an average can always be
+    # checked against the nights it came from.
+    #
+    # Clock series are MINUTES FROM THE MIDNIGHT THAT OPENS THE WAKE DAY,
+    # negative before it: a clock time cannot be averaged as a clock time
+    # (23:50 and 00:10 average to noon). Stage series are excluded, not
+    # zeroed, on nights without stage detail (iPhone-only) — the same trap
+    # `sleep_minutes` fell into with unworn nights.
+    SeriesSpec("bedtime_minutes", "sleep_nights", "nights", "bedtime_minutes", "minutes from midnight",
+               "when sleep began, in minutes from the midnight opening the wake day: -30 = 23:30, "
+               "90 = 01:30. Averages across midnight correctly this way; convert back to a clock "
+               "time before telling the user. Days whose only main sleep began after 08:00 and "
+               "ended the same day (a daytime or evening nap) are excluded and listed",
+               exclude_when=("is_in_bed_only", "motion_inferred", "daytime_main_sleep")),
+    SeriesSpec("wake_minutes", "sleep_nights", "nights", "wake_minutes", "minutes from midnight",
+               "when the night's main sleep ended, minutes from that day's midnight (450 = 07:30)",
+               exclude_when=("is_in_bed_only", "motion_inferred", "daytime_main_sleep")),
+    SeriesSpec("sleep_midpoint_minutes", "sleep_nights", "nights", "midpoint_minutes", "minutes from midnight",
+               "halfway between bedtime and wake, minutes from midnight — the usual measure of "
+               "sleep timing; compare weekdays with weekends for social jet lag",
+               exclude_when=("is_in_bed_only", "motion_inferred", "daytime_main_sleep")),
+    SeriesSpec("deep_sleep_minutes", "sleep_nights", "nights", "deep_minutes", "minutes",
+               "Watch-staged nights only", exclude_when=("is_in_bed_only", "motion_inferred", "no_stage_detail")),
+    SeriesSpec("rem_sleep_minutes", "sleep_nights", "nights", "rem_minutes", "minutes",
+               "Watch-staged nights only", exclude_when=("is_in_bed_only", "motion_inferred", "no_stage_detail")),
+    SeriesSpec("core_sleep_minutes", "sleep_nights", "nights", "core_minutes", "minutes",
+               "Watch-staged nights only", exclude_when=("is_in_bed_only", "motion_inferred", "no_stage_detail")),
+    SeriesSpec("awake_in_sleep_minutes", "sleep_nights", "nights", "awake_minutes", "minutes",
+               "time scored awake inside the night's sleep; Watch-staged nights only",
+               exclude_when=("is_in_bed_only", "motion_inferred", "no_stage_detail")),
+    SeriesSpec("deep_sleep_percent", "sleep_nights", "nights", "deep_percent", "%",
+               "deep as a share of time asleep that night (0-100); average this rather than "
+               "dividing two averaged series", exclude_when=("is_in_bed_only", "motion_inferred", "no_stage_detail")),
+    SeriesSpec("rem_sleep_percent", "sleep_nights", "nights", "rem_percent", "%",
+               "REM as a share of time asleep that night (0-100)",
+               exclude_when=("is_in_bed_only", "motion_inferred", "no_stage_detail")),
+    SeriesSpec("awakenings", "sleep_nights", "nights", "awakenings", "count",
+               "awake intervals between the first and last asleep sample; waking for the day "
+               "is not counted. Watch-staged nights only",
+               exclude_when=("is_in_bed_only", "motion_inferred", "no_stage_detail")),
+    SeriesSpec("longest_sleep_bout_minutes", "sleep_nights", "nights", "longest_sleep_bout_minutes",
+               "minutes", "the longest run of sleep with no awake interval in it",
+               exclude_when=("is_in_bed_only", "motion_inferred", "no_stage_detail")),
+    SeriesSpec("sleep_24h_minutes", "sleep_nights", "nights", "total_sleep_24h_minutes", "minutes",
+               "ALL measured sleep that day — the main sleep plus naps and the other half of a "
+               "broken night. `sleep_minutes` is the main sleep alone",
+               exclude_when=("is_in_bed_only", "motion_inferred",)),
+    SeriesSpec("sleep_segments", "sleep_nights", "nights", "sleep_segments", "count",
+               "separate sleeps that day; 1 = one unbroken main sleep, 2+ = naps or a broken night",
+               exclude_when=("is_in_bed_only", "motion_inferred",)),
+    SeriesSpec("sleep_hr_mean", "sleep_nights", "nights", "sleep_hr_mean", "bpm",
+               "mean heart rate across the asleep stages of the night",
+               exclude_when=("is_in_bed_only", "motion_inferred",)),
+    SeriesSpec("sleep_rr_mean", "sleep_nights", "nights", "sleep_rr_mean", "breaths/min",
+               "mean respiratory rate across the asleep stages of the night",
+               exclude_when=("is_in_bed_only", "motion_inferred",)),
+    # `in_bed_minutes` was a series here until 2026-09-24 and is deliberately
+    # gone: it is the total of `inBed` samples, which a Watch night does not
+    # write, so it read 0 on 381 of 400 real nights and averaged to "18 minutes
+    # in bed" for September. It is not one number per night; it is the
+    # complement of sleep_minutes. The field stays on the sleep tools' rows,
+    # where it is read beside `is_in_bed_only` and means what it says.
     SeriesSpec("resting_hr", "resting_hr_records", "records", "bpm", "bpm"),
-    SeriesSpec("hrv_sdnn", "hrv_records", "records", "sdnn_ms", "ms"),
-    SeriesSpec("wrist_temp_delta", "wrist_temp_records", "records", "temperature_delta_celsius", "°C",
-               "a delta from the wearer's own baseline, so it is signed"),
-    SeriesSpec("vo2max", "vo2max_records", "records", "vo2_max_ml_kg_min", "mL/kg/min"),
+    SeriesSpec("hrv_sdnn", "hrv_records", "records", "sdnn_ms", "ms",
+               "a day's value is the mean of that day's samples; for the samples themselves "
+               "use get_intraday"),
+    # 🔴 Was `wrist_temp_delta` reading `temperature_delta_celsius`, with a note
+    # saying the value is "a delta from the wearer's own baseline, so it is
+    # signed". Both halves were false: that field carries the ABSOLUTE reading
+    # (byte-identical to `wrist_temperature_celsius` on every row checked,
+    # 2026-09-23), which the old `get_wrist_temp` docstring already admitted as
+    # a wire-contract misnomer. A cycle analysis reading 35.7 as a deviation
+    # would treat body temperature as a signal. Renamed rather than re-noted,
+    # because the NAME was the lie and the tool-name merge breaks callers anyway.
+    SeriesSpec("wrist_temp", "wrist_temp_records", "records", "wrist_temperature_celsius", "°C",
+               "absolute skin temperature measured during sleep (~35-37 °C), NOT a deviation "
+               "from baseline; derive a deviation yourself against the person's own recent mean"),
+    SeriesSpec("vo2max", "vo2max_records", "records", "vo2_max_ml_kg_min", "mL/kg/min",
+               "the Watch estimates this occasionally, so days with data can be weeks apart"),
     SeriesSpec("weight_kg", "weight_trend_summary", "days", "weight_kg", "kg"),
-    SeriesSpec("water_liters", "water_intake_summary", "days", "intake_liters", "L"),
-    SeriesSpec("steps", "activity_summary", "days", "step_count", "steps"),
-    SeriesSpec("active_energy", "activity_summary", "days", "active_energy_kcal", "kcal"),
-    SeriesSpec("exercise_minutes", "activity_summary", "days", "exercise_minutes", "minutes"),
-    SeriesSpec("stand_minutes", "activity_summary", "days", "stand_minutes", "minutes"),
-    SeriesSpec("distance_meters", "activity_summary", "days", "distance_meters", "m"),
-    SeriesSpec("basal_energy", "basal_energy_records", "daily", "basal_kcal", "kcal"),
-    SeriesSpec("mindfulness_minutes", "mindfulness_summary", "days", "total_minutes", "minutes"),
+    # Body composition rides on the same body blob as weight, but only a smart
+    # scale writes it — most days carry weight alone, so these series are
+    # sparser than weight_kg by nature, not by loss. They were reachable only
+    # through the per-kind weight tool until 0.9.0 folded that tool into
+    # get_metric; dropping them there would have taken away the one reason
+    # someone buys a body-fat scale.
+    SeriesSpec("body_fat_percent", "weight_trend_summary", "days", "body_fat_percent", "%",
+               "0-100; only days a smart scale measured it"),
+    SeriesSpec("bmi", "weight_trend_summary", "days", "bmi", "kg/m²",
+               "only days a smart scale or Apple Health recorded it"),
+    SeriesSpec("lean_body_mass_kg", "weight_trend_summary", "days", "lean_body_mass_kg", "kg",
+               "only days a smart scale measured it"),
+    SeriesSpec("water_liters", "water_intake_summary", "days", "intake_liters", "L", cumulative=True),
+    SeriesSpec("water_refills", "water_intake_summary", "days", "refill_count", "refills",
+               "water_liters = refills x the day's container size", cumulative=True),
+    SeriesSpec("water_container_liters", "water_intake_summary", "days", "container_volume_liters", "L",
+               "the container size set for that day, not an amount drunk"),
+    SeriesSpec("steps", "activity_summary", "days", "step_count", "steps", cumulative=True),
+    SeriesSpec("active_energy", "activity_summary", "days", "active_energy_kcal", "kcal", cumulative=True),
+    SeriesSpec("exercise_minutes", "activity_summary", "days", "exercise_minutes", "minutes", cumulative=True),
+    SeriesSpec("stand_minutes", "activity_summary", "days", "stand_minutes", "minutes", cumulative=True),
+    SeriesSpec("distance_meters", "activity_summary", "days", "distance_meters", "m", cumulative=True),
+    SeriesSpec("basal_energy", "basal_energy_records", "daily", "basal_kcal", "kcal",
+               "days the Watch covered fewer than the threshold of hourly buckets are excluded "
+               "and listed, never averaged in",
+               exclude_when=("incomplete",), cumulative=True),
+    SeriesSpec("total_energy", "total_energy_records", "days", "total_kcal", "kcal",
+               "basal + active per day (TDEE); days with no or short basal coverage and today "
+               "are excluded and listed",
+               exclude_when=("partial", "basal_missing", "basal_incomplete"), cumulative=True),
+    SeriesSpec("mindfulness_minutes", "mindfulness_summary", "days", "total_minutes", "minutes", cumulative=True),
+    SeriesSpec("mindfulness_sessions", "mindfulness_summary", "days", "session_count", "sessions", cumulative=True),
 )
 
 _BY_NAME = {spec.name: spec for spec in SERIES}
 
 
-def series_catalog() -> list[dict[str, str]]:
+def series_catalog() -> list[dict[str, Any]]:
     """The self-describing list an agent should read before guessing a name."""
 
     return [
-        {"series": s.name, "unit": s.unit, "read_with": s.method.replace("_records", "").replace("_summary", ""),
+        {"series": s.name, "unit": s.unit, "cumulative": s.cumulative,
          **({"note": s.direction_note} if s.direction_note else {})}
         for s in SERIES
     ]
@@ -181,6 +320,8 @@ def daily_series(summary: dict[str, Any], spec: SeriesSpec) -> tuple[dict[str, f
         day = _day_of(row)
         if day is None or not isinstance(row, dict):
             continue
+        if any(row.get(flag) for flag in spec.exclude_when):
+            continue
         value = row.get(spec.field)
         # bool is an int subclass; a True here would silently become 1.0.
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -193,13 +334,28 @@ def daily_series(summary: dict[str, Any], spec: SeriesSpec) -> tuple[dict[str, f
     return {day: sum(vs) / len(vs) for day, vs in buckets.items()}, consumed
 
 
-def _span_days(days: list[str]) -> int | None:
-    if not days:
-        return None
-    try:
-        return (date.fromisoformat(days[-1]) - date.fromisoformat(days[0])).days + 1
-    except ValueError:
-        return None
+def excluded_days(summary: dict[str, Any], spec: SeriesSpec) -> list[dict[str, str]]:
+    """The days `daily_series` dropped on purpose, each with the flag that dropped it.
+
+    Named rather than counted: the caller is an LLM that cannot see the days it
+    did not receive, and "averaged over 11 days" is indistinguishable from a
+    wrong answer unless it can see which days went where and why.
+    """
+
+    if not spec.exclude_when:
+        return []
+    rows = summary.get(spec.array)
+    if not isinstance(rows, list):
+        return []
+    out: list[dict[str, str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        day = _day_of(row)
+        reason = next((flag for flag in spec.exclude_when if row.get(flag)), None)
+        if day is not None and reason is not None:
+            out.append({"day": day, "reason": reason})
+    return out
 
 
 def _linear_fit(xs: list[float], ys: list[float]) -> tuple[float, float] | None:
@@ -270,9 +426,31 @@ def trend(points: dict[str, float], spec: SeriesSpec) -> dict[str, Any]:
 
     fit = _linear_fit(xs, values)
     result["slope_per_day"] = fit[0] if fit else None
-    result["change"] = values[-1] - values[0]
-    result["change_pct"] = (
-        ((values[-1] - values[0]) / abs(values[0]) * 100.0) if values[0] else None
+    # 🔴 `change` is the FITTED line's rise across the window, not last day minus
+    # first day. It used to be the latter, and one short night on the first day
+    # of a window reported "+54 min, +18.7%" beside a slope of -2.8 min/day
+    # (2026-09-24, real data) — a sentence with the direction reversed. Two
+    # single days are the noisiest numbers in the series; the fit is what the
+    # whole window says. The raw difference survives, named for what it is.
+    if fit:
+        start = fit[1] + fit[0] * xs[0]
+        end = fit[1] + fit[0] * xs[-1]
+        result["change"] = end - start
+        # A percentage of a baseline near zero is arithmetic, not information
+        # (a fitted start of 0.17 gives "+5400%"). Below 5% of the window's
+        # own mean the baseline is too close to zero to divide by.
+        mean = result["mean"] or 0.0
+        result["change_pct"] = (
+            (end - start) / abs(start) * 100.0 if abs(start) >= 0.05 * abs(mean) and start else None
+        )
+    else:
+        result["change"] = None
+        result["change_pct"] = None
+    result["endpoint_difference"] = values[-1] - values[0]
+    result["change_note"] = (
+        "`change` / `change_pct` are the fitted line's rise over the window. "
+        "`endpoint_difference` is last day minus first day — two single days, "
+        "so one unusual night at either end can give it the opposite sign."
     )
     return result
 

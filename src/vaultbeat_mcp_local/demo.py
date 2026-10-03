@@ -908,6 +908,34 @@ def _build_vo2max(rng: random.Random) -> list[DecryptedRecord]:
     return out
 
 
+def _build_profile(rng: random.Random) -> list[DecryptedRecord]:
+    """`{profileID, biologicalSex, sexSource, dateOfBirth, heightCm}` — owner only, ONE record.
+
+    A profile is one row per person, not a series, so there is exactly one.
+    Values are fixed (the rng is unused on purpose): nothing about a demo
+    person's height should change between runs.
+    """
+
+    del rng
+    day = _day(0)
+    payload = {
+        "profileID": "profile-demo0000",
+        "biologicalSex": "female",
+        "sexSource": "apple_health",
+        "dateOfBirth": "1997-04-18",
+        "heightCm": 166.0,
+    }
+    return [
+        _record(
+            "profile",
+            "current",
+            owner=DEMO_OWNER_ID,
+            payload=payload,
+            created_at=_uploaded(day),
+        )
+    ]
+
+
 def _build_basal_energy(rng: random.Random) -> list[DecryptedRecord]:
     """`{sampleID, sampleStartDate, basalEnergyKcal}` — owner only, hourly, 30 days.
 
@@ -1018,6 +1046,42 @@ def _build_symptom(rng: random.Random) -> list[DecryptedRecord]:
                     created_at=_uploaded(day),
                 )
             )
+    out.extend(_build_reported_symptoms())
+    return out
+
+
+def _build_reported_symptoms() -> list[DecryptedRecord]:
+    """Self-reported episodes (`log_symptom`, GitHub #3) under the same kind.
+
+    One blob each, keyed by `entryID`, so the `reported` half of `get_symptoms`
+    is demonstrable. One has an end and one does not, because `end_recorded` is
+    the field that matters. Local wall-clock times, for the reason `_local_dt`
+    gives.
+    """
+
+    out: list[DecryptedRecord] = []
+    for back, symptom_type, name, onset_hour, end_hour, triggers in (
+        (4, "headache", "Headache", 15, 18.5, ["short_sleep"]),
+        (1, "heartburn", "Heartburn after dinner", 21, None, ["late_heavy_dinner"]),
+    ):
+        day = _day(back)
+        entry: dict[str, Any] = {
+            "entryID": f"symptom-demo{back:028d}",
+            "symptomType": symptom_type,
+            "displayName": name,
+            "severity": "mild",
+            "localDate": day.isoformat(),
+            "onsetAt": _iso(_local_dt(day, onset_hour)),
+            "triggers": triggers,
+            "createdAt": _iso(_local_dt(day, onset_hour)),
+            "updatedAt": _iso(_local_dt(day, end_hour or onset_hour)),
+        }
+        if end_hour is not None:
+            entry["endAt"] = _iso(_local_dt(day, end_hour))
+        out.append(
+            _record("symptom", f"{day.isoformat()}-r", owner=DEMO_OWNER_ID, payload=entry,
+                    created_at=_uploaded(day))
+        )
     return out
 
 
@@ -1296,6 +1360,7 @@ _BUILDERS: dict[str, Callable[[random.Random], list[DecryptedRecord]]] = {
     "note": _build_note,
     "strength": _build_strength,
     "food": _build_food,
+    "profile": _build_profile,
 }
 
 
