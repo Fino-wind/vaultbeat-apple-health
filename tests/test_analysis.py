@@ -141,7 +141,9 @@ def test_trend_reports_endpoints_and_spread() -> None:
     assert result["median"] == pytest.approx(20.0)
     assert result["min"] == 10.0
     assert result["max"] == 30.0
-    assert result["change_pct"] == pytest.approx(100.0)
+    # The fitted line runs 15 → 25 (+10, +66.7%); last minus first is 10 too, by coincidence.
+    assert result["change_pct"] == pytest.approx(66.6667, rel=1e-3)
+    assert result["endpoint_difference"] == pytest.approx(10.0)
 
 
 def test_two_points_refuse_a_slope_and_say_why() -> None:
@@ -312,7 +314,7 @@ def test_every_series_returns_days_through_the_real_service(
 
     service = _demo_service(tmp_path, monkeypatch)
     for spec in SERIES:
-        result = asyncio.run(service.metric_trend(series=spec.name, days=7))
+        result = asyncio.run(service.metric_trend(series=spec.name, days=7, owner="demo0001"))
         assert result.get("coverage"), f"{spec.name}: no coverage block"
         assert result["coverage"]["days_covered"] > 0, (
             f"{spec.name}: resolved to zero days — check `array`/`field` against "
@@ -369,7 +371,7 @@ def test_a_busy_sampling_kind_still_fills_the_requested_window(
         total_days=60, samples_per_day=6, calls=calls
     )
 
-    result = asyncio.run(service.metric_trend(series="hrv_sdnn", days=30))
+    result = asyncio.run(service.metric_trend(series="hrv_sdnn", days=30, owner="demo0001"))
     coverage = result["coverage"]
 
     assert coverage["days_covered"] == 30, (
@@ -401,7 +403,7 @@ def test_a_short_history_stops_asking_instead_of_widening_to_the_cap(
         total_days=10, samples_per_day=6, calls=calls
     )
 
-    result = asyncio.run(service.metric_trend(series="hrv_sdnn", days=30))
+    result = asyncio.run(service.metric_trend(series="hrv_sdnn", days=30, owner="demo0001"))
     coverage = result["coverage"]
 
     assert coverage["days_covered"] == 10, "it must not invent the days it could not find"
@@ -415,7 +417,7 @@ def test_an_unknown_series_answers_with_the_available_ones(
     """An agent that guessed wrong needs the list, not a traceback."""
 
     service = _demo_service(tmp_path, monkeypatch)
-    result = asyncio.run(service.metric_trend(series="blood_pressure", days=7))
+    result = asyncio.run(service.metric_trend(series="blood_pressure", days=7, owner="demo0001"))
     assert result["error"] == "unknown_series"
     assert {entry["series"] for entry in result["available_series"]} == {s.name for s in SERIES}
 
@@ -430,7 +432,7 @@ def test_correlation_coverage_describes_the_shared_days_only(
 
     service = _demo_service(tmp_path, monkeypatch)
     result = asyncio.run(
-        service.metric_correlate(series_a="sleep_minutes", series_b="vo2max", days=60)
+        service.metric_correlate(series_a="sleep_minutes", series_b="vo2max", days=60, owner="demo0001")
     )
     assert result["coverage"]["days_covered"] == result["n_pairs"]
     assert result["n_pairs"] <= min(result["n_days_a"], result["n_days_b"])
@@ -440,7 +442,7 @@ def test_compare_windows_do_not_overlap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service = _demo_service(tmp_path, monkeypatch)
-    result = asyncio.run(service.metric_compare_periods(series="resting_hr", days=7))
+    result = asyncio.run(service.metric_compare_periods(series="resting_hr", days=7, owner="demo0001"))
     recent, previous = result["recent"], result["previous"]
     assert previous["last_day"] < recent["first_day"], (
         "the two windows share a day, so the same reading is on both sides of the change"
@@ -453,7 +455,7 @@ def test_a_sparse_series_says_so_through_span_days(
     """`days` counts days WITH DATA, so span is the only thing that reveals sparsity."""
 
     service = _demo_service(tmp_path, monkeypatch)
-    result = asyncio.run(service.metric_trend(series="vo2max", days=30))
+    result = asyncio.run(service.metric_trend(series="vo2max", days=30, owner="demo0001"))
     coverage = result["coverage"]
     assert coverage["span_days"] is not None
     assert coverage["span_days"] >= coverage["days_covered"]
@@ -471,8 +473,8 @@ def test_analysis_results_never_carry_a_parallel_day_count(
 
     service = _demo_service(tmp_path, monkeypatch)
     for call in (
-        service.metric_trend(series="resting_hr", days=7),
-        service.metric_correlate(series_a="resting_hr", series_b="steps", days=7),
+        service.metric_trend(series="resting_hr", days=7, owner="demo0001"),
+        service.metric_correlate(series_a="resting_hr", series_b="steps", days=7, owner="demo0001"),
     ):
         result = asyncio.run(call)
         assert "n_days" not in result
@@ -488,7 +490,120 @@ def test_analysis_tools_do_not_reach_the_network_in_demo_mode(
 
     service = _demo_service(tmp_path, monkeypatch)
     result: dict[str, Any] = asyncio.run(
-        service.metric_correlate(series_a="steps", series_b="active_energy", days=14)
+        service.metric_correlate(series_a="steps", series_b="active_energy", days=14, owner="demo0001")
     )
     assert math.isfinite(result["pearson_r"] or 0.0)
     assert not (tmp_path / "config.json").exists()
+
+
+# ── Round 3 (2026-09-24): sources, sample floors, calendar windows ──────────
+
+
+def test_sources_are_named_by_device_or_app() -> None:
+    from vaultbeat_mcp_local.service import _source_label
+
+    # One Watch re-paired mints a new id; it is still one instrument.
+    assert _source_label("com.apple.health.648E151E-8D30-465F-BE19") == "apple"
+    assert _source_label("com.apple.health.F82C569E-DE96") == "apple"
+    assert _source_label("com.huawei.iossporthealth") == "huawei"
+    assert _source_label("com.ruguoapp.otterlife") == "otterlife"
+    assert _source_label("com.apple.Health") == "apple-health-app"
+
+
+def test_a_night_with_no_source_id_falls_back_to_how_it_was_recorded() -> None:
+    from vaultbeat_mcp_local.service import _sleep_source
+
+    inferred = [{"stage": "asleepUnspecified", "startDate": "2026-07-31T00:00:00Z",
+                 "endDate": "2026-07-31T08:00:00Z"}]
+    assert _sleep_source(inferred, "motionInferred") == "motion-inferred"
+    assert _sleep_source(inferred, "healthkitSleep") is None
+
+
+def test_source_summary_groups_interleaved_nights_per_source() -> None:
+    from vaultbeat_mcp_local.service import _source_summary
+
+    rows = [
+        {"local_date": "2026-03-01", "source": "apple", "is_in_bed_only": False},
+        {"local_date": "2026-03-02", "source": "otterlife", "is_in_bed_only": False},
+        {"local_date": "2026-03-03", "source": "apple", "is_in_bed_only": False},
+        {"local_date": "2026-03-04", "source": "otterlife", "is_in_bed_only": False},
+        {"local_date": "2026-03-05", "source": None, "is_in_bed_only": True},
+    ]
+    assert _source_summary(rows) == [
+        {"source": "apple", "first_day": "2026-03-01", "last_day": "2026-03-03", "nights": 2},
+        {"source": "otterlife", "first_day": "2026-03-02", "last_day": "2026-03-04", "nights": 2},
+    ]
+
+
+def test_calendar_window_selects_by_date_not_by_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _demo_service(tmp_path, monkeypatch)
+    everything = asyncio.run(service.metric_values(series="sleep_minutes", days=1000, owner="demo0001"))
+    days = sorted(p["date"] for p in everything["metrics"][0]["points"])
+    since, until = days[2], days[-3]
+
+    windowed = asyncio.run(service.metric_values(
+        series="sleep_minutes", since=since, until=until, owner="demo0001"))
+    got = sorted(p["date"] for p in windowed["metrics"][0]["points"])
+    assert got == [d for d in days if since <= d <= until]
+    assert windowed["range"] == {"since": since, "until": until}
+    cov = windowed["metrics"][0]["coverage"]
+    assert cov["more_available"] is True, "older days exist before `since`"
+    assert cov["window_satisfied"] is None
+
+    bad = asyncio.run(service.metric_values(series="sleep_minutes", since="2026-8-1"))
+    assert bad["error"] == "invalid_since"
+    backwards = asyncio.run(service.metric_values(series="sleep_minutes", since=until, until=since))
+    assert backwards["error"] == "invalid_range"
+
+
+def test_compare_two_named_periods(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _demo_service(tmp_path, monkeypatch)
+    everything = asyncio.run(service.metric_values(series="sleep_minutes", days=1000, owner="demo0001"))
+    days = sorted(p["date"] for p in everything["metrics"][0]["points"])
+    mid = days[len(days) // 2]
+
+    result = asyncio.run(service.metric_compare_periods(
+        series="sleep_minutes", owner="demo0001",
+        period=f"{mid}..", baseline=f"..{days[len(days) // 2 - 1]}"))
+    assert result["period"]["since"] == mid and result["baseline"]["until"] < mid
+    assert result["recent"]["n_days"] + result["previous"]["n_days"] == len(days)
+    # Both windows are open at one end, so the span they cover is open at both.
+    assert result["range"] == {"since": None, "until": None}
+
+    half = asyncio.run(service.metric_compare_periods(series="sleep_minutes", period=f"{mid}.."))
+    assert half["error"] == "invalid_periods"
+
+
+def test_correlate_with_a_lag_pairs_the_later_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_points(self: Any, spec: Any, **kw: Any) -> tuple[dict[str, float], int, dict[str, Any], None]:
+        if spec.name == "sleep_minutes":
+            return {"2026-09-01": 300.0, "2026-09-02": 400.0, "2026-09-03": 500.0, "2026-09-04": 350.0}, 4, {}, None
+        # HRV rises the day AFTER a long night, not the same day.
+        return {"2026-09-02": 30.0, "2026-09-03": 40.0, "2026-09-04": 50.0, "2026-09-05": 35.0}, 4, {}, None
+
+    monkeypatch.setattr(VaultbeatLocalService, "_analysis_points", fake_points)
+    service = VaultbeatLocalService.__new__(VaultbeatLocalService)
+    same_day = asyncio.run(service.metric_correlate(series_a="sleep_minutes", series_b="hrv_sdnn"))
+    next_day = asyncio.run(service.metric_correlate(series_a="sleep_minutes", series_b="hrv_sdnn", lag_days=1))
+    assert next_day["pearson_r"] == pytest.approx(1.0)
+    assert next_day["n_pairs"] == 4 and next_day["lag_days"] == 1
+    assert same_day["n_pairs"] == 3
+    bad = asyncio.run(service.metric_correlate(series_a="sleep_minutes", series_b="hrv_sdnn", lag_days=99))
+    assert bad["error"] == "invalid_lag_days"
+
+
+def test_exclusions_shared_by_every_series_are_listed_once() -> None:
+    from vaultbeat_mcp_local.service import _hoist_common_exclusions
+
+    unworn = {"day": "2026-09-02", "reason": "is_in_bed_only"}
+    nostage = {"day": "2026-09-14", "reason": "no_stage_detail"}
+    metrics = [
+        {"series": "bedtime_minutes", "excluded_days": [unworn]},
+        {"series": "deep_sleep_percent", "excluded_days": [unworn, nostage]},
+        {"series": "resting_hr"},
+    ]
+    assert _hoist_common_exclusions(metrics) == [unworn]
+    assert "excluded_days" not in metrics[0]
+    assert metrics[1]["excluded_days"] == [nostage]

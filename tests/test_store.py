@@ -8,6 +8,7 @@ import pytest
 
 from vaultbeat_mcp_local.crypto import generate_x25519_keypair, public_key_from_private
 from vaultbeat_mcp_local.store import (
+    DEFAULT_API_BASE_URL,
     ConfigError,
     ConfigStore,
     LocalServerConfig,
@@ -375,3 +376,38 @@ def test_a_config_with_no_reachable_key_names_all_three_locations(
     assert "system keyring" in message
     assert "identity.key" in message
     assert "DO NOT DELETE" in message
+
+
+def test_paired_config_on_the_supabase_address_moves_to_our_domain(
+    tmp_path: Path, fake_keychain: dict[tuple[str, str], str]
+) -> None:
+    """GitHub #28: the address is written at pairing and never again by an
+    upgrade, so the old Supabase default must be read as today's default — and
+    land in the file on the next write — while a deliberate override stays."""
+    private, public = generate_x25519_keypair()
+    paired = tmp_path / "paired.json"
+    write_secret_file(paired, json.dumps({
+        "api_base_url": "https://wjpnyxglgtmtgjuuhwru.supabase.co/functions/v1/",
+        "server_name": "Mac",
+        "private_key_base64": private,
+        "public_key_base64": public,
+    }) + "\n")
+    store = ConfigStore(paired)
+
+    loaded = store.load()
+    assert loaded is not None
+    assert loaded.api_base_url == DEFAULT_API_BASE_URL == "https://api.vaultbeat.app/functions/v1"
+
+    store.update(server_name="Mac")
+    assert json.loads(paired.read_text(encoding="utf-8"))["api_base_url"] == DEFAULT_API_BASE_URL
+
+    custom = tmp_path / "custom.json"
+    write_secret_file(custom, json.dumps({
+        "api_base_url": "http://127.0.0.1:54321/functions/v1",
+        "server_name": "Dev",
+        "private_key_base64": private,
+        "public_key_base64": public,
+    }) + "\n")
+    custom_loaded = ConfigStore(custom).load()
+    assert custom_loaded is not None
+    assert custom_loaded.api_base_url == "http://127.0.0.1:54321/functions/v1"

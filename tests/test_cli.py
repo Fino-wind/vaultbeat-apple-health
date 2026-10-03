@@ -85,7 +85,7 @@ def test_http_transport_alias_and_path_are_normalized() -> None:
     assert _normalize_http_path("") == "/mcp"
 
 
-def test_run_mcp_server_configures_http_transport_on_fastmcp_init(
+def test_run_mcp_server_configures_http_transport(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     captured: dict[str, Any] = {}
@@ -101,8 +101,9 @@ def test_run_mcp_server_configures_http_transport_on_fastmcp_init(
 
             return decorator
 
-        def streamable_http_app(self) -> Any:
+        def streamable_http_app(self, **kwargs: Any) -> Any:
             captured["streamable_http_app_called"] = True
+            captured["app_kwargs"] = kwargs
             return "ASGI_SENTINEL"
 
         def run(self, **kwargs: Any) -> None:
@@ -121,7 +122,7 @@ def test_run_mcp_server_configures_http_transport_on_fastmcp_init(
     # `FastMCP` at call time, and replacing `mcp.server.fastmcp` wholesale left
     # it a non-package, so any sibling the code imports (`prompts.base`) became
     # unimportable while the stub was in place.
-    monkeypatch.setattr("mcp.server.fastmcp.FastMCP", FakeFastMCP)
+    monkeypatch.setattr("mcp.server.mcpserver.MCPServer", FakeFastMCP)
 
     import uvicorn
 
@@ -150,11 +151,15 @@ def test_run_mcp_server_configures_http_transport_on_fastmcp_init(
     server_name = captured["init_args"][0]
     assert "Vaultbeat" in server_name
     assert "Sleep" not in server_name, "the name must not describe this as a sleep-only server"
-    assert captured["init_kwargs"]["host"] == "127.0.0.1"
-    assert captured["init_kwargs"]["port"] == 9000
-    assert captured["init_kwargs"]["streamable_http_path"] == "/custom-mcp"
-    assert captured["init_kwargs"]["json_response"] is False
-    assert captured["init_kwargs"]["stateless_http"] is False
+    # SDK 2.x: the server reports OUR version, and transport settings go to the
+    # HTTP app rather than the constructor.
+    from vaultbeat_mcp_local import __version__
+
+    assert captured["init_kwargs"]["version"] == __version__
+    assert captured["app_kwargs"]["host"] == "127.0.0.1"
+    assert captured["app_kwargs"]["streamable_http_path"] == "/custom-mcp"
+    assert captured["app_kwargs"]["json_response"] is False
+    assert captured["app_kwargs"]["stateless_http"] is False
     # HTTP transport is now served by uvicorn over streamable_http_app();
     # mcp.run() is reserved for the stdio path only.
     assert captured["streamable_http_app_called"] is True
@@ -353,3 +358,66 @@ def test_bind_success_states_the_seven_day_window_as_a_boundary() -> None:
     assert "7 days" in window
     assert "plan boundary" in window, "it has to say this is a plan, not a pending sync"
     assert "not a sync" in window
+
+
+def test_doctor_never_calls_an_account_with_empty_kinds_complete(
+    monkeypatch: Any, tmp_path: Path, capsys: Any
+) -> None:
+    """Only kinds an app DATE explains were ever flagged; everything else printed
+    "all N data types present" — to an account with no workouts at all. And a
+    kind the cloud did not answer for must say so, not vanish (GitHub #9)."""
+
+    class _Stub:
+        async def doctor(self) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "checks": [{"name": "binding", "ok": True, "detail": "ok"}],
+                "capabilities": {
+                    "available": True,
+                    "kinds_with_data": ["sleep"],
+                    "kinds_without_data": ["workout"],
+                    "possibly_needs_newer_app": {},
+                    "kinds_not_checked": ["water"],
+                    "not_checked_note": "Re-run the check to count them.",
+                    "note": "Kinds under kinds_without_data have nothing sealed for this server.",
+                },
+            }
+
+    monkeypatch.setattr(cli, "_service", lambda args: _Stub())
+    cli.main(["--config", str(tmp_path / "config.json"), "doctor"])
+    out = capsys.readouterr().out
+
+    assert "data types present" not in out
+    assert "No data yet: workout" in out
+    assert "Not counted this run: water" in out
+    assert "`owner`" not in out
+
+
+def test_doctor_lists_every_empty_kind_when_one_is_app_gated(
+    monkeypatch: Any, tmp_path: Path, capsys: Any
+) -> None:
+    """The plain empty kinds were printed in an `elif` after the app-gated block,
+    so one empty gated kind (strength) hid every other empty kind (water) from
+    the terminal while the JSON listed it (2026-10-03, #9)."""
+
+    class _Stub:
+        async def doctor(self) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "checks": [{"name": "binding", "ok": True, "detail": "ok"}],
+                "capabilities": {
+                    "available": True,
+                    "kinds_with_data": ["sleep"],
+                    "kinds_without_data": ["strength", "water"],
+                    "possibly_needs_newer_app": {"strength": "2026-07-19"},
+                    "note": "Kinds under kinds_without_data have nothing sealed for this server.",
+                },
+            }
+
+    monkeypatch.setattr(cli, "_service", lambda args: _Stub())
+    cli.main(["--config", str(tmp_path / "config.json"), "doctor"])
+    out = capsys.readouterr().out
+
+    assert "strength — one possible cause" in out
+    assert "also no data yet: water" in out
+    assert "data types present" not in out

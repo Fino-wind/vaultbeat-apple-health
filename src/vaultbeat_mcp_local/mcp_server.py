@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+from datetime import date as _date
 import hmac
 import inspect
 import ipaddress
@@ -8,11 +9,11 @@ import json
 from typing import Any, Callable, TypeVar, cast
 
 from vaultbeat_mcp_local import __version__
+from vaultbeat_mcp_local.app_paths import HEALTH_ACCESS, RESYNC
 from vaultbeat_mcp_local.demo import demo_enabled
 from vaultbeat_mcp_local.demo_watermark import watermark_demo_result
-from vaultbeat_mcp_local.analysis import series_catalog
 from vaultbeat_mcp_local.prompts import register_prompts, server_instructions
-from vaultbeat_mcp_local.service import VaultbeatLocalService
+from vaultbeat_mcp_local.service import PARTNER_EMPTY_HINT, VaultbeatLocalService
 from vaultbeat_mcp_local.store import ConfigStore
 
 _F = TypeVar("_F", bound=Callable[..., Any])
@@ -27,7 +28,7 @@ _F = TypeVar("_F", bound=Callable[..., Any])
 # worst mode (see `log_food_entry` vs `log_food_append`).
 #
 # The import is function-local on purpose. `run_mcp_server` deliberately imports
-# FastMCP lazily so a missing SDK produces a sentence instead of a traceback; a
+# MCPServer lazily so a missing SDK produces a sentence instead of a traceback; a
 # module-level `from mcp.types import ...` here would raise first and make that
 # whole guard dead code.
 
@@ -37,10 +38,13 @@ _F = TypeVar("_F", bound=Callable[..., Any])
 #: list as a gap in the product and go looking for `get_workout_trend`.
 _SERIES_CATALOG_NOTE = (
     "These are the quantities that are genuinely one number per day, which is what "
-    "trend / compare / correlate need. Kinds that are not here (sleep stages, "
-    "workouts, strength sets, food, notes, symptoms, menstrual cycle) are richer than "
-    "one number and are read with their own `get_*` tool — their absence from this "
-    "list is a design choice, not missing data."
+    "trend / compare / correlate need. Sleep is here as numbers (duration, bedtime, "
+    "wake, stage minutes and shares, awakenings, sleep vitals); the night-by-night "
+    "picture — naps, recording source, unworn or stage-less nights — is "
+    "`get_sleep_nights`. Kinds that are not here at all (workouts, strength sets, "
+    "food, notes, symptoms, menstrual cycle) are richer than one number and are read "
+    "with their own `get_*` tool — their absence from this list is a design choice, "
+    "not missing data."
 )
 
 
@@ -63,10 +67,10 @@ def _read_only_tool(*, open_world: bool = False) -> Any:
     from mcp.types import ToolAnnotations
 
     return ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=open_world,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=open_world,
     )
 
 
@@ -84,10 +88,10 @@ def _mutating_tool(*, destructive: bool, idempotent: bool = False) -> Any:
     from mcp.types import ToolAnnotations
 
     return ToolAnnotations(
-        readOnlyHint=False,
-        destructiveHint=destructive,
-        idempotentHint=idempotent,
-        openWorldHint=False,
+        read_only_hint=False,
+        destructive_hint=destructive,
+        idempotent_hint=idempotent,
+        open_world_hint=False,
     )
 
 
@@ -131,13 +135,13 @@ _DEMO_DOC_PREFIX = (
 def _demo_wrap(function: _F) -> _F:
     """Wrap one tool so its output is watermarked and its docstring says DEMO.
 
-    Two shapes, because this server has both: `vaultbeat_status` and
-    `vaultbeat_start_binding` are plain `def`, everything else is `async def`.
-    A single sync wrapper around a coroutine function would hand FastMCP a
+    Two shapes, because a tool may be either: plain `def` or `async def` (all
+    current tools are async; the sync branch stays for the next one that is not).
+    A single sync wrapper around a coroutine function would hand MCPServer a
     coroutine object as the tool's result — the tool would "succeed" and return
     something unserialisable.
 
-    `functools.wraps` is load-bearing beyond cosmetics: FastMCP builds each
+    `functools.wraps` is load-bearing beyond cosmetics: MCPServer builds each
     tool's JSON schema from `inspect.signature(fn)`, which follows the
     `__wrapped__` attribute wraps sets — so the published schema stays the real
     function's, not `(*args, **kwargs)`.
@@ -160,48 +164,8 @@ def _demo_wrap(function: _F) -> _F:
     return cast(_F, sync_wrapper)
 
 
-def _demo_block_wrap(function: _F, *, tool_name: str) -> _F:
-    """Wrap one tool so demo mode REFUSES it instead of running it.
-
-    The difference from `_demo_wrap` is the whole point: that one runs the tool
-    and stamps the answer, this one never calls the tool at all. For the two
-    pairing tools that is the only safe shape — their side effects happen
-    during execution (`store.ensure_initialized`, `store.update`), so anything
-    that lets the body run and then annotates the result has already written
-    config.json and minted a key by the time it gets a value to annotate.
-
-    Kept at the `tool()` choke point rather than as an `if self._demo:` at the
-    top of each body: Invariant 61 names a demo predicate appearing inside tool
-    bodies as the tell that the boundary has decayed back into a flag, and the
-    list of tools that must refuse is exactly the list annotated here.
-
-    Same two shapes as `_demo_wrap`, for the same reason — `start_binding` is a
-    plain `def` and `poll_binding` is `async def`, and a sync wrapper around a
-    coroutine function hands FastMCP an unserialisable coroutine object that
-    the client renders as success.
-    """
-
-    from vaultbeat_mcp_local.service import _demo_binding_refusal
-
-    if inspect.iscoroutinefunction(function):
-
-        @functools.wraps(function)
-        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-            return _demo_binding_refusal(tool_name)
-
-        _prefix_doc(async_wrapper, function)
-        return cast(_F, async_wrapper)
-
-    @functools.wraps(function)
-    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-        return _demo_binding_refusal(tool_name)
-
-    _prefix_doc(sync_wrapper, function)
-    return cast(_F, sync_wrapper)
-
-
 def _prefix_doc(wrapper: Any, original: Any) -> None:
-    """Put the demo warning at the top of the description FastMCP will publish."""
+    """Put the demo warning at the top of the description MCPServer will publish."""
 
     doc = inspect.getdoc(original) or ""
     wrapper.__doc__ = f"{_DEMO_DOC_PREFIX}\n\n{doc}" if doc else _DEMO_DOC_PREFIX
@@ -221,13 +185,20 @@ def _annotate_access(result: Any, service: VaultbeatLocalService) -> Any:
     tomorrow" BEFORE the first notice the user gets is a mid-conversation
     refusal.
 
-    Results that already carry an `access` block (`vaultbeat_status`,
-    `vaultbeat_doctor`) are left alone — they say the same thing with more
-    context. `access_note_if_expiring` reads an in-process stash set by the
-    bound call the tool just made, so this costs no config or Keychain I/O.
+    Results that already carry an `access` block are left alone — they say the
+    same thing with more context. Since 0.9.0 the only such result is
+    `vaultbeat_doctor`, and its block sits one level down at `binding.access`
+    (the old `vaultbeat_status` tool, which had it at the top, became that
+    `binding` key); checking only the top level made doctor print the expiry
+    twice in the trial's last 24 hours. `access_note_if_expiring` reads an
+    in-process stash set by the bound call the tool just made, so this costs no
+    config or Keychain I/O.
     """
 
     if not isinstance(result, dict) or "access" in result or "access_note" in result:
+        return result
+    binding = result.get("binding")
+    if isinstance(binding, dict) and "access" in binding:
         return result
     note = service.access_note_if_expiring()
     if note is None:
@@ -239,7 +210,7 @@ def _access_wrap(function: _F, service: VaultbeatLocalService) -> _F:
     """Wrap one tool so its dict results pick up the trial-expiry note.
 
     Mirrors `_demo_wrap`'s two shapes (this server has both sync and async
-    tools) including `functools.wraps`, which FastMCP's schema builder relies
+    tools) including `functools.wraps`, which MCPServer's schema builder relies
     on. Applied to every tool at the registration choke point rather than per
     call site — an annotation added at 29 call sites is 29 chances to forget
     the one that matters.
@@ -260,6 +231,233 @@ def _access_wrap(function: _F, service: VaultbeatLocalService) -> _F:
     return cast(_F, sync_wrapper)
 
 
+#: `get_sleep_nights` columns: (output name, row field). Order is the order an
+#: analyst reads a night in — when, how long, how it was built, how it held.
+_SLEEP_NIGHT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("date", "local_date"), ("dow", "weekday"), ("src", "source"), ("bed", "bedtime"), ("wake", "wake_time"),
+    ("asleep", "asleep_minutes"), ("deep", "deep_minutes"), ("rem", "rem_minutes"),
+    ("core", "core_minutes"), ("awake", "awake_minutes"), ("deep_pct", "deep_percent"),
+    ("rem_pct", "rem_percent"), ("wakeups", "awakenings"), ("longest_bout", "longest_sleep_bout_minutes"),
+    ("hr", "sleep_hr_mean"), ("hr_min", "sleep_hr_min"), ("rr", "sleep_rr_mean"),
+    ("other", "other_sleep"), ("segs", "sleep_segments"),
+)
+
+_OTHER_COL = [col for col, _field in _SLEEP_NIGHT_COLUMNS].index("other")
+
+
+def _other_sleep_label(segments: Any) -> str | None:
+    """`[{bedtime, wake_time, asleep_minutes}]` → "12:26-13:48 82m; ..." or None."""
+
+    if not segments:
+        return None
+    parts = []
+    for seg in segments:
+        start = str(seg.get("bedtime") or "")[11:16]
+        end = str(seg.get("wake_time") or "")[11:16]
+        parts.append(f"{start}-{end} {seg.get('asleep_minutes')}m")
+    return "; ".join(parts)
+
+
+_SLEEP_NIGHT_LEGEND = {
+    "date": "the local day the sleep ENDED on (a night from 23:40 Mon to 07:10 Tue is Tue)",
+    "src": "who scored the night (`apple` = Apple's own sleep tracking; `motion-inferred` = "
+           "guessed from phone motion, no wearable; others name the band or app). "
+           "Different sources use different algorithms — see `sources`",
+    "bed / wake": "local clock time of the night's MAIN sleep — occasionally a daytime one, "
+                  "when that was the longest sleep of the day",
+    "asleep, deep, rem, core, awake": "minutes; `awake` is time scored awake inside the sleep",
+    "deep_pct / rem_pct": "share of `asleep`, 0-100",
+    "wakeups": "awake intervals between first and last asleep sample (waking for the day not counted)",
+    "longest_bout": "longest run of sleep with no awake interval, minutes",
+    "hr / hr_min / rr": "heart rate mean / min (bpm) and respiratory rate (breaths/min) while asleep; "
+                        "null when too few samples were taken that night to stand for it",
+    "other": "other measured sleep that day, NOT counted in `asleep`: naps and the other half of a "
+             "broken night, as \"HH:MM-HH:MM Nm\". Add it to `asleep` for the day's total sleep",
+    "segs": "how many separate sleeps that day (1 = one unbroken main sleep)",
+    "flag": "comma-separated, a night can carry several. "
+            "`unworn` = the Watch was not worn, sleep was never measured — NOT zero sleep; "
+            "`motion_inferred` = guessed from phone motion, runs long; `get_metric` leaves these "
+            "nights out of every sleep average, so leave them out of any average you compute here; "
+            "`no_stages` = total known but no stage breakdown (iPhone-only), so stage columns are null; "
+            "`daytime` = the day's main sleep began after 08:00 and ended the same day, a daytime "
+            "or evening nap that was the only sleep recorded that day — real, but not a bedtime",
+    "null": "not measured. Never read a null as zero",
+}
+
+
+def _sleep_nights_table(summary: dict[str, Any], since: str | None) -> dict[str, Any]:
+    """`sleep_nights` rows → one header plus one short row per night.
+
+    Named columns once, values after: a year of nights is ~40k characters this
+    way against ~200k as objects and ~500k through `get_sleep_detail`, which
+    is the difference between an agent reading the whole history and reading
+    the last fortnight while believing it read everything.
+    """
+
+    nights = summary.get("nights") or []
+    rows = []
+    for n in nights:
+        # Not exclusive, and every flag that `get_metric` excludes on is shown:
+        # an agent averaging the `asleep` column itself must be able to see the
+        # nights `get_metric` left out, or the two answers disagree with nothing
+        # on the page saying why (2026-09-25: motion-inferred nights were only
+        # visible through `src`, and a daytime stage-less night showed one flag).
+        flags = [
+            name for name, on in (
+                ("unworn", n.get("is_in_bed_only")),
+                ("motion_inferred", n.get("motion_inferred")),
+                ("daytime", n.get("daytime_main_sleep")),
+                ("no_stages", n.get("no_stage_detail") and not n.get("is_in_bed_only")),
+            ) if on
+        ]
+        flag = ",".join(flags) or None
+        row = [n.get(field) for _col, field in _SLEEP_NIGHT_COLUMNS]
+        row[_OTHER_COL] = _other_sleep_label(n.get("other_sleep"))
+        rows.append(row + [flag])
+    out: dict[str, Any] = {
+        "columns": [col for col, _field in _SLEEP_NIGHT_COLUMNS] + ["flag"],
+        "rows": rows,
+        "count": len(rows),
+        "legend": _SLEEP_NIGHT_LEGEND,
+    }
+    if since:
+        out["since"] = since
+    for key, value in summary.items():
+        if key not in ("nights", "count"):
+            out[key] = value
+    return out
+
+
+def _rows_table(rows: list[Any]) -> dict[str, Any]:
+    """`[{date, value, partial?}, ...]` → `{columns, rows}`: each key once, then values.
+
+    A month of every series as objects was 80k characters on the demo account,
+    two thirds of it the same three key names repeated per day; as a table the
+    same answer fits a client's per-result cap. Columns are the union of the
+    rows' keys in first-seen order, so an optional flag (`partial`) is a column
+    that is `null` on the days without it.
+    """
+    columns: list[str] = []
+    for row in rows:
+        if isinstance(row, dict):
+            columns.extend(key for key in row if key not in columns)
+    return {
+        "columns": columns,
+        "rows": [[row.get(column) for column in columns] for row in rows if isinstance(row, dict)],
+    }
+
+
+def _metric_tables(result: dict[str, Any]) -> dict[str, Any]:
+    """`get_metric`'s per-series `points` / `buckets` lists, as `_rows_table` tables."""
+    metrics = result.get("metrics")
+    if not isinstance(metrics, list):
+        return result
+    tabled = []
+    for entry in metrics:
+        if isinstance(entry, dict):
+            entry = {
+                key: _rows_table(value) if key in ("points", "buckets") and isinstance(value, list) else value
+                for key, value in entry.items()
+            }
+        tabled.append(entry)
+    return {**result, "metrics": tabled}
+
+
+#: `get_intraday` columns. The rest of a record repeats per row what the row
+#: already says (`record_id`, the UTC `date`, `local_date`, `avg_sdnn_ms` beside an
+#: equal `sdnn_ms`, the owner): 280 characters a row against about 40.
+_INTRADAY_COLUMNS = ("local_time", "sdnn_ms", "sample_count")
+
+
+def _intraday_table(result: dict[str, Any]) -> dict[str, Any]:
+    """`get_intraday` records → `{columns, rows}`, the owner stated once."""
+    records = result.get("records")
+    if not isinstance(records, list):
+        return result
+    dicts = [r for r in records if isinstance(r, dict)]
+    columns = [c for c in _INTRADAY_COLUMNS if any(c in r for r in dicts)]
+    out = {key: value for key, value in result.items() if key != "records"}
+    if dicts and dicts[0].get("owner_user_id"):
+        out["owner_user_id"] = dicts[0]["owner_user_id"]
+    out["columns"] = columns
+    out["rows"] = [[r.get(c) for c in columns] for r in dicts]
+    return out
+
+
+def _partner_note(result: dict[str, Any], partner: bool) -> dict[str, Any]:
+    """Explain an empty PARTNER read as what it almost always is: not shared.
+
+    Add-only, like `_annotate_if_empty`. Without it an empty partner result reads
+    as "she did not sleep" / "no cycle recorded" — a claim about a person's body
+    made from what is really a privacy toggle in their app.
+    """
+
+    if not partner or not isinstance(result, dict):
+        return result
+    coverage = result.get("coverage")
+    if isinstance(coverage, dict) and coverage.get("days_covered") == 0:
+        result.setdefault("partner_note", PARTNER_EMPTY_HINT)
+    return result
+
+
+def _owner_unknown_note(
+    result: dict[str, Any], service: VaultbeatLocalService, partner: bool
+) -> dict[str, Any]:
+    """Say so when a notes/symptoms read could not be split into "you" and "partner".
+
+    Both readers select a person by comparing against the account that paired
+    this machine (Invariant 88 (partner-is-not-me)). A pre-2026 binding never
+    recorded that account, so the comparison has nothing to compare with and
+    both readers fall back to returning EVERYONE's rows — identically for
+    `partner=true` and `false`. The other readers had `_attach_owner_guard`'s
+    `mixed_owners` warning for that case; these two had nothing, so an agent
+    asking for the partner's notes got the user's own notes back as the
+    partner's, with no signal anywhere. Notes are the sharper half: a note the
+    user's AI recorded ABOUT the partner lives in the user's own account, so even
+    a single-owner result is ambiguous there.
+
+    Add-only, and quiet on an empty result — an empty read mixes no one.
+    """
+
+    if not isinstance(result, dict) or service.person_owner() is not None:
+        return result
+    coverage = result.get("coverage")
+    if isinstance(coverage, dict) and coverage.get("days_covered") == 0:
+        return result
+    result["owner_unknown"] = True
+    result.setdefault(
+        "warning",
+        (
+            "This pairing does not record whose account it is (it predates owner "
+            "tracking), so this result holds EVERYONE's entries — yours and your "
+            "partner's — and `partner` "
+            + ("was ignored" if partner else "could not narrow it to you")
+            + ". Do not attribute any entry to a person from this call alone; "
+            "re-pair this machine from the Vaultbeat app to fix it."
+        ),
+    )
+    return result
+
+
+def _empty_window_hint(result: dict[str, Any], kind: str) -> str | None:
+    """The hint for a read whose WINDOW was empty on an account that has data.
+
+    `_annotate_if_empty` asks this first. Until 2026-10-03 it said "No food data
+    on this account" for a fortnight with nothing logged, on an account with
+    months of food (review R3 on #9). None when the read held no data at all.
+    """
+    coverage = result.get("coverage")
+    if not isinstance(coverage, dict) or not (coverage.get("total_available") or 0) > 0:
+        return None
+    oldest = coverage.get("oldest_available")
+    return (
+        f"Nothing in the window you asked for, but this account does have {kind} "
+        f"data outside it"
+        + (f" (its records start on {oldest})" if oldest else "")
+        + ". Move or widen the window; an empty window is not a missing record type."
+    )
+
+
 def _annotate_if_empty(result: dict[str, Any], kind: str, rows_key: str) -> dict[str, Any]:
     """Explain an empty result for a kind that older apps never wrote.
 
@@ -271,10 +469,19 @@ def _annotate_if_empty(result: dict[str, Any], kind: str, rows_key: str) -> dict
 
     ADD-ONLY, deliberately: it introduces a `hint` key and never reads, edits or
     removes an existing field, and it does nothing at all when there IS data.
-    Payload shape is the one contract layer no server can validate (see CLAUDE.md
-    § app↔MCP coupling), so anything touching a response has to be additive.
+    Payload shape is the one contract layer no server can validate (see
+    scripts/ci/check_payload_contract.py), so anything touching a response has to be additive.
     """
     if result.get(rows_key):
+        return result
+    if "error" in result:
+        # A refused call (`invalid_since`, …) returned no rows because it read
+        # nothing; telling the reader the account has no data would answer a
+        # question the call never asked (Invariant 57).
+        return result
+    window_hint = _empty_window_hint(result, kind)
+    if window_hint:
+        result.setdefault("hint", window_hint)
         return result
 
     since = VaultbeatLocalService.KIND_MIN_APP_RELEASE.get(kind)
@@ -291,11 +498,11 @@ def _annotate_if_empty(result: dict[str, Any], kind: str, rows_key: str) -> dict
             f"that no rows arrived — but in the order worth checking: (1) this "
             f"server was paired recently and the history has not finished sealing "
             f"for it; every server gets its own encrypted copy, so a new one starts "
-            f"nearly empty and fills in. Open the app and tap Settings → Data & AI "
-            f"→ 'Re-sync all health data to AI', then retry in a few minutes. "
+            f"nearly empty and fills in. Open the app and tap {RESYNC}, then "
+            f"retry in a few minutes. "
             f"(2) Apple Health access for it was never granted — a read denial is "
             f"invisible to the app, so it looks identical to having no data; "
-            f"recover via Settings → Data & AI → 'Apple Health access'. (3) it "
+            f"recover via {HEALTH_ACCESS}. (3) it "
             f"genuinely has not been recorded yet. Run `vaultbeat-apple-health doctor` or "
             f"call the vaultbeat_doctor tool for a full report.",
         )
@@ -308,12 +515,12 @@ def _annotate_if_empty(result: dict[str, Any], kind: str, rows_key: str) -> dict
         f"arrived, in the order worth checking: (1) this server was paired recently "
         f"and the history has not finished sealing for it — every server gets its own "
         f"encrypted copy, so a new one starts nearly empty and fills in; open the app "
-        f"and tap Settings → Data & AI → 'Re-sync all health data to AI', then retry "
+        f"and tap {RESYNC}, then retry "
         f"in a few minutes; (2) the iOS app predates this data type, which needs a "
         f"build from {since} or later; (3) Apple Health access for it was never "
         f"granted — a read denial is invisible to the app, so this looks the same as "
-        f"having no data, and the recovery path is the app's Settings → Data & AI → "
-        f"'Apple Health access' row, which re-presents the permission sheet; (4) it "
+        f"having no data, and the recovery path is {HEALTH_ACCESS} in the app, "
+        f"which re-presents the permission sheet; (4) it "
         f"genuinely has not been recorded yet. Run `vaultbeat-apple-health doctor` or call the "
         f"vaultbeat_doctor tool for a full report.",
     )
@@ -396,6 +603,126 @@ class StaticBearerASGIMiddleware:
         await self._app(scope, receive, send)
 
 
+def _forbid_unknown_arguments() -> None:
+    """Make every tool reject an argument it does not declare.
+
+    🔴 The SDK's argument model ignores extras by default, so the call reached
+    the tool with them silently dropped. `partner=true` on one of the five tools
+    that only read the user's own data — or the `owner=` that 0.9.0 removed,
+    on any tool — returned the USER's records with nothing saying the request
+    was not honoured, and an agent would present them as the partner's
+    (pre-release review, 2026-10-02). With `extra="forbid"` the call fails with
+    "partner: Extra inputs are not permitted" instead, and the tool's input
+    schema says `additionalProperties: false`.
+
+    Set on the SDK's base class before any tool is registered: each tool's
+    argument model is created from it at registration. Pinned by
+    `test_tools_reject_arguments_they_do_not_declare`, which fails if an SDK
+    upgrade moves or renames the base.
+    """
+    from mcp.server.mcpserver.utilities import func_metadata
+
+    base = func_metadata.ArgModelBase
+    base.model_config = {**base.model_config, "extra": "forbid"}
+
+
+def _compact_tool_results() -> None:
+    """Send dict results as compact JSON instead of the SDK's `indent=2`.
+
+    The SDK pretty-prints every dict a tool returns, and on these results — a
+    list of rows, each a small object — the newlines and indentation were half
+    the payload: a year of `get_sleep_nights` measured 94k characters on the
+    wire against 48k compact (pre-release review, 2026-10-02), and clients cap a
+    tool result at about 25k tokens. Values are converted exactly as before
+    (`pydantic_core.to_json`, `fallback=str`); only the whitespace goes.
+
+    Idempotent: a second call wraps the original converter, not the wrapper.
+    """
+    import pydantic_core
+    from mcp.server.mcpserver.utilities import func_metadata
+
+    original = getattr(func_metadata._convert_to_content, "__wrapped__", func_metadata._convert_to_content)
+
+    def convert(result: Any) -> Any:
+        if isinstance(result, dict):
+            result = pydantic_core.to_json(result, fallback=str).decode()
+        return original(result)
+
+    convert.__wrapped__ = original  # type: ignore[attr-defined]
+    func_metadata._convert_to_content = convert
+
+
+#: Above this many UTF-8 BYTES, a result is replaced by an answer saying how to
+#: ask for less. Claude Code rejects a tool result over 25,000 tokens
+#: (MAX_MCP_OUTPUT_TOKENS). Bytes, not characters, because bytes / 3 tracks tokens
+#: for both kinds of text these results carry: ASCII JSON runs about 3 characters
+#: (= bytes) a token, and CJK about one character (= 3 bytes) a token. A month of
+#: one account's food log was 54k characters but 82k bytes — about 27k tokens,
+#: which a character count would have let through (2026-10-02). 60,000 bytes is
+#: ~20k tokens, leaving the client's framing room.
+MAX_RESULT_BYTES = 60_000
+
+#: What to narrow, per tool, in a `result_too_large` answer.
+_NARROW_HINTS: dict[str, str] = {
+    "get_food_log": "a smaller `limit` (days, newest first), or a narrower `since`/`until` window",
+    "get_metric": (
+        "fewer `series` (name the ones you need), fewer `days` or a `since`/`until` window, "
+        "or `aggregation=\"avg\"` with `granularity=\"week\"` or `\"month\"`"
+    ),
+    "get_sleep_nights": "a smaller `limit`, or `since`",
+    "get_sleep_detail": "a smaller `limit`, without `include_timeline`",
+    "get_intraday": "a smaller `limit`",
+    "get_workouts": "a smaller `limit`",
+    "get_strength_log": "a smaller `limit` or `limit_days`",
+    "get_notes": "a smaller `limit`, or a `target_kind`",
+    "get_symptoms": "a smaller `limit`",
+    "get_menstrual_cycle": "a smaller `limit`",
+}
+
+
+def _bounded(result: Any, tool_name: str) -> Any:
+    """`result`, or a `result_too_large` answer when it would not fit a client."""
+    if not isinstance(result, dict):
+        return result
+    import pydantic_core
+
+    size = len(pydantic_core.to_json(result, fallback=str))
+    if size <= MAX_RESULT_BYTES:
+        return result
+    hint = _NARROW_HINTS.get(tool_name, "a smaller `limit` or a shorter date range")
+    return {
+        "error": "result_too_large",
+        "result_bytes": size,
+        "limit_bytes": MAX_RESULT_BYTES,
+        "message": (
+            f"This answer would be about {size // 3:,} tokens ({size:,} bytes) — more than an MCP "
+            f"client accepts in one tool result. Nothing is wrong with the data. "
+            f"Ask again with {hint}."
+        ),
+    }
+
+
+def _bound_wrap(function: _F) -> _F:
+    """Outermost wrapper: no argument combination sends a client more than
+    it accepts (`_bounded`). Outside the demo watermark, which adds a field to
+    every row and so has to be inside the measurement."""
+    name = function.__name__
+
+    if inspect.iscoroutinefunction(function):
+
+        @functools.wraps(function)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            return _bounded(await function(*args, **kwargs), name)
+
+        return cast(_F, async_wrapper)
+
+    @functools.wraps(function)
+    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+        return _bounded(function(*args, **kwargs), name)
+
+    return cast(_F, sync_wrapper)
+
+
 def run_mcp_server(
     store: ConfigStore | None = None,
     *,
@@ -409,13 +736,15 @@ def run_mcp_server(
     allow_remote: bool = False,
 ) -> None:
     try:
-        from mcp.server.fastmcp import FastMCP
+        from mcp.server.mcpserver import MCPServer
     except ModuleNotFoundError as error:
         raise RuntimeError(
             "The MCP SDK is not installed. Install with `pip install -e ./mcp-local-server`."
         ) from error
 
     selected_transport = _normalize_transport(transport)
+    _forbid_unknown_arguments()
+    _compact_tool_results()
 
     # Read ONCE, here, rather than per call. A tool whose annotations say
     # "read-only" while its body has quietly switched to synthetic data mid-session
@@ -456,41 +785,48 @@ def run_mcp_server(
     # is opt-in, while the common shape is initialize → tools/list → call. See
     # `prompts.server_instructions` for why the text concatenates them instead of
     # paraphrasing.
-    mcp = FastMCP(
+    #
+    # `version` is passed explicitly: when it was absent (v1's FastMCP took none),
+    # the SDK reported ITS OWN package version, so clients showed "1.29.0" (the mcp
+    # SDK) for a user who had just installed vaultbeat-mcp 0.3.x — and a wrong
+    # version makes a stale install indistinguishable from a current one, which is
+    # exactly the question `doctor` exists to answer. v1 needed a reach into the
+    # private `_mcp_server` to set it; SDK 2.x takes it in the constructor.
+    #
+    # Transport settings (path, json_response, stateless_http) are NOT constructor
+    # arguments since SDK 2.x — they go to `streamable_http_app()` in
+    # `_serve_streamable_http`, the only place they were ever used.
+    #
+    # Usage telemetry rides as SDK middleware, beside the SDK's own OTel one:
+    # it sees every `initialize` and `tools/call` — tool name, outcome, and which
+    # AI client is calling — without touching a single tool body. What it may and
+    # may not send is spelled out at the top of `telemetry.py`.
+    from vaultbeat_mcp_local.telemetry import PostHogMiddleware, Telemetry
+
+    def _account_id() -> str | None:
+        config = service.store.load()
+        return config.owner_user_id if config else None
+
+    telemetry = Telemetry(account_id=_account_id, demo=demo_active, transport=selected_transport)
+    mcp = MCPServer(
         "Vaultbeat Health [DEMO — SYNTHETIC DATA]" if demo_active else "Vaultbeat Health",
         instructions=server_instructions(demo=demo_active),
-        host=host,
-        port=port,
-        streamable_http_path=_normalize_http_path(path),
-        json_response=json_response,
-        stateless_http=stateless_http,
+        version=__version__,
+        middleware=[PostHogMiddleware(telemetry)],
     )
 
-    # FastMCP takes no `version`, and when the inner server's is None the SDK falls
-    # back to reporting ITS OWN package version — so clients showed "1.29.0" (the mcp
-    # SDK) for a user who had just installed vaultbeat-mcp 0.3.x. Wrong version numbers
-    # are worse than absent ones: they make a stale install indistinguishable from a
-    # current one, which is exactly the question `doctor` exists to answer.
-    # Guarded because it reaches past the public API — a future SDK that renames this
-    # attribute costs a cosmetic version string, never a working server.
-    inner_server = getattr(mcp, "_mcp_server", None)
-    if inner_server is not None and hasattr(inner_server, "version"):
-        inner_server.version = __version__
-
-    def tool(
-        *, title: str, annotations: Any, blocked_in_demo: bool = False
-    ) -> Callable[[_F], _F]:
+    def tool(*, title: str, annotations: Any) -> Callable[[_F], _F]:
         """Register one tool — the single place demo mode can reach every tool.
 
         A choke point, not a convenience wrapper (Invariant 58): the alternative
         is 29 call sites each remembering to watermark, which is 29 chances to
         forget and no way to notice the one that did.
 
-        Patching `mcp.call_tool` after construction does NOT work and was tried:
-        `FastMCP.__init__` calls `_setup_handlers`, which binds the bound method
-        into the low-level server at construction time, so a later reassignment
-        is never consulted. Decorating on the way in is the only hook that
-        exists.
+        Patching `mcp.call_tool` after construction does NOT work and was tried
+        (on SDK 1.x: the constructor bound the handler into the low-level server,
+        so a later reassignment was never consulted; 2.x likewise registers its
+        `tools/call` handler at construction). Decorating on the way in is the
+        hook that does not depend on SDK internals.
         """
 
         def decorator(function: _F) -> _F:
@@ -500,31 +836,24 @@ def run_mcp_server(
             # mode returns before reaching.
             prepared = _access_wrap(function, service)
             if demo_active:
-                # `blocked_in_demo` is checked FIRST and is not additive: a tool
-                # that must not run cannot also be watermarked, because
-                # watermarking implies there was a result to stamp.
-                prepared = (
-                    _demo_block_wrap(prepared, tool_name=function.__name__)
-                    if blocked_in_demo
-                    else _demo_wrap(prepared)
-                )
+                # A tool with a disk or network write in its BODY must refuse by
+                # never running, not be watermarked after it ran — that was
+                # `_demo_block_wrap`, removed in 0.9.0 together with the two
+                # pairing tools that were its only users (code-map Invariant 61
+                # keeps the lesson; git has the mechanism).
+                prepared = _demo_wrap(prepared)
+            prepared = _bound_wrap(prepared)
             return cast(_F, mcp.tool(title=title, annotations=annotations)(prepared))
 
         return decorator
 
     # Prompts. `demo_active` is handed down rather than re-read for the reason
-    # recorded above the FastMCP construction: every surface that can say "demo"
+    # recorded above the MCPServer construction: every surface that can say "demo"
     # has to learn it from the same frozen value, or they disagree mid-session.
     #
     # Registered here rather than beside `mcp.run` so that "what this server
     # exposes" reads as one block. Nothing below depends on it.
     register_prompts(mcp, demo=demo_active)
-
-    @tool(title="Connection status", annotations=_read_only_tool())
-    def vaultbeat_status() -> dict[str, Any]:
-        """Return local Vaultbeat binding state without exposing private keys or server tokens."""
-
-        return service.status()
 
     @tool(title="Run diagnostics", annotations=_read_only_tool(open_world=True))
     async def vaultbeat_doctor() -> dict[str, Any]:
@@ -540,7 +869,8 @@ def run_mcp_server(
         `capabilities` — which metric kinds actually have data, and which empty
         ones are explained by an older iOS app (with the release date each
         needs). An empty kind is NOT proof the user never recorded it: their app
-        may predate the feature entirely.
+        may predate the feature entirely. A kind under `kinds_not_checked` could
+        not be counted this run; it is neither empty nor full.
 
         `scope` — what this report does NOT cover. Everything here can pass and
         the setup still be broken on the client side: this server is a subprocess
@@ -551,175 +881,84 @@ def run_mcp_server(
         variables actually arrived — check that before guessing at the client's
         environment.
 
-        This runs a cloud round trip, so it is slower than `vaultbeat_status`
-        (local config only) — prefer status for a quick liveness check.
+        `binding` — the local pairing state (which account, which server, whether
+        demo mode is serving synthetic data). No keys or tokens.
+
+        This runs a cloud round trip, so it takes a moment.
         """
 
-        return await service.doctor()
-
-    @tool(title="Sleep history", annotations=_read_only_tool())
-    async def vaultbeat_sync_sleep(
-        limit: int = 50,
-        owner: str | None = None,
-        fresh: bool = False,
-        summary_only: bool = False,
-    ) -> dict[str, Any]:
-        """Fetch encrypted Vaultbeat sleep records, decrypt them locally, and return
-        per-day primary session summaries matching the iOS app's display.
-
-        Returns `daily_summary` (one primary session per local date, selected by
-        iOS priority: Watch > iPhone > inBedOnly) and `sessions` (all raw records).
-        The `limit` controls how many raw blobs are fetched; 50 covers ~2-3 weeks.
-        Use `owner` prefix to filter by person — take it from `vaultbeat_status`
-        (`owner_user_id_prefix` is the paired user; server 0.7.1+), or
-        `vaultbeat_doctor` for every owner present in the data. Without it, both
-        partners' data is mixed and per-day selection may pick the wrong
-        person's session.
-
-        ⚠️ `is_in_bed_only: true` means sleep was NEVER MEASURED that night (the
-        Watch wasn't worn) — NOT that the person slept zero. On those nights
-        `total_sleep_minutes` is 0, `duration_label` reads "no sleep data", and
-        `in_bed_minutes` holds the time actually recorded in bed. Report such a
-        night as "no sleep data (in bed ~Xh)", never as "slept 0 hours".
-
-        Results are served from a short-lived local cache (default 10 min);
-        pass fresh=True to force a cloud round trip.
-
-        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
-
-        🔑 **Pass `summary_only=True` when you only want the SIDE EFFECT.** A default
-        call returns every decrypted session — measured at 76,446 characters, which
-        overflows a typical tool-result limit and gets spilled to a file the caller
-        then has to read back. That is the right shape when you want the nights; it
-        is pure waste when you called this to make the server do something (force a
-        sync, check the link is alive, confirm a deploy took effect), which is a
-        large share of real calls. `summary_only=True` returns the counts, the day
-        range and the coverage block, and nothing else. For the nights themselves,
-        `get_sleep_detail` is the tool that exists for it.
-        """
-
-        result = await service.sleep_records(limit=limit, owner=owner, fresh=fresh)
-        if summary_only:
-            # 🔴 Keep `coverage` and drop the bodies. Coverage is what says how much
-            # the answer rests on (Invariant 64), so removing it would turn a
-            # deliberately small reply into an unanchored one — the opposite of the
-            # honesty this server is built on. `synced` counts the raw sessions that
-            # were actually decrypted, so the caller can still tell "the sync did
-            # something" from "the sync found nothing".
-            slim: dict[str, Any] = {
-                "summary_only": True,
-                "synced": len(result.get("sessions") or []),
-                "days": len(result.get("daily_summary") or []),
-                "note": (
-                    "Bodies omitted because summary_only=True. Call "
-                    "`get_sleep_detail` for the nights themselves."
-                ),
-            }
-            # ⚠️ The day RANGE is deliberately not recomputed here — `coverage`
-            # already carries `first_day` / `last_day`, and a second copy would be
-            # a second thing to keep correct. The first draft did recompute it,
-            # off `local_date`, and shipped two `None`s: the rows in
-            # `daily_summary` key their day as `date`. Caught by running it
-            # against the real account rather than by reading the code.
-            for passthrough in ("coverage", "errors"):
-                if passthrough in result:
-                    slim[passthrough] = result[passthrough]
-            return slim
-
-        return _annotate_if_empty(result, "sleep", "sessions")
-
-    @tool(title="Water intake", annotations=_read_only_tool())
-    async def get_water_intake(
-        limit: int = 90, owner: str | None = None, fresh: bool = False
-    ) -> dict[str, Any]:
-        """Decrypt recent daily water intake locally and compute the average.
-
-        Returns one entry per day (newest first) with refill count, container volume, and
-        derived intake in liters, plus `average_daily_intake_liters` over the window.
-        Use `owner` prefix to filter by person — take it from
-        `vaultbeat_status` (`owner_user_id_prefix` is the paired user; server
-        0.7.1+), or `vaultbeat_doctor` for every owner present in the data.
-        Each record carries `owner_user_id` to identify whose data it is.
-
-        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
-        """
-
-        return _annotate_if_empty(
-            await service.water_intake_summary(limit=limit, owner=owner, fresh=fresh),
-            "water",
-            "days",
-        )
-
-    @tool(title="Weight trend", annotations=_read_only_tool())
-    async def get_weight_trend(
-        limit: int = 90, goal_kg: float | None = None, owner: str | None = None, fresh: bool = False
-    ) -> dict[str, Any]:
-        """Decrypt recent body-weight records locally and compute the trend.
-
-        Returns one entry per day (newest first, kilograms) plus latest/average/min/max,
-        the OLS weekly rate (kg/week), and — when `goal_kg` is given — the distance to goal.
-        Use `owner` prefix to filter by person — take it from
-        `vaultbeat_status` (`owner_user_id_prefix` is the paired user; server
-        0.7.1+), or `vaultbeat_doctor` for every owner present in the data.
-        Each record carries `owner_user_id` to identify whose data it is.
-
-        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
-        """
-
-        return _annotate_if_empty(
-            await service.weight_trend_summary(
-                limit=limit, goal_kg=goal_kg, owner=owner, fresh=fresh
-            ),
-            "body",
-            "days",
-        )
+        report = await service.doctor()
+        # Was its own `vaultbeat_status` tool until 0.9.0. The binding state is
+        # part of the answer to "why is nothing working", so it rides here.
+        report["binding"] = service.status()
+        # State only, deliberately (owner, 2026-09-23). An earlier version also
+        # carried a "what it sends" line and the opt-out instruction, and every
+        # diagnosis would put that in front of the agent, which tends to relay it
+        # to the user unprompted. What is sent and how to turn it off are
+        # disclosed where a person goes to read about it — the README's
+        # Telemetry section and the privacy page — not recited on each run.
+        report["telemetry"] = {"enabled": telemetry.enabled}
+        return report
 
     @tool(title="Symptoms", annotations=_read_only_tool())
-    async def get_symptoms(limit: int = 120, fresh: bool = False) -> dict[str, Any]:
-        """Decrypt recent HealthKit symptom days locally, grouped by data owner.
+    async def get_symptoms(
+        limit: int = 120, partner: bool = False, fresh: bool = False
+    ) -> dict[str, Any]:
+        """Decrypt recent symptoms locally, grouped by data owner — both sources.
 
-        SENSITIVE: symptom data (cramps, headache, fatigue, coughing…) only reaches
-        this server when a user explicitly opted in on iOS — their own AI toggle for
-        their own data, or the partner-AI toggle for a partner's data. Both partners
-        can track symptoms, so each entry in `owners` carries `owner_user_id` plus
-        per-type counts and day-by-day samples with severity
-        (mild/moderate/severe/present/…). Stays on-device, never re-exported.
+        SENSITIVE. Each entry in `owners` carries `owner_user_id` and two lists:
+        · `days` — symptoms imported from Apple Health (cramps, headache, fatigue,
+          coughing…), one row per day with each sample's severity
+          (mild/moderate/severe/present/…). These reach this server only when the
+          user opted in on iOS — their own AI toggle, or the partner-AI toggle for
+          a partner's. `symptom_counts` counts logged DAYS per type.
+        · `reported` — episodes a person reported themselves, through
+          `log_symptom` or the Vaultbeat app: `entry_id`, `symptom_type`,
+          `display_name` (their own words), `severity`, `local_date`, `onset_at` /
+          `end_at` (`end_recorded: false` means no end was logged — ask, do not
+          assume it is still going), `duration_minutes`, `body_location`,
+          `triggers`, `note`. `reported_counts` counts EPISODES per type.
+        A type that exists in Apple Health is spelled the same in both lists
+        (`healthkit_type: true`), so "headache" from either source is one symptom.
+        To correct or remove a reported entry use `update_symptom` /
+        `delete_symptom` with its `entry_id`; imported days are edited in Apple Health.
+        Stays on-device, never re-exported.
+
+        Returns YOUR symptoms by default; `partner=true` returns your partner's
+        Apple Health `days` only (if they share symptoms with you from their own
+        app). A partner's `reported` episodes never reach you: the app and
+        `log_symptom` seal them for their owner's own AI alone, so an empty
+        `reported` under `partner=true` means "not shareable", not "none logged".
 
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
+        the row count) and `coverage.span_days` beside any average or trend.
+        `coverage.window_satisfied: false` alone does NOT mean a short history: it is
+        also false when older days exist beyond your window. 🔴 Before saying how far
+        back someone's data goes, read `coverage.more_available`: `true` means this
+        server can decrypt days OLDER than `first_day` that your `limit` left behind —
+        re-read with a larger `limit`, or quote `coverage.oldest_available` as the real
+        start of their history. Never report a `limit`-shaped window as the extent of
+        their data.
         """
 
-        return await service.symptom_summary(limit=limit, fresh=fresh)
+        return _owner_unknown_note(
+            _partner_note(
+                await service.symptom_summary(
+                    limit=limit, fresh=fresh, owner=service.person_owner(partner=partner)
+                ),
+                partner,
+            ),
+            service,
+            partner,
+        )
 
     @tool(title="Notes", annotations=_read_only_tool())
-    async def get_notes(limit: int = 120, target_kind: str | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def get_notes(
+        limit: int = 120,
+        target_kind: str | None = None,
+        partner: bool = False,
+        fresh: bool = False,
+    ) -> dict[str, Any]:
         """Decrypt recent free-text notes (day annotations) locally.
 
         SENSITIVE free text. Each note carries `owner_user_id` (who wrote it),
@@ -730,17 +969,30 @@ def run_mcp_server(
         agent-authored via `log_note`. Pass target_kind to filter.
         Stays on-device, never re-exported.
 
+        Returns notes about YOU by default. `partner=true` returns notes about your
+        partner: the ones they wrote themselves and shared, plus the ones your AI
+        recorded about them (`about: "partner"`, written with
+        `log_note_append(partner=true)`).
+
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
+        the row count) and `coverage.span_days` beside any average or trend.
+        `coverage.window_satisfied: false` alone does NOT mean a short history: it is
+        also false when older days exist beyond your window. 🔴 Before saying how far
+        back someone's data goes, read `coverage.more_available`: `true` means this
+        server can decrypt days OLDER than `first_day` that your `limit` left behind —
+        re-read with a larger `limit`, or quote `coverage.oldest_available` as the real
+        start of their history. Never report a `limit`-shaped window as the extent of
+        their data.
         """
 
-        return await service.notes_summary(limit=limit, target_kind=target_kind, fresh=fresh)
+        return _owner_unknown_note(
+            _partner_note(
+                await service.notes_summary(limit=limit, target_kind=target_kind, fresh=fresh, partner=partner),
+                partner,
+            ),
+            service,
+            partner,
+        )
 
     @tool(title="Strength log", annotations=_read_only_tool())
     async def get_strength_log(
@@ -754,15 +1006,19 @@ def run_mcp_server(
         in Vaultbeat; owner's own sessions only — strength has no partner
         fan-out. Join `date` against sleep/HRV/weight for training-load
         analysis. Pass limit_days to cap how many sessions return.
+        `duplicate_sessions`, when present, lists stored entries that only repeat
+        another session of the same day; they are already left out of `sessions`
+        and `session_count`, so do not add their volume back.
 
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
+        the row count) and `coverage.span_days` beside any average or trend.
+        `coverage.window_satisfied: false` alone does NOT mean a short history: it is
+        also false when older days exist beyond your window. 🔴 Before saying how far
+        back someone's data goes, read `coverage.more_available`: `true` means this
+        server can decrypt days OLDER than `first_day` that your `limit` left behind —
+        re-read with a larger `limit`, or quote `coverage.oldest_available` as the real
+        start of their history. Never report a `limit`-shaped window as the extent of
+        their data.
         """
 
         return _annotate_if_empty(
@@ -801,8 +1057,8 @@ def run_mcp_server(
         Encrypted end-to-end before it ever leaves this machine — this server
         never sends plaintext. Requires a bind made after this feature shipped
         (carries owner_user_id/owner_public_key_base64/owner_device_id from
-        the pairing handshake); an older bind must re-pair by calling
-        `vaultbeat_start_binding` then `vaultbeat_poll_binding`.
+        the pairing handshake); an older bind must re-pair by running
+        `uvx vaultbeat-apple-health@latest bind` in a terminal.
         """
 
         return await service.log_strength_entry(
@@ -836,8 +1092,8 @@ def run_mcp_server(
         `replaced_exercises` is always `[]` here — that empty list is the receipt
         that this call deleted nothing. Encrypted end-to-end before it ever leaves
         this machine. Requires a bind made after the agent write path shipped; an
-        older bind must re-pair via `vaultbeat_start_binding` then
-        `vaultbeat_poll_binding`.
+        older bind must re-pair by running `uvx vaultbeat-apple-health@latest bind`
+        in a terminal.
         """
 
         return await service.log_strength_entry(
@@ -846,9 +1102,21 @@ def run_mcp_server(
 
     @tool(title="Food log", annotations=_read_only_tool())
     async def get_food_log(
-        limit: int = 90, limit_days: int | None = None, fresh: bool = False
+        limit: int | None = None,
+        limit_days: int | None = None,
+        fresh: bool = False,
+        since: str | None = None,
+        until: str | None = None,
     ) -> dict[str, Any]:
-        """Decrypt recent daily food-intake logs locally (newest first).
+        """Decrypt daily food-intake logs locally (newest first).
+
+        `limit` = days: the newest two weeks by default. `since` / `until`
+        ("YYYY-MM-DD", local days, both inclusive) read a calendar window
+        instead — "what did I eat in the first week of August" — and then
+        `limit` applies only if you pass it. A logged day is roughly 0.5-1k
+        tokens (more with notes, and Chinese text counts more), so a month can
+        already be past what a client takes in one result — it then comes back
+        as `result_too_large`; ask for fewer days or a narrower window.
 
         Each day carries `meals`, each meal a list of `items` with `food` (name),
         optional free-text `portion` ("1 根" / "300g" / "小份"), optional
@@ -859,17 +1127,26 @@ def run_mcp_server(
         Owner's own days only. Pass limit_days to cap how many days return.
 
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
+        the row count) and `coverage.span_days` beside any average or trend.
+        `coverage.window_satisfied: false` alone does NOT mean a short history: it is
+        also false when older days exist beyond your window. 🔴 Before saying how far
+        back someone's data goes, read `coverage.more_available`: `true` means this
+        server can decrypt days OLDER than `first_day` that your `limit` left behind —
+        re-read with a larger `limit`, or quote `coverage.oldest_available` as the real
+        start of their history. Never report a `limit`-shaped window as the extent of
+        their data.
         """
 
+        # An empty string is "no bound", the same as omitting it. Tested against
+        # None alone, `since=""` skipped the two-week default here and then read
+        # as no bound downstream — the whole history in one result (review R10).
+        since, until = since or None, until or None
+        if limit is None and since is None and until is None:
+            limit = 14
         return _annotate_if_empty(
-            await service.food_summary(limit=limit, limit_days=limit_days, fresh=fresh),
+            await service.food_summary(
+                limit=limit, limit_days=limit_days, fresh=fresh, since=since, until=until
+            ),
             "food",
             "days",
         )
@@ -970,7 +1247,11 @@ def run_mcp_server(
 
     @tool(title="Log note (replaces note)", annotations=_mutating_tool(destructive=True))
     async def log_note(
-        text: str, kind: str = "general", date: str | None = None, merge: bool = False
+        text: str,
+        kind: str = "general",
+        date: str | None = None,
+        merge: bool = False,
+        partner: bool = False,
     ) -> dict[str, Any]:
         """Log a free-text note on the owner's behalf (agent write).
 
@@ -993,33 +1274,43 @@ def run_mcp_server(
         non-null and you did not intend to replace, you just destroyed that text;
         re-send it with `merge=True`.
 
-        For symptoms, use `log_note_append`. Discomfort shows up in installments
-        across a day (nausea at noon, dizziness at night), so the second write
-        of the day is the normal case, not the exception — and this tool would
-        replace the morning's entry with the evening's.
+        Symptoms do NOT go here: use `log_symptom`, one call per symptom. A
+        note is free text nothing can be matched against; a symptom entry keeps
+        its type, severity and timing so it can later be lined up with sleep,
+        food and heart rate. A note is for what surrounds it (mood, events, how
+        a day went).
 
         `date` = LOCAL calendar day "YYYY-MM-DD" (default today). Read back via
         `get_notes` (optionally `target_kind="mood"`/`"general"`). Encrypted
         end-to-end before it ever leaves this machine.
+
+        `partner=true` records a note ABOUT your partner ("she had a stomach ache
+        this morning"). It is stored in YOUR account and sealed to you and this
+        machine only — your partner's account is never touched, and it never
+        mixes into your own notes: plain reads leave it out, `get_notes(partner=true)`
+        returns it. Default `false` = a note about you.
         """
 
-        return await service.log_note(text=text, kind=kind, date=date, merge=merge)
+        return await service.log_note(
+            text=text, kind=kind, date=date, merge=merge, partner=partner
+        )
 
     @tool(title="Add to note", annotations=_mutating_tool(destructive=False))
     async def log_note_append(
         text: str,
         kind: str = "general",
         date: str | None = None,
+        partner: bool = False,
     ) -> dict[str, Any]:
         """Add a line to a day's note WITHOUT erasing what is already there (agent write).
 
         There is one note per (kind, day). This tool appends your `text` to it on a
         new line and cannot delete what is already written.
 
-        USE THIS FOR SYMPTOMS. Discomfort arrives in installments across a day —
-        nausea at noon, dizziness at night — so the second write of the day is the
-        normal case, not the exception. `log_note` would replace the morning's
-        entry with the evening's.
+        The second note of a day is the normal case, not the exception — a
+        morning event and an evening one — and `log_note` would replace the
+        first with the second. Symptoms do NOT go here: use `log_symptom`, which
+        keeps type, severity and timing as fields a later analysis can match.
 
         Reach for `log_note` ONLY when you intend your text to become the note's
         ENTIRE contents and whatever is there now to be deleted (e.g. correcting
@@ -1033,9 +1324,140 @@ def run_mcp_server(
         The result is the same shape `log_note` returns. `replaced_text` is always
         `null` here — that null is the receipt that this call deleted nothing.
         Encrypted end-to-end before it ever leaves this machine.
+
+        `partner=true` records a note ABOUT your partner ("she had a stomach ache
+        this morning"). It is stored in YOUR account and sealed to you and this
+        machine only — your partner's account is never touched, and it never
+        mixes into your own notes: plain reads leave it out, `get_notes(partner=true)`
+        returns it. Default `false` = a note about you.
         """
 
-        return await service.log_note(text=text, kind=kind, date=date, merge=True)
+        return await service.log_note(
+            text=text, kind=kind, date=date, merge=True, partner=partner
+        )
+
+    @tool(title="Log symptom", annotations=_mutating_tool(destructive=False))
+    async def log_symptom(
+        symptom_type: str,
+        severity: str = "unspecified",
+        onset_at: str | None = None,
+        end_at: str | None = None,
+        date: str | None = None,
+        display_name: str | None = None,
+        body_location: str | None = None,
+        triggers: list[str] | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Record one symptom the person reports — one call per symptom (agent write).
+
+        This is where "我肚子疼" / "headache since lunch" / "拉肚子了" goes, not a
+        note: each episode is kept as fields (type, severity, timing, place,
+        suspected causes) so a later read can line it up with sleep, food, heart
+        rate and wrist temperature. Two symptoms at once are two calls. This tool
+        only ever adds; it cannot change or delete anything already recorded.
+
+        `symptom_type`: a short English token. Use the Apple Health name when one
+        fits — abdominal_cramps, bloating, constipation, diarrhea, heartburn,
+        nausea, vomiting, headache, dizziness, fatigue, fever, chills, coughing,
+        sore_throat, runny_nose, lower_back_pain, chest_tightness_or_pain,
+        shortness_of_breath, acne, night_sweats… — so it merges with what Apple
+        Health imports; otherwise a plain descriptive one (rectal_bleeding,
+        stomach_spasm, eye_strain). Any spelling is folded to one form.
+        `display_name`: the person's own words, e.g. "便血" / "胃痉挛".
+
+        `severity`: mild | moderate | severe | unspecified. Use `unspecified`
+        unless they said how bad it is — never grade it for them.
+
+        `onset_at`: when it began, ISO 8601 with their UTC offset, e.g.
+        "2026-09-30T10:49+08:00". Omit it only for something happening NOW (it
+        defaults to the current time). If they named a day but no time
+        ("昨天头疼"), pass that day as a bare "2026-09-29" — do not invent an hour.
+        `end_at`: when it eased, if they said; add it later with `update_symptom`.
+        `date`: the local day to file it under, only when it differs from the
+        onset's own day.
+        `body_location`, `note`: free text, only what they said.
+        `triggers`: what THEY suspect caused it, as short tokens
+        (["bbq_dinner", "spicy_food"], ["sleep_deprivation"]). Record their
+        suspicion; do not add causes of your own.
+
+        Returns `entry_id` (keep it for `update_symptom` / `delete_symptom`) and
+        the entry as read back. Read everything with `get_symptoms`. Sealed for
+        the owner and this machine only, end to end, before it leaves here.
+        """
+
+        return await service.log_symptom(
+            symptom_type=symptom_type,
+            severity=severity,
+            onset_at=onset_at,
+            end_at=end_at,
+            date=date,
+            display_name=display_name,
+            body_location=body_location,
+            triggers=triggers,
+            note=note,
+        )
+
+    @tool(
+        title="Update symptom (overwrites given fields)",
+        annotations=_mutating_tool(destructive=True),
+    )
+    async def update_symptom(
+        entry_id: str,
+        severity: str | None = None,
+        end_at: str | None = None,
+        onset_at: str | None = None,
+        date: str | None = None,
+        symptom_type: str | None = None,
+        display_name: str | None = None,
+        body_location: str | None = None,
+        triggers: list[str] | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Change fields of one reported symptom (agent write) — e.g. it eased.
+
+        The common call is `update_symptom(entry_id, end_at="…")` when the person
+        says it has stopped, or a new `severity` when it got worse. Only the
+        fields you pass change; omitted ones keep their value. Passing a field
+        OVERWRITES it: `note` replaces the old note rather than adding to it, and
+        `triggers` replaces the whole list — read the entry first and send the
+        combined list if you mean to add one. `""` clears a text field or a
+        mistaken `end_at`; `[]` clears triggers.
+
+        `entry_id` comes from `log_symptom` or from `get_symptoms`' `reported`
+        list. Symptoms imported from Apple Health cannot be edited here.
+
+        Returns `previous` — the old value of every field this call changed — and
+        the entry as read back.
+        """
+
+        return await service.update_symptom(
+            entry_id=entry_id,
+            symptom_type=symptom_type,
+            severity=severity,
+            onset_at=onset_at,
+            end_at=end_at,
+            date=date,
+            display_name=display_name,
+            body_location=body_location,
+            triggers=triggers,
+            note=note,
+        )
+
+    @tool(title="Delete symptom (erases the entry)", annotations=_mutating_tool(destructive=True))
+    async def delete_symptom(entry_id: str) -> dict[str, Any]:
+        """Erase one reported symptom that was logged by mistake (agent write).
+
+        Only for an entry that should never have existed — a duplicate, the wrong
+        person, a symptom they did not have. A symptom that simply ended is NOT
+        deleted: record its end with `update_symptom(entry_id, end_at=…)`.
+
+        The entry's content is overwritten in the cloud, so it disappears from
+        `get_symptoms` and from the app. The result carries `deleted_entry` — the
+        full entry as it was — so a mistaken delete can be logged again with
+        `log_symptom`. Symptoms imported from Apple Health cannot be deleted here.
+        """
+
+        return await service.delete_symptom(entry_id=entry_id)
 
     # Found by the generalised rule in `test_destructive_titles_name_their_
     # consequence`, not by anyone auditing this line: its own docstring says
@@ -1052,10 +1474,10 @@ def run_mcp_server(
         Encrypted end-to-end before it ever leaves this machine.
 
         Written data always lands in Vaultbeat cloud + MCP (visible to
-        `get_weight_trend`). Whether it also reaches Apple Health depends on an
-        iOS setting: Settings → Data & AI → "Allow AI to update Apple Health"
-        (OFF by default). When it is on, weigh-ins logged here sync back into
-        Apple Health on the next app sync.
+        `get_metric` series "weight_kg"). Whether it also reaches Apple Health depends on an
+        iOS setting, OFF by default: the MCP tab → "Allow AI to update Apple
+        Health" (app 1.2.8 and earlier: Settings → Data & AI). When it is on,
+        weigh-ins logged here sync back into Apple Health on the next app sync.
 
         ⚠️ If the owner wants this number in the Apple Health app, tell them to
         turn that toggle ON — do NOT tell them to re-enter it by hand in the
@@ -1070,125 +1492,46 @@ def run_mcp_server(
 
     @tool(title="Menstrual cycle", annotations=_read_only_tool())
     async def get_menstrual_cycle(
-        limit: int = 90, owner: str | None = None, fresh: bool = False
+        limit: int = 90, partner: bool = False, fresh: bool = False
     ) -> dict[str, Any]:
         """Decrypt recent menstrual cycle data locally and predict the next period.
 
         SENSITIVE: menstrual data only reaches this server if the user explicitly opted
         in on iOS; it stays on-device and is never re-exported. Returns recent samples plus
-        a next-period prediction. Use `owner` prefix to filter by person.
+        a next-period prediction. Reads YOUR cycle by default; if the cycle being
+        asked about is your partner's, pass `partner=true` (it reaches this server
+        only if they share it).
 
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
+        the row count) and `coverage.span_days` beside any average or trend.
+        `coverage.window_satisfied: false` alone does NOT mean a short history: it is
+        also false when older days exist beyond your window. 🔴 Before saying how far
+        back someone's data goes, read `coverage.more_available`: `true` means this
+        server can decrypt days OLDER than `first_day` that your `limit` left behind —
+        re-read with a larger `limit`, or quote `coverage.oldest_available` as the real
+        start of their history. Never report a `limit`-shaped window as the extent of
+        their data.
         """
 
-        return await service.menstrual_cycle_summary(limit=limit, owner=owner, fresh=fresh)
+        return _partner_note(
+            await service.menstrual_cycle_summary(
+                limit=limit, owner=service.person_owner(partner=partner), fresh=fresh
+            ),
+            partner,
+        )
 
-    # Same family, milder: since 2026-08-11 this leaves credentials alone (see
-    # its docstring), but it still overwrites `poll_id` — which invalidates a QR
-    # code already on screen, the exact hazard `vaultbeat_poll_binding` warns
-    # about. The hint stays True; the title now says what for.
-    @tool(
-        title="Start pairing (invalidates any open QR)",
-        annotations=_mutating_tool(destructive=True),
-        # Writes config.json and mints the 0600 identity key — both forbidden
-        # to a demo process (Invariant 61), and both silent. See
-        # `_demo_binding_refusal`.
-        blocked_in_demo=True,
-    )
-    def vaultbeat_start_binding(server_name: str = "Local AI Server") -> dict[str, Any]:
-        """Initialize a binding session: generates a keypair (if needed) and returns a
-        QR payload that the user scans in the Vaultbeat iOS app to authorize this AI server.
-
-        ⚠️ If the user says they cannot see the QR code, believe them. Many
-        terminals and most agent transcripts drop the block characters it is
-        drawn with, so the payload can reach you intact while their screen shows
-        a blank gap — do not assert that it is there. Have them run
-        `uvx vaultbeat-apple-health bind` in a real terminal instead.
-
-        Returns `qr_payload_json` — a JSON string the AI should render as a QR code
-        for the user to scan, plus `poll_id` to pass to `vaultbeat_poll_binding`.
-        After the user scans, call `vaultbeat_poll_binding` to complete authorization.
-        The iOS path is Settings → Data & AI → Connect an AI server.
-
-        Opening a session does NOT disturb an existing binding: the current
-        credentials keep working until a scan actually lands, and are only
-        replaced at that moment. (Before 2026-08-11 this call wiped them up
-        front, so an agent "just re-checking" silently unbound its owner.)
-        """
-
-        session = service.start_binding(server_name=server_name)
-        return {
-            "poll_id": session.poll_id,
-            "qr_payload": session.qr_payload,
-            "qr_payload_json": session.qr_payload_json,
-        }
-
-    # "Check pairing status" until 2026-08-20, which pointed the opposite way to
-    # this tool's own `destructiveHint: True` — and the annotation is right. Its
-    # SUCCESS branch is the write: `store.update` replaces server_id, server_token
-    # (rotated even when the identity is unchanged), the owner identity and
-    # bound_at, and on a new identity also clears last_sync_at and the decrypted
-    # cache. A title that says "Check" invites the reflexive approval that a
-    # destructive hint exists to prevent. House style is `verb (consequence)`,
-    # as in "Log food (replaces day)".
-    @tool(
-        title="Finish pairing (replaces this binding)",
-        annotations=_mutating_tool(destructive=True),
-        # Its success branch overwrites server_id / server_token / owner
-        # identity and can clear the plaintext cache — the most destructive
-        # write in the package, and demo mode has no business reaching it.
-        blocked_in_demo=True,
-    )
-    async def vaultbeat_poll_binding() -> dict[str, Any]:
-        """Check whether the user has scanned the QR code and authorized this server.
-
-        Call this after `vaultbeat_start_binding`. THREE possible `status` values:
-
-        · "pending"  — the pairing is alive and simply has not been scanned yet.
-                       Keep polling with short delays.
-        · "bound"    — success. The server can now decrypt health data.
-        · "expired"  — TERMINAL. Stop polling; no amount of retrying recovers it.
-                       Run `uvx vaultbeat-apple-health bind` for a fresh QR code.
-
-        🔴 "pending" is positive evidence that nothing is wrong. The endpoint
-        looks the pairing row up by pollID and answers "expired" when it is gone,
-        so a long run of "pending" means the row is still there and nobody has
-        scanned — NOT that it went stale while you waited.
-
-        That distinction decides what you tell the user, and getting it backwards
-        is destructive: re-running `bind` mints a NEW pollID, which invalidates
-        the QR they are looking at — so "just run bind again" turns a pairing
-        that was one scan away from working into one that cannot complete. Only
-        do it on "expired".
-
-        So while it stays "pending", the useful action is to get the code
-        scanned, not to restart anything. Connecting is open on every plan, so
-        there is no tier to check; the scanner is at Settings → Data & AI →
-        "Connect an AI server". Do not send them to check the network, reinstall
-        this server, or run diagnostics — none of those are implicated.
-
-        If they cannot see a QR code at all, it is your output that failed, not
-        their phone — see `vaultbeat_start_binding`.
-        """
-
-        result = await service.poll_once()
-        return {
-            "status": result.status,
-            "server_id": result.server_id,
-            "owner_user_id": result.owner_user_id,
-        }
+    # Pairing is not a tool (removed 0.9.0, owner 2026-09-23): it happens once,
+    # at install time, through `uvx vaultbeat-apple-health bind` in a terminal —
+    # the same place every other MCP server does its setup. Two tools that sat in
+    # every agent's tool list forever for a one-time step were noise, and the QR
+    # they relayed often did not render in an agent transcript anyway. An
+    # unpaired read raises `ConfigError` carrying `PAIRING_GUIDANCE`, so the
+    # agent still learns exactly what to tell the user at the moment it matters.
 
     @tool(title="Sleep stage detail", annotations=_read_only_tool())
     async def get_sleep_detail(
         limit: int = 2,
-        owner: str | None = None,
+        partner: bool = False,
         fresh: bool = False,
         include_timeline: bool = False,
     ) -> dict[str, Any]:
@@ -1196,26 +1539,25 @@ def run_mcp_server(
 
         Which sleep tool to use:
         · THIS one for going deep on one or two specific nights (stage bands,
-          per-stage vitals). It defaults to 2 nights because each is ~1-2k
+          per-stage vitals). It defaults to 2 nights because each is ~3k
           characters; see the SIZE note below.
-        · `vaultbeat_sync_sleep` for anything spanning time — "how did I sleep
-          this week/month", trends, averages. Its default of 50 covers ~2-3
-          weeks. Reach for it whenever the question is about a period rather
-          than a night, and do not conclude from THIS tool's two rows that only
-          two nights exist.
+        · `get_sleep_nights` for anything spanning time — "how did I sleep
+          this week/month/year", patterns, worst nights. One compact row per
+          night, a whole year in one read. Reach for it whenever the question
+          is about a period rather than a night, and do not conclude from THIS
+          tool's two rows that only two nights exist.
+        · `get_metric` with the sleep series (`bedtime_minutes`,
+          `deep_sleep_minutes`, `awakenings`, ...) for averages computed for you.
 
         (This used to call itself "the primary tool for detailed sleep analysis",
         which read as "use this one for sleep" and handed back two days to
         anyone who asked how their week went.)
 
         Returns `stage_intervals` (contiguous stage bands with start/end),
-        `stage_minutes`, and `stage_vitals` (per-stage HR/RR min/mean/max). Use
-        `owner` prefix to filter by person — the first characters of a user id.
-        `vaultbeat_doctor` lists them under `capabilities.owner_prefixes`; there
-        is no other way to discover one, and omitting `owner` on a paired
-        account blends both people into one result.
+        `stage_minutes`, and `stage_vitals` (per-stage HR/RR min/mean/max). Reads
+        YOUR nights by default; `partner=true` reads your partner's shared sleep.
 
-        ⚠️ SIZE: each night is ~1-2k characters as returned. Setting
+        ⚠️ SIZE: each night is ~3k characters as returned (a week ~21k). Setting
         `include_timeline=True` adds the raw per-sample array (hr, rr, stage,
         time) — about 13k characters PER NIGHT, which will overflow a typical
         25k-token client budget after 2-3 nights. Ask for it only when you need
@@ -1230,282 +1572,252 @@ def run_mcp_server(
         "slept 0 hours".
 
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
+        the row count) and `coverage.span_days` beside any average or trend.
+        `coverage.window_satisfied: false` alone does NOT mean a short history: it is
+        also false when older days exist beyond your window. 🔴 Before saying how far
+        back someone's data goes, read `coverage.more_available`: `true` means this
+        server can decrypt days OLDER than `first_day` that your `limit` left behind —
+        re-read with a larger `limit`, or quote `coverage.oldest_available` as the real
+        start of their history. Never report a `limit`-shaped window as the extent of
+        their data.
         """
 
-        return await service.sleep_detail_records(
-            limit=limit, owner=owner, fresh=fresh, include_timeline=include_timeline
+        return _partner_note(
+            await service.sleep_detail_records(
+                limit=limit,
+                owner=service.person_owner(partner=partner),
+                fresh=fresh,
+                include_timeline=include_timeline,
+            ),
+            partner,
         )
 
-    @tool(title="Activity rings", annotations=_read_only_tool())
-    async def get_activity(limit: int = 90, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
-        """Decrypt recent daily activity rings (steps, active energy kcal, exercise minutes,
-        stand hours, distance km). One entry per day, newest first.
-        Use `owner` prefix to filter by person. Each record carries `owner_user_id`.
+    @tool(title="Sleep, every night", annotations=_read_only_tool())
+    async def get_sleep_nights(
+        limit: int = 120, since: str | None = None, partner: bool = False, fresh: bool = False,
+    ) -> dict[str, Any]:
+        """Every night as one compact row — the tool for reading a sleep HISTORY.
 
-        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
+        One row per night, newest first: date, weekday, bed and wake time, time
+        asleep, deep / REM / core / awake minutes, deep and REM share, number of
+        awakenings, longest unbroken stretch of sleep, heart and breathing rate
+        while asleep, and any OTHER sleep that day (naps, the second half of a
+        broken night) — so a day's total sleep is `asleep` plus `other`. Column names come once in `columns`; each row is the
+        values in that order, so a whole year is ~40k characters. Read it when
+        the question is about a period or a pattern: weekends vs weekdays,
+        drifting bedtimes, which nights were worst, what changed after a date.
+
+        Which sleep tool:
+        · THIS one for any span of time.
+        · `get_metric` with the sleep series (`sleep_minutes`, `bedtime_minutes`,
+          `deep_sleep_minutes`, `awakenings`, ...) when you want the arithmetic —
+          weekly/monthly averages computed for you, from these same rows.
+        · `get_sleep_detail` for one or two nights in depth (stage bands,
+          per-stage vitals).
+
+        `limit` = newest N nights (default 120; pass 400 for everything, and
+        check `coverage.more_available`). `since` = "YYYY-MM-DD" keeps nights on
+        or after that day — use it for "last month" rather than guessing a limit.
+
+        Read `legend` once. Four flags, comma-separated when a night has several:
+        `unworn` means sleep was never measured that night (not zero sleep),
+        `motion_inferred` means phone motion guessed it (leave it out of averages,
+        as `get_metric` does), `daytime` means the day's main sleep was a daytime
+        nap (real, but not a bedtime), `no_stages` means the total is known but
+        the stage columns are null. A null anywhere is "not measured",
+        never zero. Reads YOUR nights; `partner=true` reads your partner's
+        shared sleep.
+
+        Carries a `coverage` block: quote `coverage.days_covered` beside any
+        average, and read `coverage.more_available` before saying how far back
+        the history goes.
         """
 
-        return _annotate_if_empty(
-            await service.activity_summary(limit=limit, owner=owner, fresh=fresh),
-            "activity",
-            "days",
+        if since is not None:
+            # Compared as a string against zero-padded dates, so "2026-8-1"
+            # would silently select the wrong nights rather than fail.
+            try:
+                since = _date.fromisoformat(since).isoformat()
+            except ValueError:
+                return {
+                    "error": "invalid_since",
+                    "requested": since,
+                    "message": 'Pass `since` as "YYYY-MM-DD", e.g. "2026-08-01".',
+                }
+        summary = await service.sleep_nights(
+            limit=limit, since=since,
+            owner=service.person_owner(partner=partner),
+            fresh=fresh,
         )
-
-    @tool(title="Resting heart rate", annotations=_read_only_tool())
-    async def get_resting_hr(limit: int = 90, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
-        """Decrypt recent resting heart rate samples (bpm). Returns per-day records
-        plus average over the window. Use `owner` prefix to filter by person.
-
-        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
-        """
-
-        return await service.resting_hr_records(limit=limit, owner=owner, fresh=fresh)
+        return _partner_note(_sleep_nights_table(summary, since), partner)
 
     @tool(title="Workouts", annotations=_read_only_tool())
-    async def get_workouts(limit: int = 90, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def get_workouts(limit: int = 90, fresh: bool = False) -> dict[str, Any]:
         """Decrypt recent workout sessions (type, duration, calories, distance).
-        Use `owner` prefix to filter by person.
+        Reads YOUR workouts; workouts are never shared between partners, so this
+        tool has no partner option.
 
         Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
+        the row count) and `coverage.span_days` beside any average or trend.
+        `coverage.window_satisfied: false` alone does NOT mean a short history: it is
+        also false when older days exist beyond your window. 🔴 Before saying how far
+        back someone's data goes, read `coverage.more_available`: `true` means this
+        server can decrypt days OLDER than `first_day` that your `limit` left behind —
+        re-read with a larger `limit`, or quote `coverage.oldest_available` as the real
+        start of their history. Never report a `limit`-shaped window as the extent of
+        their data.
         """
 
-        return await service.workout_records(limit=limit, owner=owner, fresh=fresh)
+        return await service.workout_records(limit=limit, owner=service.person_owner(), fresh=fresh)
 
-    @tool(title="Heart rate variability", annotations=_read_only_tool())
-    async def get_hrv(
-        limit: int = 168,
-        owner: str | None = None,
+    @tool(title="Health profile", annotations=_read_only_tool())
+    async def get_user_profile(fresh: bool = False) -> dict[str, Any]:
+        """Read YOUR health profile: biological sex, age, date of birth, height.
+
+        Use it before anything that depends on sex, age or height — basal
+        metabolic rate, heart-rate zones, VO2 max bands, BMI. It is never shared
+        between partners, so this tool has no partner option.
+
+        `profile.sex_source` says where the sex came from: "chosen" (the person
+        picked it in the app) or "apple_health" (a field in Apple Health they may
+        never have looked at). Every field may be null; `profile` itself is null
+        when nothing was uploaded, and the reply's `note` explains why that
+        cannot be narrowed down. Never fill a null in with a guess.
+
+        A profile is not a series: its `coverage.days_covered` is 0 by
+        construction, and the reply carries no upload time — the stored row is
+        replaced in place on every edit, so nothing here says how current the
+        values are.
+        """
+
+        return await service.user_profile(owner=service.person_owner(), fresh=fresh)
+
+    # ── Daily metrics: one generic reader ──────────────────────────────────
+    #
+    # Replaced ten per-kind tools (`get_resting_hr`, `get_activity`, `get_hrv`,
+    # …) on 2026-09-23. Every one of them was a thin shell over one service
+    # method, and every new data source would have added another shell, another
+    # prompt reference and another README row. The kinds that are not one number
+    # per day keep their own tools above — flattening a workout to "duration"
+    # would answer a question nobody asked while hiding the ones they did.
+
+    @tool(title="Daily health metrics", annotations=_read_only_tool())
+    async def get_metric(
+        series: str | list[str] | None = None,
+        days: int = 30,
+        aggregation: str = "none",
+        granularity: str = "day",
+        partner: bool = False,
         fresh: bool = False,
-        granularity: str = "hourly",
+        since: str | None = None,
+        until: str | None = None,
     ) -> dict[str, Any]:
-        """Decrypt recent HRV (SDNN in ms) — returns records plus average over the window.
+        """Read any one-number-per-day health series: steps, resting HR, HRV, weight, …
 
-        `granularity` selects between two backing kinds:
-        - `"hourly"` (default) — routes to `hrv_hourly` kind: one bucket per
-          UTC hour (arithmetic mean of every raw SDNN sample in the hour).
-          **30-day rolling window**, ≤720 records, includes `sample_count`
-          per bucket. Records also carry a `sdnn_ms` alias equal to the
-          hourly mean, so callers migrating from the pre-build-77 raw
-          default keep working without a field rename. Right for trend /
-          aggregate queries — SAVES CONTEXT vs raw.
-        - `"raw"` — routes to `hrv` kind: one record per SDNN sample (Apple
-          Watch emits every 5-15min). **3-day rolling window**; older raw
-          history lives in prior-recipient envelopes plus the
-          `VaultbeatHistoryBackfillCoordinator`-driven historical push
-          (advances 30d/24h on device wake-ups, up to 5 years). Use for
-          spike-precision questions (e.g. "HRV during the 3 minutes I
-          opened a stressful message"). Note: single-day count is often
-          30-100+ records.
+        `series` takes ONE name, a LIST of names, or nothing (= every series).
+        Names come from `list_metric_series`, which also says how much data backs
+        each — call it first rather than guessing. Activity is five series
+        (steps, active_energy, exercise_minutes, stand_minutes, distance_meters);
+        pass them as a list to get the whole day in one call.
 
-        ⚠️ `average_sdnn_ms` from the two granularities is **NOT directly
-        comparable** — they observe different windows (3d vs 30d) and, on
-        the raw side, also include legacy per-sample blobs from before
-        build 77. Use hourly for "what has my HRV been lately?" trend
-        answers; use raw only when you need per-sample precision inside
-        the last ~3 days. The equivalence claim in previous doc versions
-        was retracted 2026-07-22 after an adversarial review pointed out
-        the window mismatch.
+        `days` = the newest N days THAT HAVE DATA, per series (not N calendar days).
+        For a CALENDAR window — "last month", "this semester", "July" — pass
+        `since` / `until` ("YYYY-MM-DD", either or both) instead; `days` is then
+        ignored and the reply names the `range` it used.
 
-        Use `owner` prefix to filter by person — take it from
-        `vaultbeat_status` (`owner_user_id_prefix` is the paired user; server
-        0.7.1+), or `vaultbeat_doctor` for every owner present in the data.
+        `aggregation` is computed here, not by you: `avg` / `sum` / `min` / `max` /
+        `latest` over the window, or `none` (default) for the per-day points only.
+        `sum` is refused on state measurements (resting HR, weight, VO2max) — it
+        has no meaning there. `granularity` = `day` (default), `week` (ISO weeks)
+        or `month`; week/month return buckets aggregated with `aggregation`
+        (`avg` when `none`), each with `days_with_data` beside `days_in_period`.
+        `period_in_progress: true` marks the current, unfinished week/month and
+        `clipped_by_window: true` the oldest one your `days` cut through — never
+        compare either against a full period as if it were one.
+        `granularity` = `weekday` groups the window by day of the week (Mon..Sun)
+        — the direct answer to "weekends vs weekdays" and to social jet lag. Read
+        its `weekday_note`: sleep is dated by the morning it ends, so `Sat` is the
+        Friday-night sleep.
 
-        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
+        Honesty the reply already does for you, so do not undo it:
+        · On `cumulative` series (steps, energy, water) today is still accruing —
+          it is marked `partial: true` and excluded from every aggregate.
+        · `excluded_days` names days dropped because their data was short (basal
+          energy with the Watch off the wrist, TDEE without basal), with reasons.
+        · Missing days are absent, never zero.
+
+        Each series' `points` (or `buckets`) is a table: `columns` names the
+        fields once and every entry of `rows` is one day (or period) in that
+        order — e.g. `columns: ["date", "value", "partial"]`. The flags above are
+        columns; a day without one has `null` there.
+
+        Each series carries its own `coverage` block: quote `coverage.days_covered`
+        and `coverage.span_days` beside any number. 🔴 Before saying how far back
+        someone's data goes, read `coverage.more_available`: `true` means older days
+        exist that your `days` left behind — ask for more, or quote
+        `coverage.oldest_available`. Never report a window as the extent of their data.
+
+        Reads YOUR data by default.
+        Pass `partner=true` for your partner's — of these series only sleep, water
+        and weight (with body composition) can be shared, so every other series
+        comes back empty for a partner by design.
+
+        Sleep is here too — duration, timing (`bedtime_minutes`, `wake_minutes`,
+        `sleep_midpoint_minutes`), stages, awakenings, heart/breathing rate while
+        asleep; the nights behind those numbers are `get_sleep_nights`. Richer
+        kinds have their own tools: workouts, strength, food, notes, symptoms, cycle,
+        and the sex / age / height profile (`get_user_profile`).
+        Samples within a day (HRV spikes) → `get_intraday`. Trend / period
+        comparison / correlation → `get_metric_trend`, `compare_metric_periods`,
+        `correlate_metric_series`.
         """
 
-        if granularity == "raw":
-            return await service.hrv_records(limit=limit, owner=owner, fresh=fresh)
-
-        # Default + explicit "hourly" → aggregate kind, but fall back to raw
-        # when it yields nothing.
-        #
-        # `hrv_hourly` only started being written by iOS build 77 (2026-07-22).
-        # An App Store user on 1.2.0 has plenty of raw HRV and zero hourly
-        # buckets, so serving the empty hourly result would report "no HRV
-        # data" to someone whose HRV data is sitting right there — a straight
-        # regression against 0.1.2, where get_hrv read raw unconditionally.
-        # Version skew between app and MCP is normal and permanent (users
-        # update the two independently), so the aggregate kind degrades to the
-        # kind it aggregates instead of pretending the data is absent.
-        hourly = await service.hrv_hourly_records(limit=limit, owner=owner, fresh=fresh)
-        if hourly.get("records"):
-            return hourly
-
-        raw = await service.hrv_records(limit=limit, owner=owner, fresh=fresh)
-        if not raw.get("records"):
-            return hourly  # genuinely no HRV at all — keep the hourly shape
-
-        raw["granularity"] = "raw"
-        raw["granularity_note"] = (
-            "Requested hourly averages, but this account has none — hourly HRV "
-            "requires the iOS app from 2026-07-22 or later. Returned raw "
-            "per-sample HRV instead; the numbers are the same measurements, "
-            "just not hour-averaged."
-        )
-        return raw
-
-    @tool(title="Wrist temperature", annotations=_read_only_tool())
-    async def get_wrist_temp(limit: int = 90, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
-        """Decrypt recent sleeping wrist temperature samples — ABSOLUTE °C.
-
-        ⚠️ These are absolute skin temperatures (~35.5-36.5 °C), NOT baseline
-        deltas — the legacy `temperature_delta_celsius` field name is a wire-
-        contract misnomer (kept for compatibility; prefer the honest twin
-        `wrist_temperature_celsius`). For cycle analysis, derive the deviation
-        yourself: reading minus that person's rolling baseline. One sample per
-        night. Use `owner` prefix to filter.
-
-        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
-        """
-
-        return await service.wrist_temp_records(limit=limit, owner=owner, fresh=fresh)
-
-    @tool(title="Basal energy (BMR)", annotations=_read_only_tool())
-    async def get_basal_energy(limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
-        """Decrypt recent basal-energy-burned samples (Apple Watch BMR estimate, kcal).
-        Watch typically emits hourly samples; unlimited limit + daily aggregation
-        returns per-day BMR (~1500-2000 kcal for active young adults) + average.
-        Use `owner` prefix to filter by person.
-
-        READ `hours_covered` BEFORE QUOTING ANY SINGLE DAY. Basal arrives as one
-        blob per hour, so a day the Watch spent off the wrist comes back as a
-        real-looking row that is short in exact proportion — 883 kcal at 12 of
-        24 hours is half a day of data, NOT a collapsed metabolism. Rows with
-        `incomplete: true` are already excluded from `average_daily_basal_kcal`
-        (`average_over_days` is its denominator); if you quote such a day, say
-        how many hours it covers.
-
-        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
-        """
-
-        return _annotate_if_empty(
-            await service.basal_energy_records(limit=limit, owner=owner, fresh=fresh),
-            "basal_energy",
-            "daily",
+        return _metric_tables(
+            await service.metric_values(
+                series=series,
+                days=days,
+                aggregation=aggregation,
+                granularity=granularity,
+                owner=service.person_owner(partner=partner),
+                fresh=fresh,
+                since=since,
+                until=until,
+            )
         )
 
-    @tool(title="Total energy burned (TDEE)", annotations=_read_only_tool())
-    async def get_total_energy_burned(days: int = 30, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
-        """TDEE (total daily energy expenditure) = basal + active per day, last N days.
+    @tool(title="Intraday samples", annotations=_read_only_tool())
+    async def get_intraday(
+        series: str = "hrv_sdnn",
+        granularity: str = "hourly",
+        limit: int = 168,
+        fresh: bool = False,
+    ) -> dict[str, Any]:
+        """Samples WITHIN a day, for the series that record several per day (HRV).
 
-        The truthful daily calorie burn from Watch's actual measurements — not
-        a formula. Diet targets need to aim BELOW this to lose weight (e.g.
-        eating avg_tdee - 500 = ~0.5 kg/week loss). Returns per-day breakdown
-        {day, basal_kcal, active_kcal, total_kcal, basal_missing, partial,
-        basal_hours_covered, basal_hours_expected, basal_incomplete} + average
-        TDEE. Three kinds of day are excluded from the average and each is
-        listed with its reason in `average_excluded_days`: today (`partial`,
-        still accumulating), days with no basal data (`basal_missing`), and
-        days whose Watch coverage was short (`basal_incomplete` — e.g. 16 of 24
-        hours). A short day's kcal is low in proportion to the hours it missed,
-        so including it drags the average down and, since the error is
-        one-directional, never cancels out. Quote `average_tdee_kcal` for diet
-        targets, and if you quote a single day, check `basal_incomplete` first.
-        Use `owner` prefix to filter by person.
+        `granularity`:
+        - `"hourly"` (default) — one row per hour that HAS samples (UTC hour
+          boundaries, shown in local time), the mean SDNN of that hour and its
+          `sample_count`. Right for "how did my HRV move through the day".
+        - `"raw"` — one row per sample, newest first.
 
-        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
+        The Watch measures HRV a handful of times a day, not continuously (more
+        during a Breathe session), so most days have about 8-14 rows either way.
+        `limit` counts ROWS, not days: the default 168 is roughly two to three
+        weeks, not one. How far back the history goes depends on what this
+        phone uploaded, not on a fixed window — read `coverage.oldest_available`
+        and `coverage.more_available`. For one number per day use `get_metric`.
+        Reads YOUR data only: HRV is never shared between partners.
+
+        `rows` is a table in `columns` order (`local_time`, `sdnn_ms`, plus
+        `sample_count` for hourly). Carries a `coverage` block: quote
+        `coverage.days_covered` (distinct days, not the row count) beside any number.
         """
 
-        return await service.total_energy_burned(days=days, owner=owner, fresh=fresh)
-
-    @tool(title="VO₂ max", annotations=_read_only_tool())
-    async def get_vo2max(limit: int = 90, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
-        """Decrypt recent VO2Max samples (Apple Watch cardiorespiratory fitness).
-        Unit: mL/(kg·min); higher = better. Male 20-29 reference: <35 poor,
-        35-42 fair, 42-46 good, 46-50 excellent, 50+ superior. Returns
-        newest-first records plus latest / peak / trough / average over the
-        window. Use `owner` prefix to filter by person. VO2Max is sparse (Watch
-        computes it during outdoor brisk walk/run bouts, days apart), so a
-        limit of 30 usually covers many months.
-
-        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
-        """
-
-        return _annotate_if_empty(
-            await service.vo2max_records(limit=limit, owner=owner, fresh=fresh),
-            "vo2max",
-            "records",
+        return _intraday_table(
+            await service.intraday_values(
+                series=series, granularity=granularity, limit=limit, owner=service.person_owner(), fresh=fresh
+            )
         )
-
-    @tool(title="Mindfulness", annotations=_read_only_tool())
-    async def get_mindfulness(limit: int = 90, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
-        """Decrypt recent daily mindfulness summaries (session count, total minutes).
-        Use `owner` prefix to filter by person.
-
-        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
-        the row count) and `coverage.span_days` beside any average or trend, and read
-        `coverage.window_satisfied: false` as a shorter history than asked, not as a
-        missing kind. 🔴 Before saying how far back someone's data goes, read
-        `coverage.more_available`: `true` means this server can decrypt days OLDER
-        than `first_day` that your `limit` left behind — re-read with a larger
-        `limit`, or quote `coverage.oldest_available` as the real start of their
-        history. Never report a `limit`-shaped window as the extent of their data.
-        """
-
-        return await service.mindfulness_summary(limit=limit, owner=owner, fresh=fresh)
 
     # ── Analysis ───────────────────────────────────────────────────────────
     #
@@ -1523,44 +1835,78 @@ def run_mcp_server(
     # route cannot have. Interpretation stays out (see `analysis.py`).
 
     @tool(title="List analysable series", annotations=_read_only_tool())
-    async def list_metric_series() -> dict[str, Any]:
-        """List every series the trend / compare / correlate tools accept, with units.
+    async def list_metric_series(
+        partner: bool = False, fresh: bool = False
+    ) -> dict[str, Any]:
+        """Every series, with how much data actually backs each one.
 
-        Call this BEFORE guessing a `series` name. Kinds with a richer shape
-        (sleep stages, workouts, strength sets, food, notes, symptoms, cycle) are
+        Call this BEFORE guessing a `series` name, and before concluding a kind is
+        empty. Each row carries `rows` / `first_date` / `last_date` / `latest`, so
+        "does this person track VO2max at all" is answered here in one call instead
+        of by reading the kind and getting nothing back.
+
+        `rows` = the days that HAVE a value for that series — counted the way
+        `get_metric` reads it, so `rows: 2` means `get_metric` can return at most 2
+        points. A kind's series can differ: a partner with 14 weigh-ins may have
+        a BMI on only 2 of those days.
+
+        `cumulative: true` marks the series whose daily value ACCRUES over the day
+        (steps, energy, water). On those the newest value is routinely a partial day
+        and must not be compared against completed ones — that is what makes "steps
+        are down today" wrong at 9am. Measurements of a state (resting HR, VO2max)
+        carry `false` and need no such care.
+
+        Sleep appears here as numbers (duration, timing, stages, awakenings,
+        vitals); read the nights themselves with `get_sleep_nights`. Kinds with a
+        richer shape (workouts, strength sets, food, notes, symptoms, cycle) are
         deliberately absent — flattening them to one number per day would answer a
-        question you did not ask; read them with their own `get_*` tool.
+        question you did not ask; read them with their own tool.
         """
 
-        return {"series": series_catalog(), "note": _SERIES_CATALOG_NOTE}
+        return {
+            "series": await service.series_overview(owner=service.person_owner(partner=partner), fresh=fresh),
+            "note": _SERIES_CATALOG_NOTE,
+        }
 
     @tool(title="Metric trend", annotations=_read_only_tool())
     async def get_metric_trend(
-        series: str, days: int = 30, owner: str | None = None, fresh: bool = False
+        series: str, days: int = 30, partner: bool = False, fresh: bool = False,
+        since: str | None = None, until: str | None = None,
     ) -> dict[str, Any]:
         """Least-squares trend for one daily series: slope per day, endpoints, spread.
 
         `series` is a name from `list_metric_series`. `days` selects the newest N days
         THAT HAVE DATA, not the last N calendar days — compare `n_days` with
-        `span_days` to see whether the history is dense or sparse.
+        `span_days` to see whether the history is dense or sparse. `since` /
+        `until` ("YYYY-MM-DD") fit a calendar window instead.
 
         Returns arithmetic only. `slope_per_day` is in the series' own unit per day and
         carries no threshold, band or verdict; fewer than 3 days returns a null slope
         with a reason rather than a number fitted to noise.
 
         Carries a `coverage` block over the days the arithmetic used: quote
-        `coverage.days_covered` and `coverage.span_days` beside any number here, and
-        read `coverage.window_satisfied: false` as a shorter history than you asked
-        for rather than as a missing kind.
+        `coverage.days_covered` and `coverage.span_days` beside any number here.
+        `coverage.window_satisfied: false` alone does NOT mean a short history — it is
+        also false when older days exist beyond the window; `coverage.more_available`
+        tells the two apart.
         """
 
-        return await service.metric_trend(series=series, days=days, owner=owner, fresh=fresh)
+        return await service.metric_trend(
+            series=series, days=days, owner=service.person_owner(partner=partner), fresh=fresh,
+            since=since, until=until,
+        )
 
     @tool(title="Compare two periods", annotations=_read_only_tool())
     async def compare_metric_periods(
-        series: str, days: int = 7, owner: str | None = None, fresh: bool = False
+        series: str, days: int = 7, partner: bool = False, fresh: bool = False,
+        period: str | None = None, baseline: str | None = None,
     ) -> dict[str, Any]:
-        """Compare the newest `days` days of a series against the `days` before them.
+        """Compare two periods of one series: the newest `days` vs the `days` before, or two named windows.
+
+        To compare CALENDAR periods — "this semester vs the summer", "before and
+        after I started training" — pass `period` and `baseline`, each
+        "YYYY-MM-DD..YYYY-MM-DD" (an open end is allowed: "2026-09-01.."). `days`
+        is then ignored. Without them, the rule below applies.
 
         "Before" means the next-oldest days WITH DATA, so a gap makes the earlier
         window older rather than emptier — read `previous.first_day` / `previous.last_day`
@@ -1570,18 +1916,29 @@ def run_mcp_server(
         which window is better; that depends on the metric and on the person.
 
         Carries a `coverage` block over the days the arithmetic used: quote
-        `coverage.days_covered` and `coverage.span_days` beside any number here, and
-        read `coverage.window_satisfied: false` as a shorter history than you asked
-        for rather than as a missing kind.
+        `coverage.days_covered` and `coverage.span_days` beside any number here.
+        `coverage.window_satisfied: false` alone does NOT mean a short history — it is
+        also false when older days exist beyond the window; `coverage.more_available`
+        tells the two apart.
         """
 
-        return await service.metric_compare_periods(series=series, days=days, owner=owner, fresh=fresh)
+        return await service.metric_compare_periods(
+            series=series, days=days, owner=service.person_owner(partner=partner), fresh=fresh,
+            period=period, baseline=baseline,
+        )
 
     @tool(title="Correlate two series", annotations=_read_only_tool())
     async def correlate_metric_series(
-        series_a: str, series_b: str, days: int = 30, owner: str | None = None, fresh: bool = False
+        series_a: str, series_b: str, days: int = 30, partner: bool = False, fresh: bool = False,
+        since: str | None = None, until: str | None = None, lag_days: int = 0,
     ) -> dict[str, Any]:
         """Pearson r between two daily series, over days that have BOTH recorded.
+
+        `lag_days` pairs `series_a` on each day with `series_b` that many days
+        LATER (negative = earlier): "does a short night show up in HRV the day
+        after" is sleep vs HRV with lag_days=1. Sleep is already dated by the
+        morning it ends, so lag 0 is "last night vs today". `since` / `until`
+        ("YYYY-MM-DD") restrict to a calendar window.
 
         Days missing on either side are dropped, never interpolated and never read as
         zero, so `n_pairs` is usually smaller than either series — quote it with `r`.
@@ -1592,20 +1949,31 @@ def run_mcp_server(
         your answer, and do not translate r into a word like "strong".
 
         Carries a `coverage` block over the days the arithmetic used: quote
-        `coverage.days_covered` and `coverage.span_days` beside any number here, and
-        read `coverage.window_satisfied: false` as a shorter history than you asked
-        for rather than as a missing kind.
+        `coverage.days_covered` and `coverage.span_days` beside any number here.
+        `coverage.window_satisfied: false` alone does NOT mean a short history — it is
+        also false when older days exist beyond the window; `coverage.more_available`
+        tells the two apart.
         """
 
         return await service.metric_correlate(
-            series_a=series_a, series_b=series_b, days=days, owner=owner, fresh=fresh
+            series_a=series_a, series_b=series_b, days=days, owner=service.person_owner(partner=partner),
+            fresh=fresh, since=since, until=until, lag_days=lag_days,
         )
 
     if selected_transport == "stdio":
         mcp.run(transport="stdio")
         return
 
-    _serve_streamable_http(mcp, host=host, port=port, token=token, allow_remote=allow_remote)
+    _serve_streamable_http(
+        mcp,
+        host=host,
+        port=port,
+        token=token,
+        allow_remote=allow_remote,
+        path=_normalize_http_path(path),
+        json_response=json_response,
+        stateless_http=stateless_http,
+    )
 
 
 def _serve_streamable_http(
@@ -1615,6 +1983,9 @@ def _serve_streamable_http(
     port: int,
     token: str | None,
     allow_remote: bool,
+    path: str = "/mcp",
+    json_response: bool = True,
+    stateless_http: bool = True,
 ) -> None:
     """Fail closed before binding a network-reachable socket, then gate with the token."""
 
@@ -1633,6 +2004,13 @@ def _serve_streamable_http(
 
     import uvicorn  # transitive dep of mcp; imported lazily so the stdio path never needs it
 
-    inner = mcp.streamable_http_app()
+    # `host` is forwarded because the SDK keys its DNS-rebinding protection on it
+    # (auto-on for loopback) — the same behaviour v1 derived from the constructor.
+    inner = mcp.streamable_http_app(
+        streamable_http_path=path,
+        json_response=json_response,
+        stateless_http=stateless_http,
+        host=host,
+    )
     app: Any = StaticBearerASGIMiddleware(inner, token) if token else inner
     uvicorn.run(app, host=host, port=port, log_level="info")

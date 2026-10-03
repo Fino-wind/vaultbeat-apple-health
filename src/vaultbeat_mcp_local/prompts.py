@@ -28,7 +28,7 @@ has `tools/list` does not need one.
 HOUSE RULES FOR ADDING ONE
 --------------------------
 · Name the tools it should call, so the agent does not have to guess between
-  `get_sleep_detail` and `get_sleep` (there is no `get_sleep`).
+  `get_sleep_nights`, `get_sleep_detail` and `get_sleep` (there is no `get_sleep`).
 · Append `STYLE`, and append `ABSENCE` too whenever the prompt reads a kind that
   can legitimately be empty — which is most of them.
 · Never encode a threshold, band or grade. "Good HRV" is not ours to define, and
@@ -83,8 +83,8 @@ STYLE = (
     " Style rules: say what the data covers before you conclude anything — quote "
     "`coverage.days_covered` (distinct days, not the row count) and "
     "`coverage.span_days` from the tool result, name how recent the newest day "
-    "is, and treat `coverage.window_satisfied: false` as a shorter history than "
-    "you asked for, not as missing data. Before you tell anyone how far back "
+    "is. `coverage.window_satisfied: false` alone does not mean a short history: "
+    "it is also false when older days exist beyond your window. Before you tell anyone how far back "
     "their records go, read `coverage.more_available`: when it is `true` there "
     "are older days this server can decrypt that your `limit` simply did not "
     "ask for, so widen the `limit` or quote `coverage.oldest_available` — a "
@@ -162,8 +162,15 @@ _INSTRUCTIONS_BODY = (
     "saying you do not know.\n\n"
     "Order of operations: call `vaultbeat_doctor` first — it reports which kinds "
     "actually have data and is the only tool that can tell apart the several "
-    "reasons a kind might be empty. Then read the kind you need. There is no "
-    "`get_sleep`; the sleep tool is `get_sleep_detail`.\n\n"
+    "reasons a kind might be empty. `list_metric_series` then names every "
+    "one-number-per-day series with how much data backs it; read them with "
+    "`get_metric` (one name, a list, or all — it aggregates server-side, so do not "
+    "pull raw days to average them yourself). Sleep has two tools: "
+    "`get_sleep_nights` — every night as one compact row, a year in one call, the "
+    "tool for any period — and `get_sleep_detail` for one or two nights in depth; "
+    "its timing, stages and awakenings are also `get_metric` series. There is no "
+    "`get_sleep`. Workouts, strength, food, notes, symptoms and cycle have their "
+    "own tools, and sex, age and height are `get_user_profile`.\n\n"
     "A short result has three different causes and `coverage.more_available` "
     "separates them, so read it before you explain a short history to anyone.\n"
     "· `more_available: true` — YOUR `limit` is the boundary, nothing else. "
@@ -175,10 +182,12 @@ _INSTRUCTIONS_BODY = (
     "this as 'you only have N days' tells a person their records are missing "
     "when they are sitting right here.\n"
     "· `more_available: false` and the history is still short — THEN it is a "
-    "plan boundary or a fresh pairing. On the free plan and during the 3-day "
-    "trial only the user's last 7 days are uploaded, so that is all this server "
-    "can ever decrypt; asking for a month returns a week, permanently, and "
-    "re-syncing in the iOS app will not change it.\n"
+    "plan boundary or a fresh pairing. From app 1.2.9 the cloud is the paid "
+    "product: an account uploads its whole history while it or its partner has a "
+    "membership or a live trial, and nothing new otherwise (what it already "
+    "uploaded stays readable here). On app 1.2.8 and earlier a free account and a "
+    "trial upload only the last 7 days. Either way that is all this server can "
+    "decrypt, and re-syncing in the iOS app will not change it.\n"
     "· `more_available: null` — the tool did not say. Do not read it as either.\n\n"
     "Writes (`log_*`) record what the user told you, not what you inferred. Read "
     "the day first, append rather than replace when a tool offers both, and never "
@@ -265,11 +274,13 @@ PROMPTS: tuple[VaultbeatPrompt, ...] = (
         description="A short readout of the most recent day, set against the fortnight behind it.",
         template=(
             "Give me a brief on my most recent day of Vaultbeat data. Call "
-            "`vaultbeat_status` first and name the newest date you can see; if it is "
+            "`list_metric_series` first and name the newest `last_date` you can see; if it is "
             "older than yesterday, say so plainly and keep every claim inside that "
-            "date. Then read `get_sleep_detail`, `get_hrv`, `get_resting_hr` and "
-            "`get_activity` for the latest day, and set each against the 14 days "
-            "before it so a number has something to be compared with. Finish with the "
+            "date. Then read `get_sleep_detail` for the latest night, and "
+            "`get_metric` with series [\"hrv_sdnn\", \"resting_hr\", \"steps\", "
+            "\"active_energy\", \"exercise_minutes\"] and days=15, so the latest day "
+            "can be set against the 14 before it and a number has something to be "
+            "compared with. Finish with the "
             "single largest change and the numbers behind it. Under 150 words."
             + STYLE
             + ABSENCE
@@ -284,14 +295,16 @@ PROMPTS: tuple[VaultbeatPrompt, ...] = (
         title="Sleep review",
         description="A descriptive read of recent nights: duration, stages, and the nights that were not measured.",
         template=(
-            "Describe my recent sleep. Use `get_sleep_detail` for the {{nights}} "
-            "nights. Report duration and the stage breakdown where stages exist. "
-            "🔴 Treat `is_in_bed_only` as its own category: those are nights the watch "
+            "Describe my recent sleep over the {{nights}} nights. Read "
+            "`get_sleep_nights` (one row per night; read its `legend` once) and, for "
+            "averages, `get_metric` with the sleep series rather than computing them "
+            "yourself. Report duration, timing and the stage breakdown where stages "
+            "exist. 🔴 Treat the `flag` column as its own categories: `unworn` nights "
             "recorded time in bed without ever measuring sleep, and folding them in as "
-            "zero-minute nights invents bad nights that did not happen — read "
-            "`duration_label` rather than reasoning from the raw minutes. Say how many "
-            "nights of the window actually carried measurements before you describe "
-            "any trend."
+            "zero-minute nights invents bad nights that did not happen; `daytime` is a "
+            "nap that was the only sleep that day, not a bedtime; `no_stages` has a "
+            "total but no breakdown. Say how many nights of the window actually "
+            "carried measurements before you describe any trend."
             + STYLE
             + ABSENCE
         ),
@@ -306,14 +319,16 @@ PROMPTS: tuple[VaultbeatPrompt, ...] = (
         description="Calories in against calories out, with the incomplete days excluded rather than averaged in.",
         template=(
             "Work out my energy balance over the {{days}} days. Read "
-            "`get_total_energy_burned` and `get_food_log` for the same window. "
+            "`get_metric` with series \"total_energy\" and `get_food_log` for the same "
+            "window. "
             "🔴 Before averaging anything, check the coverage fields the burn data "
             "carries: basal energy is stored one record per hour, so a day with only "
             "part of its hours present reports a total that is too low for a reason "
             "that has nothing to do with me. The tool already excludes short days from "
-            "its own average and names them — use its `average_tdee_kcal` and its "
-            "stated day count rather than re-averaging the daily rows yourself, and "
-            "tell me which days were dropped. Food logging is manual, so a day with no "
+            "every aggregate and names them in `excluded_days` — ask for "
+            "aggregation=\"avg\" and quote that value with its `days_used`, rather than "
+            "re-averaging the daily points yourself, and tell me which days were dropped. "
+            "Food logging is manual, so a day with no "
             "entries is a day I did not log, not a day I did not eat: never subtract "
             "from an unlogged day."
             + STYLE
@@ -332,10 +347,10 @@ PROMPTS: tuple[VaultbeatPrompt, ...] = (
             "Review my recent training. Use `get_strength_log` for the {{days}} "
             "days and report per-session volume (sets, reps, load) and how the working "
             "weights moved per movement. Add `get_workouts` for the cardio in the same "
-            "window, and `get_vo2max` if it has anything — it is sparse by nature, "
-            "computed only during outdoor brisk bouts, so days apart is normal and not "
-            "a gap to explain. Then put `get_resting_hr` and `get_hrv` beside it for "
-            "the same dates. Those two are context, not a verdict: say what moved "
+            "window, and `get_metric` series \"vo2max\" if it has anything — it is sparse "
+            "by nature, computed only during outdoor brisk bouts, so days apart is normal "
+            "and not a gap to explain. Then put `get_metric` series \"resting_hr\" and "
+            "\"hrv_sdnn\" beside it for the same dates. Those two are context, not a verdict: say what moved "
             "together and leave it there, because a week where both moved is still one "
             "person and one week."
             + STYLE
@@ -352,10 +367,14 @@ PROMPTS: tuple[VaultbeatPrompt, ...] = (
         template=(
             "Give me a cycle-aware read of {{metric}}. Start with "
             "`get_menstrual_cycle` to get the recorded cycle starts and the observed "
-            "cycle lengths. Then compare the current phase with the SAME phase of "
+            "cycle lengths — it reads MY data by default; if the cycle is my "
+            "partner's, pass `partner=true` to it and to every read below, and never "
+            "mix their metric with mine. Then compare the current phase with the SAME phase of "
             "earlier cycles, using date ranges you build from those starts — not with "
             "the adjacent weeks, which mix phases together and manufacture a trend out "
-            "of an ordinary rhythm. `get_wrist_temp` and `get_symptoms` belong in this "
+            "of an ordinary rhythm. `get_metric` series \"wrist_temp\" (absolute °C, not a "
+            "deviation — compute the deviation against my own mean) and `get_symptoms` "
+            "belong in this "
             "picture where they have data. Say how many prior cycles you actually had "
             "to compare against; with fewer than two, say a like-phase comparison is "
             "not possible yet and stop rather than substituting a weekly one. Phase "
@@ -374,13 +393,12 @@ PROMPTS: tuple[VaultbeatPrompt, ...] = (
         title="Partner check-in",
         description="Read both people's shared data side by side, without turning either into a judgement.",
         template=(
-            "Show me how both of us are doing over the {{days}} days. These tools "
-            "take an `owner` prefix; call each one twice, once per person, rather than "
-            "reading an unfiltered result — an unfiltered call returns both people's "
-            "rows together and carries a `mixed_owners` warning for exactly that "
-            "reason, and an average across two bodies is a number that was true of "
-            "neither. Use whichever of `get_sleep_detail`, `get_hrv`, `get_resting_hr`, "
-            "`get_activity` and `get_weight_trend` have data for both. Report the two "
+            "Show me how both of us are doing over the {{days}} days. Every read "
+            "returns MY data by default; call each tool twice — once as it is, once "
+            "with `partner=true` — and never merge the two, because an average across "
+            "two bodies is a number that was true of neither. Use `get_sleep_nights` "
+            "and `get_metric` for weight_kg, water_liters and sleep_minutes — those "
+            "are what a partner can share. Report the two "
             "columns plainly. 🔴 Sharing is opt-in per data type and is a kindness, not "
             "a monitoring feature: describe what my partner's numbers show and stop "
             "there. No assessment of them, no advice for them, nothing they would be "
@@ -401,8 +419,10 @@ PROMPTS: tuple[VaultbeatPrompt, ...] = (
         template=(
             "Log this into Vaultbeat: {{entry}}. Pick the right tool — "
             "`log_strength_entry` for sets and reps, `log_food_entry` for a meal, "
-            "`log_weight_entry` for a weigh-in, `log_note` for anything subjective "
-            "such as symptoms, mood or how a session felt. Use the `_append` variants "
+            "`log_weight_entry` for a weigh-in, `log_symptom` for something wrong "
+            "with my body (one call per symptom, so each one can later be matched "
+            "against sleep, food and heart rate), `log_note` for mood, events or how "
+            "a session felt. Use the `_append` variants "
             "when adding to something already logged today, so an afternoon meal does "
             "not overwrite the morning one. 🔴 Write only what I actually said. If a "
             "weight, a rep count, a portion or a time is missing, ask me — do not "
@@ -439,9 +459,10 @@ PROMPTS: tuple[VaultbeatPrompt, ...] = (
             "subprocess of my AI client, so it cannot inspect the command line, the "
             "environment or the config file the client actually used, and a green "
             "check is not evidence about that half. Then say which of these it is: "
-            "the account is on the free plan or a trial, which uploads only the last "
-            "7 days to the cloud, so anything older was never sent and no amount of "
-            "re-syncing will produce it; nothing was ever recorded; Apple Health "
+            "the account has no membership or live trial, so from app 1.2.9 its phone "
+            "uploads nothing new to the cloud (on app 1.2.8 and earlier the free plan "
+            "and the trial upload only the last 7 days), and what was never sent no "
+            "amount of re-syncing will produce; nothing was ever recorded; Apple Health "
             "permission is missing for that type; the iOS app predates the feature; "
             "or this server was bound recently and its own encrypted copy of the "
             "history is still filling in. Name one, give the single next action for "
@@ -496,7 +517,7 @@ def render_prompt(prompt: VaultbeatPrompt, arguments: dict[str, Any] | None = No
 
 
 def register_prompts(mcp: Any, *, demo: bool = False) -> int:
-    """Install every prompt on a FastMCP instance. Returns how many.
+    """Install every prompt on a MCPServer instance. Returns how many.
 
     ⚠️ `demo` is PASSED IN rather than read from the environment here, matching
     how `run_mcp_server` freezes it once at startup and hands it down. The
@@ -511,7 +532,7 @@ def register_prompts(mcp: Any, *, demo: bool = False) -> int:
     functions with eight signatures to describe strings we already have.
     """
 
-    from mcp.server.fastmcp.prompts.base import Prompt, PromptArgument
+    from mcp.server.mcpserver.prompts.base import Prompt, PromptArgument
 
     for entry in PROMPTS:
         def _render(_entry: VaultbeatPrompt = entry, **arguments: Any) -> str:
@@ -529,7 +550,7 @@ def register_prompts(mcp: Any, *, demo: bool = False) -> int:
                 fn=_render,
                 # Explicit despite defaulting to None in the model: the SDK
                 # declares it without a default, so mypy requires it. It is the
-                # name of the parameter FastMCP would inject a `Context` into,
+                # name of the parameter MCPServer would inject a `Context` into,
                 # and these renderers take none.
                 context_kwarg=None,
             )

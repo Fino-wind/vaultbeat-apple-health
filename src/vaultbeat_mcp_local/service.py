@@ -3,28 +3,40 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
+import re
 import secrets
+import time
+from collections import Counter
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
-from collections.abc import Callable
+from datetime import date, datetime, timedelta, timezone, tzinfo
+from collections.abc import Awaitable, Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Protocol, TypeVar
 
 from vaultbeat_mcp_local.analysis import (
+    SERIES,
     compare_periods,
     correlate,
     daily_series,
+    excluded_days as series_excluded_days,
     lookup as series_lookup,
     series_catalog,
     trend,
 )
+from vaultbeat_mcp_local.app_paths import AUTHORIZED_SERVERS, CONNECT_SERVER, HEALTH_ACCESS, RESYNC
 from vaultbeat_mcp_local.cache import LocalRecordCache
 from vaultbeat_mcp_local.client import (
+    _ISO_TIMESTAMP,
+    _REQUEST_ID,
     PollBindingResult,
+    VaultbeatBlobOwnerConflictError,
     VaultbeatCloudClient,
     VaultbeatCloudError,
     VaultbeatTrialExpiredError,
     VaultbeatUnsupportedMetricError,
+    server_token,
 )
 from vaultbeat_mcp_local.crypto import (
     RecipientKey,
@@ -35,6 +47,7 @@ from vaultbeat_mcp_local.crypto import (
     encrypt_blob_payload,
 )
 from vaultbeat_mcp_local.store import (
+    DEFAULT_API_BASE_URL,
     PAIRING_GUIDANCE,
     ConfigError,
     ConfigStore,
@@ -68,6 +81,8 @@ METRIC_STRENGTH = "strength"
 METRIC_FOOD = "food"
 METRIC_VO2MAX = "vo2max"
 METRIC_BASAL_ENERGY = "basal_energy"
+# One record per user: biological sex, date of birth, height (GitHub #14).
+METRIC_PROFILE = "profile"
 
 # Every metric kind this layer understands. Doubles as the safety gate for
 # anything derived from a caller-supplied metric_type (cache file names, the
@@ -92,6 +107,7 @@ KNOWN_METRIC_TYPES = frozenset(
         METRIC_FOOD,
         METRIC_VO2MAX,
         METRIC_BASAL_ENERGY,
+        METRIC_PROFILE,
     }
 )
 
@@ -148,6 +164,46 @@ SYMPTOM_SEVERITY_VALUES = frozenset(
     }
 )
 
+# ── Self-reported symptom entries (2026-09-30, GitHub #3) ─────────────────────
+#
+# A second payload shape under metric_type "symptom". The HealthKit import is one
+# blob per (device, day) carrying `dayID` + `samples`; a REPORTED entry is one blob
+# per episode carrying `entryID`, written by `log_symptom` or by the app's own
+# symptom card. The key that tells them apart is `entryID` — nothing else — so a
+# reader never has to guess. Sharing the kind rather than adding one keeps the
+# DB CHECK, the mcp-sync whitelist and every other metric-kind registry untouched
+# (Invariant 18), and the two shapes land in one `get_symptoms` answer.
+#
+# Only the four values a person can actually report. HealthKit's presence and
+# appetite enums (present / notPresent / noChange / …) stay on the import side:
+# logging a symptom already says it is present, and "notPresent" is not an entry.
+SYMPTOM_ENTRY_SEVERITIES = frozenset({"unspecified", "mild", "moderate", "severe"})
+
+# HealthKit's symptom identifiers, as the iOS importer writes them
+# (`VaultbeatSymptomHealthKitReader.catalog`). A reported type that names one of
+# these is stored under the SAME spelling, so "abdominal_cramps" logged by an
+# agent and an Apple Health `abdominalCramps` sample count as one symptom.
+HEALTHKIT_SYMPTOM_TYPES = frozenset(
+    {
+        "abdominalCramps", "bloating", "constipation", "diarrhea", "heartburn",
+        "nausea", "vomiting", "appetiteChanges", "chills", "dizziness", "fainting",
+        "fatigue", "fever", "generalizedBodyAche", "hotFlashes",
+        "chestTightnessOrPain", "coughing", "rapidPoundingOrFlutteringHeartbeat",
+        "shortnessOfBreath", "skippedHeartbeat", "wheezing", "lowerBackPain",
+        "headache", "memoryLapse", "moodChanges", "lossOfSmell", "lossOfTaste",
+        "runnyNose", "sinusCongestion", "soreThroat", "breastPain", "pelvicPain",
+        "vaginalDryness", "acne", "drySkin", "hairLoss", "nightSweats",
+        "sleepChanges", "bladderIncontinence",
+    }
+)
+_HEALTHKIT_SYMPTOM_BY_KEY = {name.lower(): name for name in HEALTHKIT_SYMPTOM_TYPES}
+
+# Bounds on free text. Generous for a person describing their body, tight enough
+# that a runaway agent cannot grow one entry past the edge's ciphertext ceiling.
+_SYMPTOM_TEXT_MAX = 2_000
+_SYMPTOM_LABEL_MAX = 120
+_SYMPTOM_TRIGGERS_MAX = 20
+
 # Menstrual flow enum (mirrors the iOS HKCategoryValueVaginalBloodFlow mapping).
 MENSTRUAL_FLOW_VALUES = frozenset({"unspecified", "light", "medium", "heavy", "none"})
 
@@ -189,6 +245,10 @@ class CloudClientProtocol(Protocol):
         self, server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]
     ) -> dict[str, Any]: ...
 
+    async def write_symptom_blob(
+        self, server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]
+    ) -> dict[str, Any]: ...
+
     async def report_decrypt_failures(self, server_token: str, *, items: list[dict[str, str]]) -> None: ...
 
 
@@ -225,17 +285,23 @@ class DecryptedRecord:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> DecryptedRecord:
-        """Inverse of `to_dict` — used to rehydrate cache entries."""
+        """Inverse of `to_dict` — used to rehydrate cache entries.
 
+        🔴 The same shapes `_decrypt_row` enforces, applied again here (review
+        V10, 2026-10-03): a cache written before R5 holds the server's columns
+        as they came, and replayed them verbatim for as long as the kind's
+        digest did not change. Re-checking costs nothing and does not depend
+        on the cache ever being refreshed.
+        """
+
+        kind = raw.get("metric_type")
         return cls(
-            envelope_id=str(raw.get("envelope_id", "")),
-            blob_id=str(raw.get("blob_id", "")),
-            metric_type=(str(raw["metric_type"]) if raw.get("metric_type") is not None else None),
-            created_at=(str(raw["created_at"]) if raw.get("created_at") is not None else None),
+            envelope_id=_safe_row_id(raw.get("envelope_id", "")),
+            blob_id=_safe_row_id(raw.get("blob_id", "")),
+            metric_type=kind if kind in KNOWN_METRIC_TYPES else None,
+            created_at=_safe_shaped(raw.get("created_at"), _INSTANT),
             payload=raw.get("payload"),
-            owner_user_id=(
-                str(raw["owner_user_id"]) if raw.get("owner_user_id") is not None else None
-            ),
+            owner_user_id=_safe_shaped(raw.get("owner_user_id"), _UUID),
         )
 
 
@@ -571,6 +637,46 @@ class VO2MaxRecord:
 
 
 @dataclass(frozen=True)
+class ProfileRecord:
+    """The Health Profile decoded from a metric_type="profile" blob (GitHub #14).
+
+    Every field may be None: Apple Health returns the same nothing for "not
+    set" and "not allowed", and the app omits a field rather than guess.
+    `sex_source` is "chosen" (the person picked it in the app) or
+    "apple_health" (a stored field they may never have looked at).
+    """
+
+    record_id: str
+    biological_sex: str | None
+    sex_source: str | None
+    date_of_birth: str | None
+    height_cm: float | None
+    owner_user_id: str | None = None
+
+    def age_on(self, today: date) -> int | None:
+        if not self.date_of_birth:
+            return None
+        try:
+            born = date.fromisoformat(self.date_of_birth)
+        except ValueError:
+            return None
+        if born > today:
+            return None
+        return today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+
+    def to_dict(self, *, today: date) -> dict[str, Any]:
+        return {
+            "record_id": self.record_id,
+            "biological_sex": self.biological_sex,
+            "sex_source": self.sex_source,
+            "date_of_birth": self.date_of_birth,
+            "age": self.age_on(today),
+            "height_cm": self.height_cm,
+            "owner_user_id": self.owner_user_id,
+        }
+
+
+@dataclass(frozen=True)
 class NoteRecord:
     """One free-text annotation pinned to (target_kind, local day), decoded from a
     metric_type="note" blob.
@@ -588,12 +694,21 @@ class NoteRecord:
     created_at: str | None
     updated_at: str | None
     owner_user_id: str | None
+    about: str = "self"
+    """"self" or "partner". A note the user's AI wrote ABOUT the partner lives in
+    the USER's account (sealed to the user + this server, never to the partner),
+    so the writer alone cannot say whose body it describes. Missing on every note
+    written before 2026-09-23, which were all about their writer."""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "note_id": self.note_id,
+            "about": self.about,
             "target_kind": self.target_kind,
-            "target_date": self.target_date,
+            # The day the note is ABOUT, as a local calendar day — the form
+            # `log_note` takes. The wire value is the UTC instant of local
+            # midnight, which read as the previous day east of UTC (2026-10-02).
+            "target_date": _local_date_fields(self.target_date).get("local_date", self.target_date),
             **_local_date_fields(self.target_date),
             "text": self.text,
             "created_at": self.created_at,
@@ -632,7 +747,9 @@ class StrengthRecord:
     def to_dict(self) -> dict[str, Any]:
         return {
             "entry_id": self.entry_id,
-            "date": self.date,
+            # The training DAY, local — the form `log_strength_entry` takes. The
+            # wire value is the UTC instant of local midnight (2026-10-02).
+            "date": _local_date_fields(self.date).get("local_date", self.date),
             **_local_date_fields(self.date),
             "exercises": self.exercises,
             "note": self.note,
@@ -727,6 +844,77 @@ class SymptomDay:
             **_local_date_fields(self.day_start_date),
             "owner_user_id": self.owner_user_id,
             "samples": [sample.to_dict() for sample in self.samples],
+        }
+
+
+@dataclass(frozen=True)
+class SymptomEntry:
+    """One self-reported symptom episode (GitHub #3), decoded from a
+    metric_type="symptom" blob that carries `entryID`.
+
+    Written by `log_symptom` or by the app. Unlike a HealthKit `SymptomDay`, it
+    is one blob per episode, so an episode that starts at 23:30 and eases the
+    next morning stays one record. `local_date` is the day the WRITER filed it
+    under — carried in the payload for the reason `log_weight_entry` gives: a
+    date string has no timezone for two machines to disagree about.
+
+    `onset_at` is None when only the day is known ("昨天头疼"), which is honest
+    where a fabricated midnight would not be. `deleted` marks a tombstone: the
+    blob that once held the entry now holds nothing but its id.
+    """
+
+    entry_id: str
+    symptom_type: str
+    severity: str
+    local_date: str
+    onset_at: str | None
+    end_at: str | None
+    display_name: str | None
+    body_location: str | None
+    triggers: tuple[str, ...]
+    note: str | None
+    created_at: str | None
+    updated_at: str | None
+    owner_user_id: str | None
+    deleted: bool = False
+
+    def sort_key(self) -> str:
+        """Business order for Invariant 38's cut: the filed day, then the onset."""
+
+        return f"{self.local_date}|{self.onset_at or ''}"
+
+    def to_dict(self) -> dict[str, Any]:
+        duration: int | None = None
+        if self.onset_at and self.end_at:
+            try:
+                delta = _parse_iso8601(self.end_at) - _parse_iso8601(self.onset_at)
+                duration = max(int(delta.total_seconds() // 60), 0)
+            except ValueError:
+                duration = None
+        onset_local = _local_date_fields(self.onset_at, with_time=True).get("local_time")
+        end_local = _local_date_fields(self.end_at, with_time=True).get("local_time")
+        return {
+            "entry_id": self.entry_id,
+            "symptom_type": self.symptom_type,
+            "healthkit_type": self.symptom_type in HEALTHKIT_SYMPTOM_TYPES,
+            "display_name": self.display_name,
+            "severity": self.severity,
+            "local_date": self.local_date,
+            "onset_at": self.onset_at,
+            "onset_local_time": onset_local,
+            "end_at": self.end_at,
+            "end_local_time": end_local,
+            # Deliberately not "ongoing": a missing end means nobody logged one,
+            # which is what was OBSERVED. Whether it is still going is a question
+            # to ask the person, not a state to print.
+            "end_recorded": self.end_at is not None,
+            "duration_minutes": duration,
+            "body_location": self.body_location,
+            "triggers": list(self.triggers),
+            "note": self.note,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "owner_user_id": self.owner_user_id,
         }
 
 
@@ -980,6 +1168,33 @@ def parse_vo2max_record(payload: Any, *, owner_user_id: str | None = None) -> VO
     )
 
 
+def parse_profile_record(payload: Any, *, owner_user_id: str | None = None) -> ProfileRecord:
+    """Decode a decrypted profile blob into a typed ProfileRecord.
+
+    Wire contract mirrors iOS VaultbeatHealthProfileSharedCloudPayload:
+    {profileID, biologicalSex?, sexSource?, dateOfBirth? ("YYYY-MM-DD"), heightCm?}.
+    """
+
+    data = _require_mapping(payload, METRIC_PROFILE)
+    if "profileID" not in data:
+        raise VaultbeatCryptoError("profile payload is missing profileID")
+    sex = data.get("biologicalSex")
+    if sex not in (None, "female", "male", "other"):
+        raise VaultbeatCryptoError(f"profile payload has an unknown biologicalSex: {sex!r}")
+    height = data.get("heightCm")
+    if height is not None and (not isinstance(height, (int, float)) or isinstance(height, bool)):
+        raise VaultbeatCryptoError("profile payload heightCm is not a number")
+    birth = data.get("dateOfBirth")
+    return ProfileRecord(
+        record_id=str(data["profileID"]),
+        biological_sex=sex,
+        sex_source=data.get("sexSource") if isinstance(data.get("sexSource"), str) else None,
+        date_of_birth=str(birth) if birth else None,
+        height_cm=float(height) if height is not None else None,
+        owner_user_id=owner_user_id,
+    )
+
+
 def parse_menstrual_day(payload: Any, *, owner_user_id: str | None = None) -> MenstrualDay:
     """Decode a decrypted menstrual blob into a typed MenstrualDay (no prediction)."""
 
@@ -1049,6 +1264,281 @@ def parse_symptom_day(payload: Any, *, owner_user_id: str | None = None) -> Symp
     )
 
 
+def is_symptom_entry_payload(payload: Any) -> bool:
+    """True for a self-reported entry, False for a HealthKit day blob.
+
+    `entryID` is the one discriminator (see SYMPTOM_ENTRY_SEVERITIES' header).
+    """
+
+    return isinstance(payload, dict) and "entryID" in payload
+
+
+def _optional_text(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def parse_symptom_entry(payload: Any, *, owner_user_id: str | None = None) -> SymptomEntry:
+    """Decode a self-reported symptom blob into a typed SymptomEntry.
+
+    Wire contract (camelCase, shared with iOS `VaultbeatSymptomEntryPayload`):
+    {entryID, symptomType, severity, localDate, onsetAt?, endAt?, displayName?,
+    bodyLocation?, triggers?, note?, createdAt?, updatedAt?}; a tombstone is
+    {entryID, deleted: true, updatedAt}. Optional fields tolerate absence so an
+    older or newer writer still decodes; `severity` is held to the four values a
+    writer may emit, like `parse_symptom_day` holds the HealthKit enum.
+    """
+
+    data = _require_mapping(payload, METRIC_SYMPTOM)
+    entry_id = data.get("entryID")
+    if not isinstance(entry_id, str) or not entry_id:
+        raise VaultbeatCryptoError("symptom entry is missing entryID")
+    updated_at = _optional_text(data.get("updatedAt"))
+    created_at = _optional_text(data.get("createdAt"))
+    if data.get("deleted") is True:
+        return SymptomEntry(
+            entry_id=entry_id,
+            symptom_type="",
+            severity="unspecified",
+            local_date="",
+            onset_at=None,
+            end_at=None,
+            display_name=None,
+            body_location=None,
+            triggers=(),
+            note=None,
+            created_at=created_at,
+            updated_at=updated_at,
+            owner_user_id=owner_user_id,
+            deleted=True,
+        )
+    symptom_type = data.get("symptomType")
+    if not isinstance(symptom_type, str) or not symptom_type:
+        raise VaultbeatCryptoError("symptom entry is missing symptomType")
+    severity = str(data.get("severity", "unspecified"))
+    if severity not in SYMPTOM_ENTRY_SEVERITIES:
+        raise VaultbeatCryptoError(f"symptom entry has unknown severity value: {severity}")
+    onset_at = _optional_text(data.get("onsetAt"))
+    local_date = _optional_text(data.get("localDate"))
+    if local_date is None:
+        # A writer that left the day out still said when it began; file it under
+        # that instant's local day rather than dropping the record.
+        local_date = _local_date_fields(onset_at).get("local_date")
+    if not local_date:
+        raise VaultbeatCryptoError("symptom entry has neither localDate nor onsetAt")
+    raw_triggers = data.get("triggers")
+    triggers = tuple(
+        t.strip() for t in (raw_triggers if isinstance(raw_triggers, list) else [])
+        if isinstance(t, str) and t.strip()
+    )
+    return SymptomEntry(
+        entry_id=entry_id,
+        symptom_type=symptom_type,
+        severity=severity,
+        local_date=local_date,
+        onset_at=onset_at,
+        end_at=_optional_text(data.get("endAt")),
+        display_name=_optional_text(data.get("displayName")),
+        body_location=_optional_text(data.get("bodyLocation")),
+        triggers=triggers,
+        note=_optional_text(data.get("note")),
+        created_at=created_at,
+        updated_at=updated_at,
+        owner_user_id=owner_user_id,
+    )
+
+
+def normalize_symptom_type(raw: Any) -> str:
+    """One spelling per symptom, so reported entries and HealthKit samples join.
+
+    A HealthKit type is matched ignoring case and separators ("abdominal_cramps",
+    "Abdominal Cramps", "abdominalcramps" → "abdominalCramps"). Anything else is
+    folded into the same camelCase HealthKit uses ("rectal_bleeding" →
+    "rectalBleeding"). Non-ASCII is refused rather than stored: the type is the
+    join key across months of records, and "便血" today, "便中带血" next week
+    would be two symptoms. The person's own words go in `display_name`.
+    """
+
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("symptom_type must be a non-empty string")
+    text = raw.strip()
+    if not text.isascii():
+        raise ValueError(
+            f"symptom_type must be an English token such as 'rectal_bleeding' or "
+            f"'headache', not {text!r}; put the person's own words in display_name"
+        )
+    key = re.sub(r"[^a-z0-9]", "", text.lower())
+    if not key:
+        raise ValueError(f"symptom_type {text!r} has no letters or digits")
+    if key in _HEALTHKIT_SYMPTOM_BY_KEY:
+        return _HEALTHKIT_SYMPTOM_BY_KEY[key]
+    # Split on separators AND on existing camelCase humps, then re-join as camelCase.
+    words: list[str] = [
+        w.lower()
+        for chunk in re.split(r"[^A-Za-z0-9]+", text)
+        for w in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+", chunk)
+    ]
+    if not words:
+        raise ValueError(f"symptom_type {text!r} has no letters or digits")
+    if len(key) > 64:
+        raise ValueError("symptom_type is too long for a type token (max 64 letters)")
+    return words[0] + "".join(w.capitalize() for w in words[1:])
+
+
+def _symptom_wire_instant(value: datetime) -> str:
+    """UTC, whole seconds, trailing Z — the form the app's own encoder writes, so
+    an entry the app re-saves reads back byte-for-byte in the same shape."""
+
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _parse_symptom_time(value: str, field: str) -> tuple[datetime | None, date | None]:
+    """`(instant, None)` for a date-time, `(None, day)` for a bare 'YYYY-MM-DD'.
+
+    A date-time without an offset is read in this machine's timezone — the
+    module-wide assumption `_local_calendar_day` states.
+    """
+
+    text = value.strip()
+    if len(text) == 10 and text[4] == "-" and text[7] == "-":
+        try:
+            return None, date.fromisoformat(text)
+        except ValueError as error:
+            raise ValueError(f"{field} {value!r} is not a real calendar day") from error
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00").replace("z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(
+            f"{field} must be ISO 8601 such as '2026-09-30T10:49+08:00' (or a bare "
+            f"'2026-09-30' when only the day is known), got {value!r}"
+        ) from error
+    if parsed.tzinfo is None:
+        # A naive time is this machine's wall clock ON THAT DATE (see `_local_midnight`).
+        parsed = parsed.astimezone()
+    return parsed, None
+
+
+def _bounded_text(value: Any, field: str, limit: int) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    text = value.strip()
+    if len(text) > limit:
+        raise ValueError(f"{field} is longer than {limit} characters")
+    return text or None
+
+
+def _validate_symptom_fields(
+    *,
+    symptom_type: Any,
+    severity: Any,
+    onset_at: Any,
+    end_at: Any,
+    day: Any,
+    display_name: Any,
+    body_location: Any,
+    triggers: Any,
+    note: Any,
+    default_onset: datetime | None,
+) -> dict[str, Any]:
+    """Normalise one entry's fields into the camelCase wire shape, or raise.
+
+    `default_onset` fills a missing onset (a fresh log means "now"); an update
+    passes None because the existing onset is already in `onset_at`.
+    """
+
+    kind = normalize_symptom_type(symptom_type)
+    level = severity.strip().lower() if isinstance(severity, str) else ""
+    if level not in SYMPTOM_ENTRY_SEVERITIES:
+        raise ValueError(
+            f"severity must be one of {sorted(SYMPTOM_ENTRY_SEVERITIES)}, got {severity!r} "
+            "(use 'unspecified' when the person did not say how bad it is)"
+        )
+
+    onset_instant: datetime | None = None
+    onset_day: date | None = None
+    if isinstance(onset_at, str) and onset_at.strip():
+        onset_instant, onset_day = _parse_symptom_time(onset_at, "onset_at")
+    elif onset_at is not None and not isinstance(onset_at, str):
+        raise ValueError("onset_at must be a string")
+    elif default_onset is not None:
+        onset_instant = default_onset
+
+    end_instant: datetime | None = None
+    if isinstance(end_at, str) and end_at.strip():
+        end_instant, _end_day = _parse_symptom_time(end_at, "end_at")
+        if end_instant is None:
+            raise ValueError("end_at needs a time of day, not just a date")
+    elif end_at is not None and not isinstance(end_at, str):
+        raise ValueError("end_at must be a string")
+
+    if isinstance(day, str) and day.strip():
+        try:
+            local_day = date.fromisoformat(day.strip())
+        except ValueError as error:
+            raise ValueError(f"date must be 'YYYY-MM-DD', got {day!r}") from error
+    elif onset_instant is not None:
+        # The wall-clock day in the offset the caller wrote (or this machine's,
+        # for a naive time) — the person's day, not UTC's.
+        local_day = onset_instant.date()
+    elif onset_day is not None:
+        local_day = onset_day
+    else:
+        raise ValueError("give onset_at (when it began) or date (the day it happened)")
+
+    now = datetime.now(timezone.utc)
+    if onset_instant is not None and onset_instant > now + timedelta(minutes=5):
+        raise ValueError("onset_at is in the future")
+    if end_instant is not None and end_instant > now + timedelta(minutes=5):
+        raise ValueError("end_at is in the future")
+    if onset_instant is not None and end_instant is not None and end_instant < onset_instant:
+        raise ValueError("end_at is before onset_at")
+
+    if triggers is None:
+        raw_triggers: list[Any] = []
+    elif isinstance(triggers, str):
+        raw_triggers = [triggers]
+    elif isinstance(triggers, (list, tuple)):
+        raw_triggers = list(triggers)
+    else:
+        raise ValueError("triggers must be a list of short strings")
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in raw_triggers:
+        text = _bounded_text(item, "each trigger", _SYMPTOM_LABEL_MAX)
+        if text and text.casefold() not in seen:
+            seen.add(text.casefold())
+            cleaned.append(text)
+    if len(cleaned) > _SYMPTOM_TRIGGERS_MAX:
+        raise ValueError(f"at most {_SYMPTOM_TRIGGERS_MAX} triggers per entry")
+
+    return {
+        "symptomType": kind,
+        "severity": level,
+        "localDate": local_day.isoformat(),
+        "onsetAt": _symptom_wire_instant(onset_instant) if onset_instant else None,
+        "endAt": _symptom_wire_instant(end_instant) if end_instant else None,
+        "displayName": _bounded_text(display_name, "display_name", _SYMPTOM_LABEL_MAX),
+        "bodyLocation": _bounded_text(body_location, "body_location", _SYMPTOM_LABEL_MAX),
+        "triggers": cleaned,
+        "note": _bounded_text(note, "note", _SYMPTOM_TEXT_MAX),
+    }
+
+
+def _symptom_entry_payload(
+    entry_id: str, fields: dict[str, Any], *, created_at: str, updated_at: str
+) -> dict[str, Any]:
+    """The plaintext of one reported entry. Empty optionals are left out so the
+    wire carries only what someone actually said."""
+
+    return {
+        "entryID": entry_id,
+        **{key: value for key, value in fields.items() if value not in (None, [])},
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+    }
+
+
 def parse_note(payload: Any, *, owner_user_id: str | None = None) -> NoteRecord:
     """Decode a decrypted note blob into a typed NoteRecord.
 
@@ -1073,6 +1563,7 @@ def parse_note(payload: Any, *, owner_user_id: str | None = None) -> NoteRecord:
         created_at=(str(data["createdAt"]) if data.get("createdAt") is not None else None),
         updated_at=(str(data["updatedAt"]) if data.get("updatedAt") is not None else None),
         owner_user_id=owner_user_id,
+        about="partner" if data.get("about") == "partner" else "self",
     )
 
 
@@ -1112,10 +1603,93 @@ def parse_strength(payload: Any, *, owner_user_id: str | None = None) -> Strengt
     )
 
 
+def _strength_number_key(value: Any) -> str:
+    """A set's number as the same text whichever writer wrote it.
+
+    🔴 The iOS encoder writes a whole Double without its fraction (`39`) and the
+    agent path writes a float (`39.0`), so `str()` of the two never matched and
+    the copy this exists to collapse was counted twice for every whole weight
+    (review V3, 2026-10-03 — the tests wrote `39.0` on both sides).
+    """
+    if isinstance(value, bool):
+        return repr(value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return repr(value)
+    return repr(number) if math.isfinite(number) else repr(value)
+
+
+def _strength_exercise_key(exercise: dict[str, Any]) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """An exercise as a comparable value: its name (case-folded, as
+    `_merge_strength_exercises` compares it) and every set, in order."""
+
+    sets = tuple(
+        (_strength_number_key(s.get("weightKg")), _strength_number_key(s.get("reps")))
+        if isinstance(s, dict) else (repr(s), "")
+        for s in exercise.get("sets") or []
+    )
+    return str(exercise.get("name") or "").strip().casefold(), sets
+
+
+def _split_same_day_copies(
+    sessions: list[StrengthRecord],
+) -> tuple[list[StrengthRecord], list[tuple[StrengthRecord, str]]]:
+    """Separate sessions that are a COPY of another one logged the same day.
+
+    Both writers keep one session per local day — the app's store is keyed by
+    day and `log_strength_entry` reuses the day's entry id — so two entry ids
+    on one day only arise when a writer mints an id for a day whose other
+    entry it has not seen yet. Measured 2026-10-03 (release gate G3): an
+    agent's 02:37 write held one exercise; the phone, not having pulled it,
+    started its own entry for that day at 02:57 holding the same exercise and
+    more. Both blobs are real rows, so the read returned both: the day counted
+    as two sessions and its 1872 kg lat pulldown was summed twice.
+
+    A session is dropped from the totals only when EVERY exercise in it —
+    name and every set — already appears in a session of the same person and
+    day that was touched more recently. A session holding anything of its own
+    is kept: a genuine second workout must never be swallowed to make a count
+    look tidy. Dropped sessions are returned, never erased (Invariant 41).
+    """
+
+    groups: dict[tuple[str, str], list[StrengthRecord]] = {}
+    for entry in sessions:
+        day = _local_date_fields(entry.date).get("local_date", entry.date[:10])
+        groups.setdefault((entry.owner_user_id or "", str(day)), []).append(entry)
+
+    kept: list[StrengthRecord] = []
+    copies: list[tuple[StrengthRecord, str]] = []
+    for group in groups.values():
+        if len(group) == 1:
+            kept.extend(group)
+            continue
+        group.sort(key=lambda e: e.updated_at or e.created_at or "", reverse=True)
+        day_kept: list[StrengthRecord] = []
+        for entry in group:
+            keys = Counter(_strength_exercise_key(x) for x in entry.exercises)
+            # A multiset, not a set: [E, E] is two exercises' worth of work and
+            # is not a copy of [E] (review V3).
+            holder = next(
+                (k for k in day_kept
+                 if keys <= Counter(_strength_exercise_key(x) for x in k.exercises)),
+                None,
+            )
+            if holder is not None and keys:
+                copies.append((entry, holder.entry_id))
+            else:
+                day_kept.append(entry)
+        kept.extend(day_kept)
+    return kept, copies
+
+
 def summarize_strength(entries: list[StrengthRecord], *, limit_days: int | None = None) -> dict[str, Any]:
     """Recent strength sessions, newest day first, with per-session volume.
 
-    Dedup by entry_id (newest updated_at wins — edits upsert the same blob id).
+    Dedup by entry_id (newest updated_at wins — edits upsert the same blob id),
+    then set aside any session that only repeats another one logged the same
+    day (`_split_same_day_copies`): it is listed under `duplicate_sessions` and
+    kept out of `sessions` and `session_count`.
     Pass `limit_days` to keep only the most recent N sessions after dedup.
     """
 
@@ -1127,14 +1701,35 @@ def summarize_strength(entries: list[StrengthRecord], *, limit_days: int | None 
         if existing is None or new_key >= old_key:
             by_id[entry.entry_id] = entry
 
-    ordered = sorted(by_id.values(), key=lambda e: e.date, reverse=True)
+    kept, copies = _split_same_day_copies(list(by_id.values()))
+    ordered = sorted(kept, key=lambda e: e.date, reverse=True)
     if limit_days is not None:
         ordered = ordered[:limit_days]
+    shown_days = {_local_date_fields(e.date).get("local_date") for e in ordered}
 
-    return {
+    summary: dict[str, Any] = {
         "session_count": len(ordered),
         "sessions": [entry.to_dict() for entry in ordered],
     }
+    listed = [
+        {
+            "entry_id": copy.entry_id,
+            "local_date": _local_date_fields(copy.date).get("local_date"),
+            "duplicate_of": holder,
+            "total_volume_kg": round(copy.total_volume_kg, 1),
+        }
+        for copy, holder in sorted(copies, key=lambda c: c[0].date, reverse=True)
+        if _local_date_fields(copy.date).get("local_date") in shown_days
+    ]
+    if listed:
+        summary["duplicate_sessions"] = listed
+        summary["duplicate_note"] = (
+            "These entries only repeat exercises (same name, same sets) already in "
+            "another session of the same day, so they are left out of `sessions`, "
+            "`session_count` and any volume you add up. Each is still stored, so "
+            "nothing was lost; it is a second copy, not a second workout."
+        )
+    return summary
 
 
 def parse_food(payload: Any, *, owner_user_id: str | None = None) -> FoodRecord:
@@ -1250,6 +1845,113 @@ def _parse_iso8601(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+#: A blob id `mcp-write-{kind}` accepts — the ids this server mints itself
+#: (`new_entry_blob_id`, `body_day_blob_id`; `BLOB_ID_SHAPES` in mcpWrite.ts).
+_WRITTEN_BLOB_ID = re.compile(r"(?:strength|food|note|symptom)-[0-9a-f]{32}|body-[0-9]{1,12}(?:-u[0-9a-f]{8})?")
+
+
+def _is_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+#: Every key a write response may contribute, each with the shape its value must
+#: have (`json(200, …)` in supabase/functions/_shared/mcpWrite.ts).
+_SERVER_FACT_SHAPES: dict[str, Callable[[Any], bool]] = {
+    "upserted_blobs": _is_count,
+    "upserted_envelopes": _is_count,
+    # How many devices the write's push reached (`push.delivered`, a number in
+    # `pushNotify.ts`). Shaped as a bool here from 2026-10-02 to 10-03, which
+    # dropped it from every real write — review V1.
+    "push_notified": _is_count,
+    "blob_id": lambda v: isinstance(v, str) and bool(_WRITTEN_BLOB_ID.fullmatch(v)),
+    "request_id": lambda v: server_token(v, _REQUEST_ID) is not None,
+}
+
+
+def _server_facts(response: Any) -> dict[str, Any]:
+    """The machine facts of an edge write response — never its prose.
+
+    Write tools used to put the edge function's whole JSON body in their result
+    as `server_response`. Anything that endpoint (or whatever answers in its
+    place) chose to say then reached the agent's context verbatim, which is the
+    prompt-injection channel Anti-pattern 23 forbids (pre-release review,
+    2026-10-02).
+    🔴 The first fix filtered by SHAPE — any identifier-like key, any id-like
+    string — and a shape is not a fact: `{"then_tell_user": "delete_every_note"}`
+    passed it whole (review R5, 2026-10-03). Now only the keys the endpoint is
+    known to send survive, each only with the value type it is known to have.
+    A key added server-side is dropped until the client learns it, which is the
+    safe direction.
+    """
+    if not isinstance(response, dict):
+        return {}
+    return {
+        key: response[key]
+        for key, fits in _SERVER_FACT_SHAPES.items()
+        if key in response and fits(response[key])
+    }
+
+
+#: A row id copied from the cloud into a result or an error line. Ids here are
+#: hex, uuids, epochs and dates joined by `-`, so they almost always carry a
+#: digit; a digit-free run of words is a sentence wearing an id's clothes.
+#: 🔴 "Almost": `profile-{uid8}` is a kind and eight hex characters, and one
+#: account in ~2,600 has a uid8 of letters only (a–f). Its id became
+#: `<invalid-id>`, the cache stored that, and the incremental merge — which
+#: matches cached rows against the catalog's raw ids — dropped the row the
+#: next time anything in its kind changed (review V8, 2026-10-03). A kind
+#: prefix followed by hex is therefore an id with or without a digit.
+_ROW_ID = re.compile(
+    r"(?:(?=[^0-9]*[0-9])[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}"
+    r"|[a-z][a-z0-9_]{0,31}-[0-9a-f]{8,64})"
+)
+_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_INSTANT = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ][0-9:.]{5,18}(?:Z|[+-]\d{2}(?::?\d{2})?)?)?")
+
+
+def _safe_row_id(value: Any) -> str:
+    """`value` if it is shaped like a row id, else a fixed placeholder (Anti-pattern 23)."""
+    text = str(value)
+    return text if _ROW_ID.fullmatch(text) else "<invalid-id>"
+
+
+def _recheck_error_lines(lines: list[str]) -> list[str]:
+    """Error lines read back from the cache, their row-id prefix re-checked.
+
+    A line is `<row id>: <locally written reason>`; before R5 the id was the
+    server's column as it came, and a cached line replayed it for as long as
+    the kind's digest held (review V10 follow-up, 2026-10-03). A prefix that
+    is not an id becomes `<invalid-id>`; the reason, written by this client,
+    is kept.
+    """
+    checked = []
+    for line in lines:
+        head, sep, tail = line.partition(": ")
+        # Only `<id>: decrypt_failed (…)` lines are cached; a line without the
+        # separator was written here whole and is kept.
+        checked.append(f"{_safe_row_id(head)}{sep}{tail}" if sep else line)
+    return checked
+
+
+def _bound_uuid(value: str | None) -> str | None:
+    """A pairing-time id from the config, repeated only if it is a UUID. It
+    came from the server, and a config written before 2026-10-03 may hold any
+    string (review V2)."""
+    return server_token(value, _UUID)
+
+
+def _safe_shaped(value: Any, shape: re.Pattern[str]) -> str | None:
+    return str(value) if value is not None and shape.fullmatch(str(value)) else None
+
+
+#: How many kinds the catalog and `get_metric` read from the cloud at once.
+#: Enough to overlap the waits, few enough to stay polite to the edge function.
+_CONCURRENT_KIND_READS = 4
+#: How many per-kind digests the doctor asks for at once, after one probe kind
+#: has proved the token (`_kind_counts`).
+_CONCURRENT_DIGESTS = 9
+
+
 def _local_date_fields(iso: str | None, *, with_time: bool = False) -> dict[str, Any]:
     """Human-readable local-calendar fields for a wire timestamp.
 
@@ -1270,7 +1972,7 @@ def _local_date_fields(iso: str | None, *, with_time: bool = False) -> dict[str,
         return {}
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    local = parsed.astimezone(datetime.now(timezone.utc).astimezone().tzinfo)
+    local = parsed.astimezone()  # the offset in force AT that instant — see `_local_midnight`
     fields: dict[str, Any] = {"local_date": local.date().isoformat()}
     if with_time:
         fields["local_time"] = local.strftime("%Y-%m-%dT%H:%M")
@@ -1356,6 +2058,32 @@ def _attach_errors(summary: dict[str, Any], errors: list[str]) -> dict[str, Any]
     return summary
 
 
+#: An `owner` value starting with this selects everyone EXCEPT the id after it.
+#: That is how "my partner" is expressed without this server ever storing, or an
+#: agent ever having to look up, the partner's id: the account that paired this
+#: machine is known from the binding, and on a paired account every other owner
+#: in the data IS the partner (a pairing is exactly two people — enforced by the
+#: DB trigger that caps a user at one relationship).
+NOT_OWNER_MARK = "!"
+
+
+def _select_owner(records: list[Any], owner: str | None) -> list[Any]:
+    """The one owner filter every reader goes through."""
+
+    if not owner:
+        return records
+    # Case-folded on both sides. Both ids come from Postgres `uuid` columns today
+    # and are lowercase, but this repo has already shipped one bug from the same
+    # uuid written in two cases (Invariant 32), and here a mismatch would not
+    # error: "me" would read as empty and `partner=true` would hand back the
+    # user's own rows labelled as the partner's.
+    if owner.startswith(NOT_OWNER_MARK):
+        me = owner[len(NOT_OWNER_MARK):].lower()
+        return [r for r in records if r.owner_user_id and not r.owner_user_id.lower().startswith(me)]
+    owner = owner.lower()
+    return [r for r in records if r.owner_user_id and r.owner_user_id.lower().startswith(owner)]
+
+
 def _attach_owner_guard(
     summary: dict[str, Any], records: list["DecryptedRecord"], owner: str | None
 ) -> dict[str, Any]:
@@ -1379,8 +2107,10 @@ def _attach_owner_guard(
     summary["warning"] = (
         "Records from MULTIPLE people are mixed in this result (owner prefixes: "
         + ", ".join(owners)
-        + "). Aggregate numbers blend both people and are meaningless — "
-        're-query with owner="<prefix>" to select one person.'
+        + "). Aggregate numbers blend both people and are meaningless. This "
+        "happens only when the server cannot tell whose account paired it (an "
+        "old binding); re-pair from the Vaultbeat app so reads default to you "
+        "and `partner=true` selects your partner."
     )
     return summary
 
@@ -1412,42 +2142,28 @@ _COVERAGE_DATE_KEYS = ("local_date", "day", "date")
 # a negative one explicitly instead of trusting the machine it runs on.
 _BARE_DAY_LENGTH = 10
 
+#: Rides on EVERY read result, so its length is paid on every call — it was
+#: 2.9k characters until 2026-09-24, more than the data on a one-week read.
+#: Condensed rule for rule: each sentence below is one thing an agent has
+#: actually got wrong. Adding to it costs every tool; say it once, here.
 _COVERAGE_NOTE = (
-    "How much data this answer rests on. `days_covered` is the number of DISTINCT "
-    "local calendar days this result's numbers are computed over — NOT the length "
-    "of any list, which `limit` has already cut. Quote it beside any average, trend "
-    "or comparison drawn from this result: an average over 3 days and one over 30 "
-    "are the same shape and the same number of digits, and only this field tells "
-    "them apart. `days_in_payload` is how many of those days you can actually find "
-    "a row for in this response; it normally equals `days_covered`, and when it is "
-    "SMALLER the remainder was cut by a display cap — those days are already inside "
-    "the aggregates and inside `first_day`..`last_day`, so the oldest day named may "
-    "have no row printed below. Do not report them as gaps and do not re-read hoping "
-    "they appear. `rows_counted` is how many rows those days came from — when it "
-    "exceeds `days_covered` the rows are intra-day samples, not days. `span_days` is "
-    "the inclusive first_day..last_day distance, so days_covered=12 with "
-    "span_days=200 is a sparse history and not a fortnight. `days_missing_in_span` "
-    "counts days inside that span this result has NO data for — it is measured "
-    "against `days_covered`, never against what is printed; a missing day means "
-    "EITHER nothing was recorded, OR `requested_unit` is not \"days\" and the limit "
-    "cut those rows off — it NEVER means nothing happened. "
-    "🔴 `more_available` is the one to read before you say how much history "
-    "exists: it is true when this server can decrypt days OLDER than "
-    "`first_day` that your `limit` left behind, and `oldest_available` names "
-    "the earliest day it holds. If it is true, DO NOT tell the user this is all "
-    "their data — re-read with a larger `limit`, or quote `oldest_available` as "
-    "the real start of their history. `total_available` is how many rows existed "
-    "before the cut, so 30 of 3251 is visibly a slice and not a history. "
-    "`window_satisfied` is false when fewer rows than requested came back OR "
-    "when `more_available` is true; it is null when no limit was requested. It "
-    "is true ONLY when you got everything you asked for AND nothing older is "
-    "being withheld by the limit, so it is the single field to check before "
-    "concluding a history is short. A short history with `more_available: false` "
-    "really is all this server holds (a freshly paired server is still sealing "
-    "its copy, so re-check after a re-sync rather than concluding the data does "
-    "not exist; an unpaid account seals only its last 7 days). None of these "
-    "fields is a quality judgement — sparse is normal for kinds the Watch only "
-    "measures occasionally."
+    "How much data this answer rests on. Quote `days_covered` (DISTINCT local days "
+    "the numbers are computed over — not the length of any list) beside any average, "
+    "trend or comparison. `days_in_payload` below `days_covered` means a display cap "
+    "hid rows that are still inside the numbers: not gaps, do not re-read for them. "
+    "`rows_counted` above `days_covered` means intra-day samples. `span_days` far "
+    "above `days_covered` is a sparse history, not a dense one. A day missing inside "
+    "the span means nothing was recorded or the limit cut it — never that nothing "
+    "happened. 🔴 Read `more_available` before saying how much history exists: true "
+    "means older days are decryptable right now and your `limit` left them behind — "
+    "ask for more, or quote `oldest_available` as the real start; never report a "
+    "limit-shaped window as all their data (`total_available` is the pre-cut count). "
+    "`window_satisfied` is true only when you got everything you asked for AND "
+    "nothing older is withheld. `more_available: false` with a short history really "
+    "is all this server holds — a freshly paired server may still be sealing its "
+    "copy, and an account with no membership or live trial uploads nothing new "
+    "from app 1.2.9 (its last 7 days on app 1.2.8 and earlier). None of this is a "
+    "quality judgement."
 )
 
 
@@ -1466,6 +2182,312 @@ _SERIES_NOTE = (
 )
 
 
+_AGGREGATIONS = ("none", "avg", "sum", "min", "max", "latest")
+_GRANULARITIES = ("day", "week", "month", "weekday")
+
+#: "Every day there is", for the one reader whose window is a day count.
+_ALL_DAYS = 36500
+
+_WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+#: Rides every weekday-bucketed series. The trap it names is the one an agent
+#: will actually fall into: a night is dated by the morning it ENDS, so the
+#: "Sat" bucket is Friday night's sleep — reading it as "Saturday night" puts
+#: the weekend lie-in on the wrong night and inverts the social-jet-lag story.
+_WEEKDAY_NOTE = (
+    "Buckets are days of the week, Mon..Sun, each aggregating every day of that "
+    "weekday in the window; `days_in_period` is how many of that weekday the window "
+    "spans and `days_with_data` how many of them had data. Sleep is dated by the day "
+    "it ENDED, so `Sat` is the Friday-night sleep and `Mon` the Sunday-night one."
+)
+
+#: Series with sub-daily samples worth reading as samples. HRV is the one kind
+#: where "when exactly" questions are real (a spike during a stressful minute);
+#: the others either record once a day or are only meaningful summed.
+_INTRADAY_SERIES = frozenset({"hrv_sdnn"})
+
+_METRIC_NOTE = (
+    "`days` selects the newest N calendar days THAT HAVE DATA for each series, not "
+    "the last N days on the calendar — quote each series' `coverage.days_covered` "
+    "and `coverage.span_days`. Days with no reading are absent, never zero. Where a "
+    "day holds several samples its value is their mean. On `cumulative` series the "
+    "newest day may be today, still accumulating: it is marked `partial` and left out "
+    "of every aggregate. `excluded_days` names days dropped because their data was "
+    "short (e.g. the Watch off the wrist) — each is listed with its reason. These are "
+    "numbers only; no threshold, band or verdict is implied."
+)
+
+_EMPTY_METRIC_HINT = (
+    "No values for this series in the data this server can decrypt. That has "
+    "several possible causes — recently paired, Apple Health access never granted, "
+    "or genuinely not recorded — and this reply cannot tell them apart. Check "
+    "`coverage.more_available` first, then call `vaultbeat_doctor`."
+)
+
+
+def _weekday_span_counts(points: dict[str, float]) -> dict[str, int]:
+    """How many of each weekday the window's first..last day spans.
+
+    The denominator for a weekday bucket: "4 of 5 Mondays had data" is a
+    different finding from "4 of 4", and without it the two look the same.
+    """
+
+    counts = {name: 0 for name in _WEEKDAY_NAMES}
+    if not points:
+        return counts
+    day = date.fromisoformat(min(points))
+    last = date.fromisoformat(max(points))
+    while day <= last:
+        counts[_WEEKDAY_NAMES[day.weekday()]] += 1
+        day += timedelta(days=1)
+    return counts
+
+
+def _period_key(day: str, granularity: str) -> tuple[str, str, str, int]:
+    """(label, first_day, last_day, days_in_period) for the bucket holding *day*."""
+
+    d = date.fromisoformat(day)
+    if granularity == "week":
+        start = d - timedelta(days=d.weekday())
+        end = start + timedelta(days=6)
+        iso = start.isocalendar()
+        return f"{iso[0]}-W{iso[1]:02d}", start.isoformat(), end.isoformat(), 7
+    start = d.replace(day=1)
+    nxt = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
+    end = nxt - timedelta(days=1)
+    return start.strftime("%Y-%m"), start.isoformat(), end.isoformat(), (nxt - start).days
+
+
+def _aggregate(fn: str, points: dict[str, float], spec: Any) -> dict[str, Any]:
+    """One number over a set of days, or null with the reason it was refused."""
+
+    out: dict[str, Any] = {"fn": fn, "value": None, "days_used": len(points)}
+    if not points:
+        out["reason"] = "no days with data in this window"
+        return out
+    if fn == "sum" and not spec.cumulative:
+        # Summing a state measurement (resting HR, weight, VO2max) produces a
+        # number with no meaning that still LOOKS like a quantity — refuse it.
+        out["reason"] = (
+            f"`{spec.name}` is a measurement of a state, not an amount that accrues, "
+            "so a sum of it means nothing. Use avg, min, max or latest."
+        )
+        return out
+    ordered = sorted(points)
+    values = [points[d] for d in ordered]
+    if fn == "avg":
+        out["value"] = round(sum(values) / len(values), 3)
+    elif fn == "sum":
+        out["value"] = round(sum(values), 3)
+    elif fn == "min":
+        low = min(ordered, key=lambda d: points[d])
+        out["value"], out["day"] = round(points[low], 3), low
+    elif fn == "max":
+        high = max(ordered, key=lambda d: points[d])
+        out["value"], out["day"] = round(points[high], 3), high
+    elif fn == "latest":
+        out["value"], out["day"] = round(points[ordered[-1]], 3), ordered[-1]
+    return out
+
+
+def _metric_entry(
+    spec: Any,
+    points: dict[str, float],
+    raw: dict[str, Any],
+    *,
+    consumed: int,
+    days: int,
+    aggregation: str,
+    granularity: str,
+    today: str,
+) -> dict[str, Any]:
+    """One series' block in a `get_metric` reply."""
+
+    entry: dict[str, Any] = {
+        "series": spec.name,
+        "unit": spec.unit,
+        "cumulative": spec.cumulative,
+        **({"note": spec.direction_note} if spec.direction_note else {}),
+    }
+
+    # Today on an accruing series is a partial day: shown, never aggregated.
+    # Leaving it in would drag every average down in one direction only — the
+    # 9am "steps are down today" mistake, made by the server on the agent's behalf.
+    partial = today if spec.cumulative and today in points else None
+    complete = {d: v for d, v in points.items() if d != partial}
+
+    oldest_kept = min(points) if points else None
+    excluded = [
+        e for e in series_excluded_days(raw, spec)
+        if oldest_kept is None or e["day"] >= oldest_kept
+    ]
+    if partial is not None:
+        excluded.append({"day": partial, "reason": "partial_today"})
+    if excluded:
+        entry["excluded_days"] = sorted(excluded, key=lambda e: e["day"], reverse=True)
+
+    if granularity == "day":
+        entry["points"] = [
+            {"date": d, "value": round(points[d], 3), **({"partial": True} if d == partial else {})}
+            for d in sorted(points, reverse=True)
+        ]
+        if aggregation != "none":
+            entry["aggregate"] = _aggregate(aggregation, complete, spec)
+    else:
+        fn = aggregation if aggregation != "none" else "avg"
+        entry["bucket_fn"] = fn
+        buckets: dict[str, dict[str, Any]] = {}
+        members: dict[str, dict[str, float]] = {}
+        if granularity == "weekday":
+            span_days = _weekday_span_counts(points)
+            for d, v in complete.items():
+                label = _WEEKDAY_NAMES[date.fromisoformat(d).weekday()]
+                members.setdefault(label, {})[d] = v
+            for label, group in members.items():
+                buckets[label] = {
+                    "period": label, "first_day": min(group), "last_day": max(group),
+                    "days_in_period": span_days[label],
+                }
+            order = [name for name in _WEEKDAY_NAMES if name in buckets]
+            entry["weekday_note"] = _WEEKDAY_NOTE
+        else:
+            for d, v in complete.items():
+                label, first, last, size = _period_key(d, granularity)
+                buckets.setdefault(
+                    label,
+                    {"period": label, "first_day": first, "last_day": last, "days_in_period": size},
+                )
+                members.setdefault(label, {})[d] = v
+            order = sorted(buckets, reverse=True)
+        rows = []
+        for label in order:
+            agg = _aggregate(fn, members[label], spec)
+            row = {**buckets[label], "value": agg["value"], "days_with_data": agg["days_used"]}
+            if agg.get("reason"):
+                row["reason"] = agg["reason"]
+            rows.append(row)
+        entry["buckets"] = rows
+
+    entry["rows_consumed"] = consumed
+    _attach_sources(entry, points, raw)
+    _attach_series_coverage(entry, points, requested=days, source=raw)
+    # The `days` cut lands wherever the newest-N days end, which is usually
+    # mid-week / mid-month — so the OLDEST bucket holds only the tail of its
+    # period. `days_with_data < days_in_period` cannot tell that apart from real
+    # gaps, and a clipped week's `sum` of steps reads as a week they barely
+    # walked. Flag it only when older data is known to exist beyond the window
+    # AND the bucket starts before the oldest day kept.
+    bucket_rows = entry.get("buckets") if granularity != "weekday" else None
+    coverage = entry.get("coverage")
+    if (
+        bucket_rows
+        and points
+        and isinstance(coverage, dict)
+        and coverage.get("more_available") is True
+        and bucket_rows[-1]["first_day"] < min(points)
+    ):
+        bucket_rows[-1]["clipped_by_window"] = True
+    # The other end has the same problem and hits far more often: the NEWEST
+    # bucket is usually the current week / month, still running. Measured on
+    # the owner's account 2026-09-23 (a Wednesday): "weekly steps, sum" put
+    # 2 days into this week's bucket and printed 10,433 beside last week's
+    # 42,107 — a collapse that is only the calendar.
+    if bucket_rows and bucket_rows[0]["last_day"] >= today:
+        bucket_rows[0]["period_in_progress"] = True
+    if not points:
+        entry["hint"] = _EMPTY_METRIC_HINT
+    return entry
+
+
+#: Attached when a PARTNER read comes back empty. The likeliest cause is not a
+#: missing measurement at all: partners share per data type, and only some types
+#: can reach this server at all. The list is an iOS fact, checked against the
+#: sync executors' `mcpPolicy` (2026-09-23): sleep, water and body go to the
+#: partner's AI by default (`.allVisible`); cycle, symptoms and notes only when
+#: the partner flips that type's "share with partner's AI" switch; every other
+#: kind is `.ownDevicesOnly` and never leaves their own devices. It said "sleep,
+#: cycle, water and weight" until 0.9.0 — which made an empty `get_symptoms` or
+#: `get_notes(partner=true)` read as "cannot be shared" when it can.
+PARTNER_EMPTY_HINT = (
+    "Nothing of your partner's came back for this. Partner data reaches this "
+    "server only for the types they share, and only on a paired account: sleep, "
+    "water and weight (including body composition) are shared by default; cycle, "
+    "Apple Health symptoms and notes only if your partner turned on sharing them "
+    "with your AI in their own Vaultbeat app; everything else — including "
+    "symptoms they reported themselves — is never shared. Treat this as "
+    "'not shared', never as 'they did not do it'."
+)
+
+
+def _mixed_owner_refusal(spec: Any, raw: dict[str, Any], owner: str | None) -> dict[str, Any] | None:
+    """Refuse one-number-per-day arithmetic over two people's rows.
+
+    The read tools could get away with a WARNING on a blended result because
+    their rows still carried `owner_user_id` — an agent could split them. This
+    layer collapses each day to one number first, so after bucketing the two
+    people are physically inseparable: an 82 kg day and a 40 kg day come out as
+    one 61 kg day that nobody weighed. A number that was true of neither person
+    must not be produced, so it is refused before it exists.
+    """
+
+    if owner or not raw.get("mixed_owners"):
+        return None
+    prefixes = raw.get("owner_user_id_prefixes") or []
+    return {
+        "series": spec.name,
+        "error": "mixed_owners",
+        "owner_user_id_prefixes": prefixes,
+        "message": (
+            "This account holds more than one person's data and the server could not "
+            "tell which one is you, "
+            "so each day would average two bodies into one number that is true of "
+            "neither. This server could not tell whose account paired it, so it cannot "
+            "default to 'you' — re-pair from the Vaultbeat app to fix that."
+        ),
+    }
+
+
+def _attach_series_exclusions(
+    result: dict[str, Any],
+    points: dict[str, float],
+    raw: dict[str, Any],
+    spec: Any,
+    *,
+    partial_today: str | None = None,
+) -> None:
+    """Name the days the arithmetic dropped on purpose (see `SeriesSpec.exclude_when`),
+    plus today on an accruing series — same `partial_today` reason `get_metric` gives."""
+
+    oldest = min(points) if points else None
+    dropped = [
+        e for e in series_excluded_days(raw, spec) if oldest is None or e["day"] >= oldest
+    ]
+    if partial_today is not None:
+        dropped.append({"day": partial_today, "reason": "partial_today"})
+    if dropped:
+        result["excluded_days"] = dropped
+
+
+def _fetch_was_cut(summary: dict[str, Any], spec: Any, limit: int) -> bool:
+    """Did `limit` leave older data behind? Ask the read method, not the array.
+
+    The method's own `coverage.more_available` is the authority, because only it
+    knows what its `limit` counts. Counting the returned array against `limit`
+    is right for the kinds that return one row per unit of `limit`, and wrong
+    for basal energy: its `limit` counts HOURLY samples while its `daily` array
+    holds DAYS, so 30 samples come back as 2 rows, "2 < 30" reads as "history
+    ended", and a 7-day request answered with one day (found on the owner's
+    real account 2026-09-23, through `get_metric`; the trend tool had the same
+    short window all along). The row count stays as the fallback for a reader
+    that does not say.
+    """
+
+    said = (summary.get("coverage") or {}).get("more_available")
+    if isinstance(said, bool):
+        return said
+    return _rows_returned(summary, spec) >= limit
+
+
 def _rows_returned(summary: dict[str, Any], spec: Any) -> int:
     """How many rows the read actually handed back, valid or not.
 
@@ -1482,7 +2504,7 @@ def _attach_series_coverage(
     result: dict[str, Any],
     points: dict[str, float],
     *,
-    requested: int,
+    requested: int | None,
     source: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The standard coverage block, over an already-bucketed `{day: value}` map.
@@ -1639,8 +2661,9 @@ def _attach_coverage(
     is now literally the answer to it.
 
     ⚠️ **`more_available` is computed from THIS server's decryptable set**, so it
-    cannot leak across the paywall: a free account has only 7 days sealed for
-    it (Invariant 72 (free-tier-uploads-seven-days)), so the field reads `false`
+    cannot leak across the paywall: a free account has only what its app
+    uploaded sealed for it — nothing new from app 1.2.9, 7 days on 1.2.8 and
+    earlier (Invariant 72 (free-tier-uploads-seven-days)) — so the field reads `false`
     for exactly the reason it should — there is no more, not "we won't say".
 
     ⚠️ **It compares DAYS, not row counts**, and that is deliberate. A
@@ -1977,8 +3000,35 @@ def _local_calendar_day(value: datetime) -> date:
     """
 
     if value.tzinfo is not None:
-        value = value.astimezone(datetime.now(timezone.utc).astimezone().tzinfo)
+        value = value.astimezone()  # per-instant offset — see `_local_midnight`
     return value.date()
+
+
+def new_entry_blob_id(kind: str) -> str:
+    """A fresh blob id for an entry-shaped agent write: `{kind}-{32 hex}`.
+
+    The same shape the iOS app mints for these kinds, and the ONLY shape
+    `mcp-write-{kind}` accepts (`BLOB_ID_SHAPES` in
+    supabase/functions/_shared/mcpWrite.ts, GitHub #9). Change one and every
+    agent write of that kind is refused with `invalid_blob_id`;
+    `scripts/ci/check_write_blob_id_shapes.py` holds the two together.
+    """
+    return f"{kind}-{secrets.token_hex(16)}"
+
+
+def body_day_blob_id(day_start_epoch: int, owner_user_id: str | None = None) -> str:
+    """The blob id of one body day: `body-{local-midnight epoch}`.
+
+    With `owner_user_id`, the id `upsert_sleep_payload` gives the same day when
+    another account already holds the plain one — `-u` plus the first eight hex
+    digits of the owner's uuid. Body ids are not per-user (two people in one
+    time zone share every day's epoch), so a second account's weigh-in lives
+    under that remapped id, and an agent writing for it has to use it too.
+    """
+    base = f"body-{int(day_start_epoch)}"
+    if owner_user_id is None:
+        return base
+    return f"{base}-u{owner_user_id.replace('-', '').lower()[:8]}"
 
 
 def _local_midnight_iso(day: date) -> str:
@@ -1988,9 +3038,24 @@ def _local_midnight_iso(day: date) -> str:
     assumption as that function; see its docstring.
     """
 
-    local_tz = datetime.now(timezone.utc).astimezone().tzinfo
-    local_midnight = datetime(day.year, day.month, day.day, tzinfo=local_tz)
-    return local_midnight.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return _local_midnight(day).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _local_midnight(day: date) -> datetime:
+    """Local midnight of `day`, carrying the UTC offset in force ON THAT DAY.
+
+    🔴 Every local-time conversion here used to take its zone from
+    `datetime.now().astimezone().tzinfo` — a FIXED offset, today's. In a zone
+    with daylight saving that is an hour wrong for half the year: once a US
+    user's clocks go back on 1 November, every summer entry's local midnight
+    lands at 23:00 the day before, so a note's `target_date`, a strength or
+    food day, and a cycle's start all read a day early (review R2 on #9,
+    2026-10-03). A naive local datetime's `.astimezone()` asks the OS for the
+    offset that applied at that moment instead, which is the same thing
+    Swift's `Calendar.current` does on the phone.
+    """
+
+    return datetime(day.year, day.month, day.day).astimezone()
 
 
 def _normalize_strength_exercises(exercises: Any) -> list[dict[str, Any]]:
@@ -2174,6 +3239,414 @@ def _median(values: list[float]) -> float | None:
 _LUTEAL_PHASE_DAYS = 14
 
 
+#: Two asleep samples closer than this are one continuous bout. Apple writes
+#: stage samples back to back, but a Watch reconnect can leave a gap of a few
+#: seconds; without a tolerance every such seam would read as an awakening.
+_SLEEP_BOUT_GAP_SECONDS = 120
+
+
+def _sleep_continuity(
+    intervals: list[tuple[float, float, str]], asleep_stages: set[str],
+) -> tuple[int, int]:
+    """(awakenings, longest continuous sleep in minutes) for one night.
+
+    An awakening is an `awake` interval that starts after the first asleep
+    sample and before the last one ends — waking up for the day is not an
+    awakening, and neither is lying awake before sleep arrives. A bout is a run
+    of asleep intervals with no `awake` between them and no gap longer than
+    `_SLEEP_BOUT_GAP_SECONDS`.
+    """
+
+    asleep = [iv for iv in intervals if iv[2] in asleep_stages]
+    if not asleep:
+        return 0, 0
+    first_start = min(iv[0] for iv in asleep)
+    last_end = max(iv[1] for iv in asleep)
+    awakenings = sum(
+        1 for start, _end, stage in intervals
+        if stage == "awake" and first_start < start < last_end
+    )
+
+    longest = 0.0
+    bout_start: float | None = None
+    bout_end = 0.0
+    for start, end, stage in sorted(intervals, key=lambda iv: iv[0]):
+        if stage in asleep_stages:
+            if bout_start is None or start - bout_end > _SLEEP_BOUT_GAP_SECONDS:
+                bout_start = start
+            bout_end = max(bout_end, end)
+            longest = max(longest, bout_end - bout_start)
+        elif stage == "awake":
+            bout_start = None
+    return awakenings, int(longest / 60)
+
+
+#: Minimum asleep-stage samples before a night's heart / breathing rate is
+#: reported. A real Watch night carries ~90 HR and ~35 RR samples; the night
+#: that prompted this carried 2 and read "100 bpm asleep". Low enough that a
+#: sparse-but-real night (a band sampling every ~90 min) still counts.
+_MIN_SLEEP_HR_SAMPLES = 5
+_MIN_SLEEP_RR_SAMPLES = 3
+
+
+def _source_label(source_id: str) -> str:
+    """A stable, human-readable name for a HealthKit sample source.
+
+    Every `com.apple.health.<UUID>` is Apple's own sleep scoring and is named
+    `apple`. The UUID is NOT a physical device: it is the identity the device
+    was registered under, and re-pairing or restoring a Watch mints a new one.
+    Until 2026-09-24 it was kept as `apple-xxxx`, and one Watch re-paired around
+    2025-10-01 showed up as "two Apple devices" — an invented change of
+    instrument, the exact misreading this label exists to prevent (owner:
+    「apple设备a和b是一个啊」; the two ids' stage shares matched to the point).
+    The question this answers is "same algorithm or not", and Apple is one.
+    Anything else is an app's bundle id, named by its last meaningful component.
+    """
+
+    sid = source_id.strip()
+    lowered = sid.lower()
+    if lowered.startswith("com.apple.health."):
+        return "apple"
+    if lowered == "com.apple.health":
+        return "apple-health-app"
+    known = {"huawei": "huawei", "otterlife": "otterlife", "xiaomi": "xiaomi", "garmin": "garmin",
+             "fitbit": "fitbit", "oura": "oura", "whoop": "whoop", "withings": "withings",
+             "autosleep": "autosleep", "sleepcycle": "sleep-cycle", "pillow": "pillow"}
+    for needle, name in known.items():
+        if needle in lowered:
+            return name
+    parts = [p for p in lowered.split(".") if p not in ("com", "app", "ios", "net", "org", "io")]
+    return parts[-1] if parts else lowered or "unknown"
+
+
+def _sleep_source(samples: list[dict[str, Any]], provenance: str | None = None) -> str | None:
+    """The source that wrote most of a night's asleep time.
+
+    Samples without a `sourceID` fall back to the session's provenance:
+    `motionInferred` nights were inferred from phone motion, not measured by a
+    wearable (10 real nights, 2026-09-24 — long, unstaged, all while the Watch
+    was not in use), which is the difference an agent most needs to see.
+    """
+
+    seconds: dict[str, float] = {}
+    for sample in samples:
+        sid = sample.get("sourceID")
+        if not sid or not str(sample.get("stage", "")).startswith("asleep"):
+            continue
+        try:
+            t0 = datetime.fromisoformat(sample["startDate"].replace("Z", "+00:00"))
+            t1 = datetime.fromisoformat(sample["endDate"].replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        label = _source_label(str(sid))
+        seconds[label] = seconds.get(label, 0.0) + max((t1 - t0).total_seconds(), 0.0)
+    if not seconds:
+        if provenance == "motionInferred":
+            return "motion-inferred"
+        return None
+    return max(seconds.items(), key=lambda kv: kv[1])[0]
+
+
+def _source_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every recording source in these rows: its first and last night, and how many.
+
+    Different sources score sleep with different algorithms — on this data a
+    Huawei band read REM at ~15% of sleep and an Apple Watch at ~27% on the same
+    body — so a trend that crosses from one to another is partly a change of
+    instrument. Grouped per source rather than as consecutive runs, because an
+    app that writes the odd night between a Watch's (OtterLife did, 27 times)
+    would otherwise shatter the list into dozens of one-night runs.
+    """
+
+    by_source: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        src = row.get("source")
+        day = row.get("local_date")
+        if src is None or day is None or row.get("is_in_bed_only"):
+            continue
+        entry = by_source.setdefault(src, {"source": src, "first_day": day, "last_day": day, "nights": 0})
+        entry["first_day"] = min(entry["first_day"], day)
+        entry["last_day"] = max(entry["last_day"], day)
+        entry["nights"] += 1
+    return sorted(by_source.values(), key=lambda e: e["first_day"])
+
+
+def _parse_day_range(since: str | None, until: str | None) -> tuple[str | None, str | None, dict[str, Any] | None]:
+    """Normalise a `since` / `until` pair, or return the error to hand back.
+
+    Days are compared as strings, so "2026-8-1" would silently select the wrong
+    rows rather than fail — it is normalised or refused here, never passed on.
+    """
+
+    out: list[str | None] = []
+    for name, value in (("since", since), ("until", until)):
+        if value is None or value == "":
+            out.append(None)
+            continue
+        try:
+            out.append(date.fromisoformat(str(value)).isoformat())
+        except ValueError:
+            return None, None, {
+                "error": f"invalid_{name}", "requested": value,
+                "message": f'Pass `{name}` as "YYYY-MM-DD", e.g. "2026-08-01".',
+            }
+    if out[0] and out[1] and out[0] > out[1]:
+        return None, None, {"error": "invalid_range", "since": out[0], "until": out[1],
+                            "message": "`since` is after `until`."}
+    return out[0], out[1], None
+
+
+def _parse_period(value: str, name: str) -> tuple[str | None, str | None, dict[str, Any] | None]:
+    """"YYYY-MM-DD..YYYY-MM-DD" (either end may be empty) → (since, until, error)."""
+
+    if ".." not in value:
+        return None, None, {"error": f"invalid_{name}", "requested": value,
+                            "message": f'Pass `{name}` as "YYYY-MM-DD..YYYY-MM-DD".'}
+    left, right = value.split("..", 1)
+    return _parse_day_range(left.strip() or None, right.strip() or None)
+
+
+def _apply_range_coverage(result: dict[str, Any], since: str | None, until: str | None) -> None:
+    """After a calendar-window read: say which window, and fix `more_available`.
+
+    The window, not a row count, bounded this read — so "older days exist" is
+    whether history starts before the window's first day, and `window_satisfied`
+    (which answers "did I get the count I asked for") has no count to answer.
+    """
+
+    if not (since or until):
+        return
+    result["range"] = {"since": since, "until": until}
+    coverage = result.get("coverage")
+    if isinstance(coverage, dict):
+        first = coverage.get("first_day") or since
+        oldest = coverage.get("oldest_available")
+        coverage["more_available"] = bool(oldest and first and oldest < first)
+        coverage["window_satisfied"] = None
+        coverage["requested"] = None
+        coverage["requested_unit"] = "date range"
+
+
+def _hoist_common_exclusions(metrics: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Move exclusions shared by every listing series to one top-level list."""
+
+    lists: list[list[dict[str, str]]] = [m["excluded_days"] for m in metrics if m.get("excluded_days")]
+    if len(lists) < 2:
+        return []
+    keyed = [{(e["day"], e["reason"]) for e in lst} for lst in lists]
+    shared = set.intersection(*keyed)
+    if not shared:
+        return []
+    for m in metrics:
+        if m.get("excluded_days"):
+            rest = [e for e in m["excluded_days"] if (e["day"], e["reason"]) not in shared]
+            if rest:
+                m["excluded_days"] = rest
+            else:
+                m.pop("excluded_days")
+    return [{"day": d, "reason": r} for d, r in sorted(shared, reverse=True)]
+
+
+def _attach_sources(result: dict[str, Any], points: dict[str, float], raw: dict[str, Any]) -> None:
+    """Add `sources` (+ note) when the days behind `points` came from >1 source."""
+
+    rows = raw.get("nights") if isinstance(raw, dict) else None
+    if not isinstance(rows, list) or not rows or "source" not in rows[0]:
+        return
+    summary = _source_summary([r for r in rows if r.get("local_date") in points])
+    if len(summary) > 1:
+        result["sources"] = summary
+        result["source_note"] = SLEEP_SOURCE_NOTE
+
+
+#: Rides next to `sources` whenever more than one is present.
+SLEEP_SOURCE_NOTE = (
+    "More than one device or app recorded these nights. Sources score sleep with "
+    "different algorithms (stage shares especially), so compare within one source, "
+    "and when a trend crosses from one to another say so before concluding the "
+    "person changed rather than the instrument."
+)
+
+
+def _sessions_overlap(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """True when two sleep sessions share any time (local `YYYY-MM-DDTHH:MM`)."""
+
+    try:
+        a0, a1 = datetime.fromisoformat(a["bedtime"]), datetime.fromisoformat(a["wake_time"])
+        b0, b1 = datetime.fromisoformat(b["bedtime"]), datetime.fromisoformat(b["wake_time"])
+    except (KeyError, TypeError, ValueError):
+        return True  # cannot tell → treat as the same sleep; never invent a second one
+    return a0 < b1 and b0 < a1
+
+
+# A main sleep that began at or after 08:00 ON THE DAY IT ENDED never reached
+# into the night: a daytime nap, or an evening one that ended before midnight.
+# Until 2026-10-03 the window closed at 18:00, so an 18:28-20:03 nap that was
+# the only sleep recorded that day became the "bedtime" of 2025-11-13 and pulled
+# that month's average to ~02:52, the latest of the year (release gate G1). No
+# upper bound is needed: a real night that starts in the evening ends on the
+# NEXT day, so its bedtime is negative here.
+_DAYTIME_START_MIN = 8 * 60
+
+
+def _session_zone(session: dict[str, Any]) -> tzinfo | None:
+    """The zone the phone stamped on a sleep session, or None for "use this machine's".
+
+    🔴 Review V4 (2026-10-03): every clock time and calendar day of a night was
+    converted with THIS machine's zone. On an MCP server running in UTC — a VPS,
+    the documented deployment — a UTC+8 night of 23:30→07:30 became 15:30→23:30
+    on one day, was flagged `daytime_main_sleep`, and bedtime, wake and midpoint
+    went empty for every night. iOS has stamped each session with the assembling
+    phone's zone since 1.2.5 (Invariant 70 (first-observation-wins-for-a-zone));
+    it was never read.
+
+    The identifier is preferred for clock times (it knows DST inside the night);
+    the stored offset is the fallback, and older sessions carry neither. Never
+    rendered: the stamp describes the phone that assembled the night, not where
+    anyone slept.
+    """
+    identifier = session.get("timeZoneIdentifier")
+    if isinstance(identifier, str) and identifier:
+        try:
+            return ZoneInfo(identifier)
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    offset = session.get("timeZoneUTCOffsetSeconds")
+    if isinstance(offset, int) and not isinstance(offset, bool) and abs(offset) <= 18 * 3600:
+        return timezone(timedelta(seconds=offset))
+    return None
+
+
+def _session_local_date(session: dict[str, Any], session_date_utc: datetime) -> str:
+    """The night's calendar day. `sessionDate` IS the phone's local midnight, so
+    with the stamped offset `sessionDate + offset` read as UTC is that day exactly
+    (the iOS doc on `timeZoneUTCOffsetSeconds`: consumers bucketing by day use the
+    number, not the identifier). Without a stamp: this machine's zone, as before."""
+    offset = session.get("timeZoneUTCOffsetSeconds")
+    if isinstance(offset, int) and not isinstance(offset, bool) and abs(offset) <= 18 * 3600:
+        return (session_date_utc.astimezone(timezone.utc) + timedelta(seconds=offset)).strftime("%Y-%m-%d")
+    return session_date_utc.astimezone().strftime("%Y-%m-%d")
+
+
+def _clock_minutes(local_iso: str, midnight: datetime) -> int | None:
+    """Minutes from `midnight` to a local `YYYY-MM-DDTHH:MM` — negative before it.
+
+    Clock times cannot be averaged as clock times: 23:50 and 00:10 average to
+    noon. Measured against the midnight that opens the WAKE day, a bedtime of
+    23:50 is -10 and 01:19 is 79, and their mean (34, i.e. 00:34) is right.
+    """
+
+    try:
+        return int((datetime.fromisoformat(local_iso) - midnight).total_seconds() // 60)
+    except (ValueError, TypeError):
+        return None
+
+
+def _clock_label(minutes: int | float | None) -> str | None:
+    if minutes is None:
+        return None
+    total = int(round(minutes)) % 1440
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def _night_clock(night: dict[str, Any]) -> tuple[int | None, int | None, int | None]:
+    """(bedtime, wake, midpoint) in minutes from the midnight that opens the wake day."""
+
+    wake_raw = night.get("wake_time") or ""
+    try:
+        midnight = datetime.fromisoformat(wake_raw).replace(hour=0, minute=0, second=0, microsecond=0)
+    except (ValueError, TypeError):
+        return None, None, None
+    bed_min = _clock_minutes(night.get("bedtime") or "", midnight)
+    wake_min = _clock_minutes(wake_raw, midnight)
+    mid_min = (bed_min + wake_min) // 2 if bed_min is not None and wake_min is not None else None
+    return bed_min, wake_min, mid_min
+
+
+def sleep_night_row(night: dict[str, Any]) -> dict[str, Any]:
+    """One night as the flat record the sleep series and `get_sleep_nights` read.
+
+    `None` means "not measured", never zero: stage minutes are None on a night
+    without stage detail (iPhone-only), and every sleep field is None on an
+    in-bed-only night (the Watch was not worn). The two flags travel with the
+    row so `SeriesSpec.exclude_when` can name why a night was left out.
+    """
+
+    stages = night.get("stage_minutes") or {}
+    in_bed_only = bool(night.get("is_in_bed_only"))
+    staged = bool(night.get("has_stage_detail")) and not in_bed_only
+    asleep = None if in_bed_only else night.get("total_sleep_minutes")
+
+    bed_min, wake_min, mid_min = _night_clock(night)
+
+    def stage(name: str) -> int | None:
+        return int(stages.get(name, 0)) if staged else None
+
+    deep, rem = stage("asleepDeep"), stage("asleepREM")
+
+    def share(part: int | None) -> float | None:
+        if part is None or not asleep:
+            return None
+        return round(100.0 * part / float(asleep), 1)
+
+    return {
+        "local_date": night.get("local_date"),
+        "weekday": _weekday(night.get("local_date")),
+        "bedtime": _clock_label(bed_min),
+        "wake_time": _clock_label(wake_min),
+        "bedtime_minutes": bed_min,
+        "wake_minutes": wake_min,
+        "midpoint_minutes": mid_min,
+        "asleep_minutes": asleep,
+        "deep_minutes": deep,
+        "rem_minutes": rem,
+        "core_minutes": stage("asleepCore"),
+        "awake_minutes": stage("awake"),
+        "deep_percent": share(deep),
+        "rem_percent": share(rem),
+        "awakenings": night.get("awakenings") if staged else None,
+        "longest_sleep_bout_minutes": night.get("longest_sleep_bout_minutes") if staged else None,
+        "source": night.get("source"),
+        "sleep_hr_samples": night.get("sleep_hr_samples"),
+        "sleep_hr_mean": None if in_bed_only else night.get("sleep_hr_mean"),
+        "sleep_hr_min": None if in_bed_only else night.get("sleep_hr_min"),
+        "sleep_rr_mean": None if in_bed_only else night.get("sleep_rr_mean"),
+        "other_sleep_minutes": night.get("other_sleep_minutes") or 0,
+        "sleep_segments": night.get("sleep_segments"),
+        # All measured sleep that day, main + naps + a split night's other half.
+        # None only when nothing at all was measured.
+        "total_sleep_24h_minutes": (
+            (asleep or 0) + (night.get("other_sleep_minutes") or 0)
+            if (asleep is not None or night.get("other_sleep_minutes")) else None
+        ),
+        "other_sleep": night.get("other_sleep") or [],
+        "in_bed_minutes": night.get("in_bed_minutes"),
+        "has_stage_detail": staged,
+        "is_in_bed_only": in_bed_only,
+        "no_stage_detail": not staged,
+        # The day's MAIN sleep began at or after 08:00 on the day it ended — a
+        # nap (daytime or evening) that was the only sleep recorded that day.
+        # Real, so it stays in the table and in `sleep_minutes`; left out of the
+        # clock series, where one 12:34 "bedtime" moved a whole month's average
+        # past 03:30 (2026-09-24, 6 of 323 real nights), and an 18:28 one did
+        # the same to November 2025 (see `_DAYTIME_START_MIN`).
+        "daytime_main_sleep": bed_min is not None and bed_min >= _DAYTIME_START_MIN,
+        # Guessed from the phone lying still, not measured by a wearable. Kept in
+        # the table; left out of the sleep series, because stillness is not
+        # sleep and the guess runs long (real data: 474 min on average against
+        # 434 for the Watch nights around them).
+        "motion_inferred": night.get("source") == "motion-inferred",
+        "owner_user_id": night.get("owner_user_id"),
+    }
+
+
+def _weekday(day: Any) -> str | None:
+    try:
+        return datetime.strptime(str(day), "%Y-%m-%d").strftime("%a")
+    except (ValueError, TypeError):
+        return None
+
+
 def summarize_menstrual_cycle(
     days: list[MenstrualDay],
     wrist_readings: list[tuple[datetime, float]] | None = None,
@@ -2213,7 +3686,7 @@ def summarize_menstrual_cycle(
     starts = _cycle_starts(days)
     if len(starts) < 2:
         _LOG.info("menstrual prediction skipped: need >=2 cycle starts, have %d", len(starts))
-        payload["last_cycle_start_date"] = starts[-1].isoformat() if starts else None
+        payload["last_cycle_start_date"] = _local_calendar_day(starts[-1]).isoformat() if starts else None
         payload["prediction_note"] = (
             "Insufficient history to predict the next period "
             f"(need at least two recorded cycle starts, have {len(starts)})."
@@ -2233,8 +3706,12 @@ def summarize_menstrual_cycle(
     last_start = starts[-1]
     predicted = last_start + timedelta(days=rounded_length)
     payload["average_cycle_length_days"] = rounded_length
-    payload["last_cycle_start_date"] = last_start.isoformat()
-    payload["predicted_next_period_start_date"] = predicted.isoformat()
+    # Local calendar days, like the ovulation date below. The starts are UTC
+    # instants of local midnight, and `.isoformat()` of one read as the PREVIOUS
+    # day east of UTC ("2026-09-29T16:00:00+00:00" for a 09-30 start at UTC+8 —
+    # pre-release review, 2026-10-02).
+    payload["last_cycle_start_date"] = _local_calendar_day(last_start).isoformat()
+    payload["predicted_next_period_start_date"] = _local_calendar_day(predicted).isoformat()
 
     if wrist_readings:
         ovulation = detect_ovulation_from_wrist_temp(wrist_readings, last_start)
@@ -2250,7 +3727,9 @@ def summarize_menstrual_cycle(
     return payload
 
 
-def summarize_symptoms(days: list[SymptomDay]) -> dict[str, Any]:
+def summarize_symptoms(
+    days: list[SymptomDay], entries: list[SymptomEntry] | None = None
+) -> dict[str, Any]:
     """Recent symptom days grouped by data owner, plus per-owner type counts.
 
     Both partners can track symptoms, so days are grouped by `owner_user_id`
@@ -2259,6 +3738,12 @@ def summarize_symptoms(days: list[SymptomDay]) -> dict[str, Any]:
     wins — matching the one-blob-per-day upsert) and sort newest-first.
     `symptom_counts` counts logged days per symptom type, skipping explicit
     "notPresent" entries so "logged as absent" doesn't inflate the tally.
+
+    `entries` are the self-reported episodes (GitHub #3). They sit beside the
+    HealthKit `days` under `reported`, never inside them: `days` / `symptom_counts`
+    keep the exact shape and meaning every earlier caller relies on (logged DAYS
+    per type), while `reported_counts` counts EPISODES per type — two different
+    units, so they are two different fields. Tombstones never reach here.
     """
 
     owners: dict[str, dict[str, SymptomDay]] = {}
@@ -2269,6 +3754,15 @@ def summarize_symptoms(days: list[SymptomDay]) -> dict[str, Any]:
         if existing is None or day.day_start_date >= existing.day_start_date:
             by_id[day.day_id] = day
 
+    reported: dict[str, dict[str, SymptomEntry]] = {}
+    for entry in entries or []:
+        owner_key = entry.owner_user_id or "unknown"
+        by_entry = reported.setdefault(owner_key, {})
+        prior = by_entry.get(entry.entry_id)
+        if prior is None or (entry.updated_at or "") >= (prior.updated_at or ""):
+            by_entry[entry.entry_id] = entry
+        owners.setdefault(owner_key, {})
+
     owner_summaries: list[dict[str, Any]] = []
     for owner_key in sorted(owners):
         ordered = sorted(owners[owner_key].values(), key=lambda d: d.day_start_date, reverse=True)
@@ -2278,12 +3772,21 @@ def summarize_symptoms(days: list[SymptomDay]) -> dict[str, Any]:
                 if sample.severity == "notPresent":
                     continue
                 type_counts[sample.symptom_type] = type_counts.get(sample.symptom_type, 0) + 1
+        own_entries = sorted(
+            reported.get(owner_key, {}).values(), key=lambda e: e.sort_key(), reverse=True
+        )
+        reported_counts: dict[str, int] = {}
+        for entry in own_entries:
+            reported_counts[entry.symptom_type] = reported_counts.get(entry.symptom_type, 0) + 1
         owner_summaries.append(
             {
                 "owner_user_id": None if owner_key == "unknown" else owner_key,
                 "day_count": len(ordered),
                 "symptom_counts": dict(sorted(type_counts.items(), key=lambda kv: -kv[1])),
                 "days": [day.to_dict() for day in ordered],
+                "reported_count": len(own_entries),
+                "reported_counts": dict(sorted(reported_counts.items(), key=lambda kv: -kv[1])),
+                "reported": [entry.to_dict() for entry in own_entries],
             }
         )
 
@@ -2292,62 +3795,8 @@ def summarize_symptoms(days: list[SymptomDay]) -> dict[str, Any]:
         "owners": owner_summaries,
         "owner_count": len(owner_summaries),
         "total_day_count": sum(o["day_count"] for o in owner_summaries),
+        "total_reported_count": sum(o["reported_count"] for o in owner_summaries),
     }
-
-
-def _select_primary_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Pick one primary session per local_date using iOS mergeSameDaySessions priority.
-
-    Priority (highest wins):
-      1. non-inBedOnly beats inBedOnly
-      2. hasStageDetail beats non-hasStageDetail (Watch beats iPhone)
-      3. longer totalSleepMinutes beats shorter
-      4. earlier bedtime wins (tie-break)
-
-    In-bed-only nights (Watch not worn — no actual-sleep stage anywhere in the
-    night) keep the honest `total_sleep_minutes: 0`, but must NOT read as "slept
-    0 hours": `is_in_bed_only` is surfaced, `duration_label` says
-    `"no sleep data"` instead of `"0h00m"`, and `in_bed_minutes` carries what
-    was actually measured. Mirrors the iOS assembler's F2 rule that the in-bed
-    number "MUST be labelled 'in bed', never as sleep" — iOS substitutes it into
-    its duration, this layer reports it as a separate field so an AI reading the
-    output can tell "not measured" from "measured zero" (2026-07-27).
-    """
-
-    by_date: dict[str, list[dict[str, Any]]] = {}
-    for s in sessions:
-        d = s.get("local_date", "")
-        if d:
-            by_date.setdefault(d, []).append(s)
-
-    daily: list[dict[str, Any]] = []
-    for day_key in sorted(by_date.keys(), reverse=True):
-        candidates = by_date[day_key]
-        best = max(candidates, key=lambda s: (
-            not s.get("is_in_bed_only", False),
-            s.get("has_stage_detail", False),
-            s.get("total_sleep_minutes", 0),
-            -(datetime.fromisoformat(s["bedtime"]).timestamp()
-              if s.get("bedtime") else 0),
-        ))
-        h, m = divmod(best["total_sleep_minutes"], 60)
-        in_bed_only = bool(best.get("is_in_bed_only", False))
-        stage_minutes = best.get("stage_minutes") or {}
-        daily.append({
-            "date": day_key,
-            "total_sleep_minutes": best["total_sleep_minutes"],
-            "duration_label": _NO_SLEEP_DATA_LABEL if in_bed_only else f"{h}h{m:02d}m",
-            "is_in_bed_only": in_bed_only,
-            # Same source iOS uses for its F2 fallback: the `inBed` stage only
-            # (an `awake`-only night measures no in-bed time, there as here).
-            "in_bed_minutes": int(stage_minutes.get("inBed", 0)),
-            "bedtime": best.get("bedtime"),
-            "wake_time": best.get("wake_time"),
-            "has_stage_detail": best.get("has_stage_detail"),
-            "stage_minutes": stage_minutes,
-        })
-
-    return daily
 
 
 def _demo_write_refusal(tool: str) -> dict[str, Any]:
@@ -2385,56 +3834,7 @@ def _demo_write_refusal(tool: str) -> dict[str, Any]:
             f"serves synthetic records so the read tools can be exercised without an "
             f"account, and it has no account to write to. Do not re-pair or run "
             f"diagnostics. To log real data, unset {DEMO_ENV} and pair this machine "
-            f"with the Vaultbeat iOS app (Settings → Data & AI → Connect an AI server)."
-        ),
-    }
-
-
-def _demo_binding_refusal(tool: str) -> dict[str, Any]:
-    """The answer the two PAIRING tools give while demo mode is on.
-
-    Separate from `_demo_write_refusal` because the honest reason is the
-    opposite one. A `log_*` refusal says "demo mode has no account to write
-    to"; this one says "demo mode does not NEED an account" — pairing is the
-    step demo mode exists to let you skip, so being told to go pair would send
-    a reader backwards out of the thing they are already using.
-
-    RETURNED, never raised, for the reason spelled out on `_demo_write_refusal`:
-    an exception becomes a ToolError that never reaches the watermarker.
-
-    🔴 Why this exists at all. `start_binding` calls `store.ensure_initialized`
-    and `store.update`; `poll_once` overwrites `server_id` / `server_token` /
-    the owner identity on success. Both WRITE DISK — config.json and the 0600
-    identity.key — which is precisely what Invariant 61 forbids a demo process
-    from doing, and the failure is silent in both directions: on a fresh
-    machine a "look what this does" demo run mints a real keypair and leaves a
-    real config behind; on a machine that is already paired it rewrites
-    `poll_id`, invalidating a QR the user may have on screen (Invariant 54).
-    Meanwhile the same process's `doctor` reports demo mode as offline and
-    holding no key — true when it was printed, and made false by the first
-    binding call of that session.
-    """
-
-    from vaultbeat_mcp_local.demo import DEMO_BANNER, DEMO_ENV
-
-    return {
-        # Banner first, same ordering as `_watermark_demo` and the write
-        # refusal — the sentence has to work on a reader who does not already
-        # know to look for a boolean.
-        "demo_warning": DEMO_BANNER,
-        "demo_mode": True,
-        "ok": False,
-        "error": "demo_mode_needs_no_pairing",
-        "tool": tool,
-        "detail": (
-            f"Demo mode is on ({DEMO_ENV} is set), so nothing was written and no keys "
-            f"were created — the config file and identity key on this machine are "
-            f"untouched. Pairing is the step demo mode replaces: the synthetic records "
-            f"the read tools are serving need no account, so there is nothing here to "
-            f"pair with and nothing is broken. To connect a REAL account, unset "
-            f"{DEMO_ENV}, restart this server, and run the pairing tools again (or "
-            f"`uvx vaultbeat-apple-health bind` in a terminal) — pairing is free on "
-            f"every plan."
+            f"with the Vaultbeat iOS app ({CONNECT_SERVER})."
         ),
     }
 
@@ -2486,6 +3886,10 @@ class VaultbeatLocalService:
         # while ALSO disarming itself in production, where `run_mcp_server`
         # passes the flag explicitly.
         self._demo_env_at_start = demo_enabled()
+        # One cloud fetch per kind at a time; see `sync_decrypted_records`.
+        self._inflight_syncs: dict[str | None, asyncio.Future[tuple[list[DecryptedRecord], list[str]]]] = {}
+        # The newest fetch of each kind; only it may write the cache.
+        self._sync_generation: dict[str | None, int] = {}
         # Trial-deadline snapshot from the config of the LAST successful
         # require_bound() in this process — a zero-I/O stash so the per-tool
         # `access_note` annotation (vb-016) never adds a config/Keychain read
@@ -2551,15 +3955,17 @@ class VaultbeatLocalService:
         deadline = cls._trial_deadline(config.trial_ends_at)
         block: dict[str, Any] = {
             "phase_at_pairing": "trial",
-            "trial_ends_at": config.trial_ends_at,
+            # A config written before 2026-10-03 holds whatever the server sent;
+            # only a timestamp-shaped value is repeated (review V2).
+            "trial_ends_at": server_token(config.trial_ends_at, _ISO_TIMESTAMP),
             "recorded_at_pairing": config.bound_at,
         }
         if deadline is None:
-            # Unparseable date — carry the raw string and the caveat, never crash
-            # a status call over it and never invent a day count.
+            # Unparseable date — the caveat, never the raw string (it came from
+            # the server, Anti-pattern 23), never a crash, never a day count.
             block["note"] = (
                 "A trial deadline was recorded when this server paired but its "
-                f"date could not be parsed ({config.trial_ends_at!r}). The cloud "
+                "date could not be parsed. The cloud "
                 "enforces the real entitlement on every request; a purchase made "
                 "in the iOS app since pairing is not reflected in this snapshot."
             )
@@ -2622,7 +4028,7 @@ class VaultbeatLocalService:
         self,
         *,
         server_name: str = "Local AI Server",
-        api_base_url: str = "https://wjpnyxglgtmtgjuuhwru.supabase.co/functions/v1",
+        api_base_url: str = DEFAULT_API_BASE_URL,
     ) -> BindingSession:
         config = self.store.ensure_initialized(server_name=server_name, api_base_url=api_base_url)
         poll_id = secrets.token_urlsafe(24)
@@ -2661,8 +4067,8 @@ class VaultbeatLocalService:
         config = self.store.load()
         if not config or not config.poll_id:
             raise RuntimeError(
-                "No active binding session; call `vaultbeat_start_binding` first, then "
-                "`vaultbeat_poll_binding` (CLI equivalent: `vaultbeat-apple-health bind`)"
+                "No active binding session; run `vaultbeat-apple-health bind`, which "
+                "starts one and waits for the scan."
             )
 
         result = await self._client(config).poll_binding(config.poll_id)
@@ -2778,6 +4184,55 @@ class VaultbeatLocalService:
         metric_type: str | None = None,
         fresh: bool = False,
     ) -> tuple[list[DecryptedRecord], list[str]]:
+        """`_sync_decrypted_records`, with concurrent reads of one kind sharing one fetch.
+
+        The catalog and `get_metric` read their kinds concurrently (cold, one
+        kind is a multi-megabyte download — 14 MB of sleep in 13 s on one
+        account — and they used to run back to back: 170 s for the catalog with
+        the cache off, past a client's 60 s timeout). Concurrency must not
+        download a kind twice, and it would: total energy reads basal energy
+        itself. So a second read of a kind already being fetched waits for that
+        fetch instead of starting its own. `fresh=True` keeps its own round trip.
+
+        🔴 A fresh read also becomes THE fetch of its kind, and only the newest
+        fetch of a kind may write the cache (review R6 on #9, 2026-10-03). Every
+        write tool re-reads `fresh=True` right after writing; until then a plain
+        read already in flight kept its slot, so a read arriving after the write
+        joined the download that began before it, and when that download landed
+        its `cache.save` overwrote the post-write cache for the whole TTL — the
+        agent's own write vanished from its next ten minutes of reads. Each
+        fetch now takes a generation of its kind, and `_sync_decrypted_records`
+        saves only while its generation is still the newest. Waiters of the
+        older fetch still get what it read: they asked before the write.
+        """
+        task = None if fresh else self._inflight_syncs.get(metric_type)
+        if task is None:
+            generation = self._sync_generation.get(metric_type, 0) + 1
+            self._sync_generation[metric_type] = generation
+            task = asyncio.ensure_future(
+                self._sync_decrypted_records(
+                    limit=None, metric_type=metric_type, fresh=fresh, generation=generation
+                )
+            )
+            self._inflight_syncs[metric_type] = task
+            key = metric_type
+
+            def forget(done: asyncio.Future[Any]) -> None:
+                if self._inflight_syncs.get(key) is done:
+                    self._inflight_syncs.pop(key, None)
+
+            task.add_done_callback(forget)
+        records, errors = await asyncio.shield(task)
+        return (list(records[:limit]) if limit is not None else list(records)), list(errors)
+
+    async def _sync_decrypted_records(
+        self,
+        *,
+        limit: int | None = None,
+        metric_type: str | None = None,
+        fresh: bool = False,
+        generation: int | None = None,
+    ) -> tuple[list[DecryptedRecord], list[str]]:
         """Fetch + decrypt this server's records, cache-first.
 
         `metric_type` narrows the fetch server-side (older mcp-sync deployments
@@ -2786,7 +4241,9 @@ class VaultbeatLocalService:
         Within the cache TTL a repeat query answers from local plaintext with
         ZERO network; `fresh=True` forces a cloud round trip. The cache always
         stores the FULL result set for its key — `limit` only trims the copy
-        returned to the caller.
+        returned to the caller. `generation` is this fetch's place in its
+        kind's order (`sync_decrypted_records`); a fetch overtaken by a newer
+        one returns what it read but does not write the cache.
         """
 
         if metric_type is not None and metric_type not in KNOWN_METRIC_TYPES:
@@ -2859,10 +4316,14 @@ class VaultbeatLocalService:
                 f"This Vaultbeat MCP server has no usable pairing. {PAIRING_GUIDANCE}"
             )
 
+        # This fetch's place among every fetch of its kind, in any process
+        # sharing this pairing (`LocalRecordCache.save`, review V5).
+        fetch_started = time.time()
         if not fresh:
             cached = self.cache.load(server_id=server_id, metric_type=metric_type)
             if cached is not None:
                 cached_records, cached_errors = cached
+                cached_errors = _recheck_error_lines(cached_errors)
                 records = [DecryptedRecord.from_dict(row) for row in cached_records]
                 if limit is not None:
                     records = records[:limit]
@@ -2924,14 +4385,17 @@ class VaultbeatLocalService:
                 if server_digest == prev_digest:
                     # Nothing changed. Zero further bytes.
                     records = [DecryptedRecord.from_dict(row) for row in prev_records]
-                    self.cache.save(
-                        prev_records,
-                        server_id=server_id,
-                        metric_type=metric_type,
-                        errors=prev_errors,
-                        digest=prev_digest,
-                        blob_xmins=prev_xmins,
-                    )
+                    prev_errors = _recheck_error_lines(prev_errors)
+                    if self._is_newest_fetch(metric_type, generation):
+                        self.cache.save(
+                            prev_records,
+                            server_id=server_id,
+                            metric_type=metric_type,
+                            errors=prev_errors,
+                            digest=prev_digest,
+                            blob_xmins=prev_xmins,
+                            started_at=fetch_started,
+                        )
                     self.store.update(last_sync_at=now_iso())
                     if limit is not None:
                         records = records[:limit]
@@ -2971,15 +4435,16 @@ class VaultbeatLocalService:
         try:
             if envelope_rows is None:
                 envelope_rows = await client.sync(server_token, metric_type=metric_type)
-        except VaultbeatUnsupportedMetricError as error:
+        except VaultbeatUnsupportedMetricError:
             # Version skew: this MCP server knows a kind the deployed edge
             # function does not. Degrade to "this one kind is unavailable"
             # rather than raising — every other tool call still works, and the
             # agent gets a message it can relay instead of an opaque failure.
             # (2026-07-22: the opposite behaviour took ALL default HRV reads
-            # down for two days.)
+            # down for two days.) The kind named is the one THIS call asked for,
+            # not the server's echo of it (Anti-pattern 23).
             return [], [
-                f"unsupported_metric:{error.metric_type} — the Vaultbeat cloud "
+                f"unsupported_metric:{metric_type or 'unknown'} — the Vaultbeat cloud "
                 "has not been updated to serve this data type yet; every other "
                 "data type is unaffected"
             ]
@@ -3004,10 +4469,10 @@ class VaultbeatLocalService:
                 kind = blob.get("metric_type") if isinstance(blob, dict) else None
                 if blob_id and isinstance(kind, str) and kind in KNOWN_METRIC_TYPES:
                     undecryptable.append({"blob_id": blob_id, "metric_type": kind})
-                envelope_id = str(row.get("id", "<unknown>"))
+                envelope_id = _safe_row_id(row.get("id", "<unknown>"))
                 errors.append(f"{envelope_id}: decrypt_failed ({type(error).__name__})")
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
-                envelope_id = str(row.get("id", "<unknown>"))
+                envelope_id = _safe_row_id(row.get("id", "<unknown>"))
                 # Stage-tagged so a consumer can tell "sealed with a stale key /
                 # corrupt ciphertext" apart from the parse_failed entries the
                 # per-metric decoders append (2026-07-23 client feedback: a bare
@@ -3064,18 +4529,46 @@ class VaultbeatLocalService:
                 }
                 server_digest = self._digest_from_catalog(catalog_xmins)
 
-        self.cache.save(
-            record_dicts,
-            server_id=server_id,
-            metric_type=metric_type,
-            errors=errors,
-            digest=server_digest,
-            blob_xmins=catalog_xmins,
-        )
+        if self._is_newest_fetch(metric_type, generation):
+            self.cache.save(
+                record_dicts,
+                server_id=server_id,
+                metric_type=metric_type,
+                errors=errors,
+                digest=server_digest,
+                blob_xmins=catalog_xmins,
+                started_at=fetch_started,
+            )
         self.store.update(last_sync_at=now_iso())
         if limit is not None:
             records = records[:limit]
         return records, errors
+
+    async def _committed(self, metric_type: str, write: Awaitable[_T]) -> _T:
+        """Await a write and, once the cloud accepted it, retire what the cache
+        held for its kind (review V6, 2026-10-03).
+
+        Every write tool re-reads `fresh=True` afterwards, but a re-read that
+        failed (a catalog or blob error after the 200) made the tool report an
+        error for a write that HAD landed, and left the pre-write snapshot — the
+        one its own pre-write read had just saved — answering plain reads for
+        the whole TTL, so an agent that retried saw nothing change. Now the
+        kind's cache expires and its generation moves on the moment the write
+        returns, so neither that snapshot nor a fetch begun before the write
+        can answer the next read.
+        """
+        response = await write
+        self.cache.expire(metric_type)
+        self._sync_generation[metric_type] = self._sync_generation.get(metric_type, 0) + 1
+        # And no plain read may join a download begun before the write: one
+        # without a fresh re-read after it (`delete_symptom`) would otherwise
+        # hand the deleted entry back until that download finished.
+        self._inflight_syncs.pop(metric_type, None)
+        return response
+
+    def _is_newest_fetch(self, metric_type: str | None, generation: int | None) -> bool:
+        """Whether a fetch may still write the cache: no newer fetch of its kind began."""
+        return generation is None or self._sync_generation.get(metric_type) == generation
 
     @staticmethod
     def _digest_from_catalog(blob_xmins: dict[str, str]) -> dict[str, Any] | None:
@@ -3124,141 +4617,6 @@ class VaultbeatLocalService:
             kept = kept[:limit]
         return kept, errors
 
-    async def sleep_records(
-        self, *, limit: int | None = None, fresh: bool = False,
-        owner: str | None = None,
-    ) -> dict[str, Any]:
-        """Return recent sleep sessions with per-day primary selection matching iOS app.
-
-        Each session carries `local_date` (Asia/Shanghai), `has_stage_detail`, and
-        `is_in_bed_only` flags. The top-level `daily_summary` picks one primary
-        session per local date using the same priority as the iOS app's
-        `mergeSameDaySessions`: non-inBedOnly > hasStageDetail > longest duration
-        > earliest bedtime.
-
-        `limit` means "how many nights to return", not "how many blobs to fetch".
-        F8 per-source assembly creates 2-3 blobs per night (Watch stages + iPhone
-        inBed + possibly OtterLife); truncating blobs before per-day selection
-        drops the stage-detailed blob and returns inBed-only data. So we fetch ALL
-        blobs, run per-day selection, then truncate nights.
-
-        *owner*: if given, only include records whose ``owner_user_id`` starts
-        with this prefix.
-        """
-
-        records, errors = await self._records_for_metric(METRIC_SLEEP, limit=None, fresh=fresh)
-        if owner:
-            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
-        sessions: list[dict[str, Any]] = []
-        tz_local = datetime.now(timezone.utc).astimezone().tzinfo
-
-        for record in records:
-            try:
-                payload = record.payload
-                session = payload.get("session", payload)
-                samples = session.get("samples", [])
-                # Accumulate SECONDS, truncate once per stage. The old code ran
-                # int(seconds / 60) on EVERY sample and summed the truncated
-                # minutes, throwing away up to 59s per sample — across 315
-                # nights that came out ~6.8 min short on average, 17 min at
-                # worst (2026-07-27). Per-stage (not per-total) truncation keeps
-                # the invariant total_sleep_minutes == Σ asleep* stage_minutes,
-                # which matters more here than the last ~2 min: both numbers sit
-                # in the same object and an AI reading them compares them.
-                stage_seconds: dict[str, float] = {}
-                for sample in samples:
-                    stage = sample.get("stage", "unknown")
-                    start = sample.get("startDate", "")
-                    end = sample.get("endDate", "")
-                    secs = 0.0
-                    if start and end:
-                        try:
-                            t0 = datetime.fromisoformat(start.replace("Z", "+00:00"))
-                            t1 = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                            secs = max((t1 - t0).total_seconds(), 0.0)
-                        except (ValueError, TypeError):
-                            secs = 0.0
-                    stage_seconds[stage] = stage_seconds.get(stage, 0.0) + secs
-                stage_minutes: dict[str, int] = {
-                    stage: int(secs / 60) for stage, secs in stage_seconds.items()
-                }
-
-                actual_sleep_stages = {
-                    "asleepCore", "asleepDeep", "asleepREM", "asleepUnspecified"
-                }
-                total_sleep_min = sum(
-                    v for k, v in stage_minutes.items() if k in actual_sleep_stages
-                )
-                distinct_actual = {
-                    k for k in stage_minutes if k in actual_sleep_stages and stage_minutes[k] > 0
-                }
-                has_stage_detail = len(distinct_actual) >= 2
-                is_in_bed_only = total_sleep_min == 0
-
-                # Convert sessionDate UTC to local date
-                sd_raw = session.get("sessionDate", "")
-                try:
-                    sd_utc = datetime.fromisoformat(sd_raw.replace("Z", "+00:00"))
-                    local_date = sd_utc.astimezone(tz_local).strftime("%Y-%m-%d")
-                except (ValueError, TypeError):
-                    local_date = sd_raw[:10] if sd_raw else ""
-
-                # Convert bedtime/wakeTime to local ISO for display
-                bedtime_raw = session.get("bedtime", "")
-                wake_raw = session.get("wakeTime", "")
-                try:
-                    bedtime_local = datetime.fromisoformat(
-                        bedtime_raw.replace("Z", "+00:00")
-                    ).astimezone(tz_local).strftime("%Y-%m-%dT%H:%M")
-                except (ValueError, TypeError, AttributeError):
-                    bedtime_local = bedtime_raw
-                try:
-                    wake_local = datetime.fromisoformat(
-                        wake_raw.replace("Z", "+00:00")
-                    ).astimezone(tz_local).strftime("%Y-%m-%dT%H:%M")
-                except (ValueError, TypeError, AttributeError):
-                    wake_local = wake_raw
-
-                sessions.append({
-                    "envelope_id": record.envelope_id,
-                    "blob_id": record.blob_id,
-                    "local_date": local_date,
-                    "session_date_utc": sd_raw,
-                    "bedtime": bedtime_local,
-                    "wake_time": wake_local,
-                    "provenance": session.get("provenance", "healthkitSleep"),
-                    "total_sleep_minutes": total_sleep_min,
-                    "has_stage_detail": has_stage_detail,
-                    "is_in_bed_only": is_in_bed_only,
-                    "stage_minutes": stage_minutes,
-                    "sample_count": len(samples),
-                    "heart_rate_samples": len(payload.get("heartRateSamples", [])),
-                    "respiratory_rate_samples": len(payload.get("respiratoryRateSamples", [])),
-                })
-            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
-                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
-
-        daily_summary = _select_primary_sessions(sessions)
-        _avail = len(daily_summary)
-        _oldest = _coverage_day_of(daily_summary[-1]) if daily_summary else None
-
-        if limit is not None:
-            daily_summary = daily_summary[:limit]
-            kept_dates = {d["date"] for d in daily_summary}
-            sessions = [s for s in sessions if s.get("local_date") in kept_dates]
-
-        summary = {
-            "daily_summary": daily_summary,
-            "sessions": sessions,
-            "count": len(sessions),
-        }
-        # Coverage counts NIGHTS, not blobs: `sessions` holds 2-3 blobs per night
-        # (Watch stages + iPhone inBed + possibly OtterLife), so `count` above is
-        # not a number of nights and must never be read as one.
-        _attach_coverage(summary, rows=daily_summary, requested=limit, unit="nights", total_available=_avail, oldest_raw=_oldest)
-        _attach_errors(summary, errors)
-        return _attach_owner_guard(summary, records, owner)
-
     async def sleep_detail_records(
         self, *, limit: int | None = None, fresh: bool = False,
         owner: str | None = None, include_timeline: bool = False,
@@ -3291,22 +4649,25 @@ class VaultbeatLocalService:
 
         records, errors = await self._records_for_metric(METRIC_SLEEP, limit=None, fresh=fresh)
         if owner:
-            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
-        tz_local = datetime.now(timezone.utc).astimezone().tzinfo
+            records = _select_owner(records, owner)
+        # Every conversion below asks for the offset in force AT that instant,
+        # never today's — see `_local_midnight` — and in the zone the phone
+        # stamped on the night when it did (`_session_zone`); `zone=None` is
+        # this machine's.
 
-        def _to_local_iso(raw: str) -> str:
+        def _to_local_iso(raw: str, zone: tzinfo | None = None) -> str:
             try:
                 return datetime.fromisoformat(
                     raw.replace("Z", "+00:00")
-                ).astimezone(tz_local).strftime("%Y-%m-%dT%H:%M:%S")
+                ).astimezone(zone).strftime("%Y-%m-%dT%H:%M:%S")
             except (ValueError, TypeError, AttributeError):
                 return raw
 
-        def _to_local_short(raw: str) -> str:
+        def _to_local_short(raw: str, zone: tzinfo | None = None) -> str:
             try:
                 return datetime.fromisoformat(
                     raw.replace("Z", "+00:00")
-                ).astimezone(tz_local).strftime("%Y-%m-%dT%H:%M")
+                ).astimezone(zone).strftime("%Y-%m-%dT%H:%M")
             except (ValueError, TypeError, AttributeError):
                 return raw
 
@@ -3315,10 +4676,19 @@ class VaultbeatLocalService:
                 t = datetime.fromisoformat(ts_utc.replace("Z", "+00:00")).timestamp()
             except (ValueError, TypeError):
                 return "unknown"
+            # `inBed` spans the whole night and sorts first, so first-match
+            # handed EVERY sample on a night that also carries stages to
+            # "inBed" and left the asleep stages' vitals empty (2026-09-24:
+            # the demo's HR never reached `sleep_hr_mean`; on real data, every
+            # night an iPhone or a third-party app also wrote `inBed`). A
+            # sample inside a real stage belongs to that stage.
+            in_bed = False
             for start_ts, end_ts, stage in stage_intervals:
                 if start_ts <= t <= end_ts:
-                    return stage
-            return "between_stages"
+                    if stage != "inBed":
+                        return stage
+                    in_bed = True
+            return "inBed" if in_bed else "between_stages"
 
         all_nights: list[dict[str, Any]] = []
 
@@ -3340,10 +4710,11 @@ class VaultbeatLocalService:
                 has_stage_detail = len(distinct_actual) >= 2
                 is_in_bed_only = len(distinct_actual) == 0
 
+                zone = _session_zone(session)
                 sd_raw = session.get("sessionDate", "")
                 try:
                     sd_utc = datetime.fromisoformat(sd_raw.replace("Z", "+00:00"))
-                    local_date = sd_utc.astimezone(tz_local).strftime("%Y-%m-%d")
+                    local_date = _session_local_date(session, sd_utc)
                 except (ValueError, TypeError):
                     local_date = sd_raw[:10] if sd_raw else ""
 
@@ -3356,7 +4727,7 @@ class VaultbeatLocalService:
                 # (2026-07-27).
                 # Durations accumulate in SECONDS and truncate once per stage;
                 # the old per-sample int(seconds / 60) ran ~6.8 min short per
-                # night on average (same fix as sleep_records above).
+                # night on average (2026-07-27).
                 stage_intervals: list[tuple[float, float, str]] = []
                 stage_seconds: dict[str, float] = {}
                 malformed_samples = 0
@@ -3390,8 +4761,11 @@ class VaultbeatLocalService:
                 for si_start, si_end, si_stage in stage_intervals:
                     stage_intervals_out.append({
                         "stage": si_stage,
-                        "start": datetime.fromtimestamp(si_start, tz=tz_local).strftime("%Y-%m-%dT%H:%M:%S"),
-                        "end": datetime.fromtimestamp(si_end, tz=tz_local).strftime("%Y-%m-%dT%H:%M:%S"),
+                        # Same zone as bedtime / wake (review V4 follow-up):
+                        # this alone stayed in the machine's, so a UTC host
+                        # put the stages eight hours off the night they are in.
+                        "start": datetime.fromtimestamp(si_start, tz=zone).strftime("%Y-%m-%dT%H:%M:%S"),
+                        "end": datetime.fromtimestamp(si_end, tz=zone).strftime("%Y-%m-%dT%H:%M:%S"),
                     })
 
                 raw_points: list[tuple[str, float | None, float | None]] = []
@@ -3416,7 +4790,7 @@ class VaultbeatLocalService:
                         last_rr = rr_val
                         stage_rr.setdefault(point_stage, []).append(rr_val)
                     timeline.append({
-                        "time": _to_local_iso(ts_raw),
+                        "time": _to_local_iso(ts_raw, zone),
                         "hr": last_hr,
                         "rr": last_rr,
                         "stage": point_stage,
@@ -3438,25 +4812,63 @@ class VaultbeatLocalService:
                         "rr_max": max(rr_vals) if rr_vals else None,
                     }
 
+                # Night-level features computed HERE, while the raw intervals
+                # and per-stage samples are still in hand, so every consumer
+                # (this tool, `sleep_nights`, the sleep series) reads one
+                # derivation instead of re-deriving from a payload that has
+                # already had its timeline dropped (2026-09-24).
+                asleep_hr = [v for k, vs in stage_hr.items() if k in actual_sleep_stages for v in vs]
+                asleep_rr = [v for k, vs in stage_rr.items() if k in actual_sleep_stages for v in vs]
+                night_source = _sleep_source(samples, session.get("provenance"))
+                awakenings, longest_bout = _sleep_continuity(stage_intervals, actual_sleep_stages)
+
                 all_nights.append({
                     "envelope_id": record.envelope_id,
                     "local_date": local_date,
-                    "bedtime": _to_local_short(session.get("bedtime", "")),
-                    "wake_time": _to_local_short(session.get("wakeTime", "")),
+                    "bedtime": _to_local_short(session.get("bedtime", ""), zone),
+                    "wake_time": _to_local_short(session.get("wakeTime", ""), zone),
                     "total_sleep_minutes": total_sleep_min,
-                    # Same "0h00m is a lie on a Watch-less night" fix as
-                    # _select_primary_sessions — see its docstring.
+                    # In-bed-only nights (Watch not worn — no actual-sleep stage
+                    # anywhere) keep the honest `total_sleep_minutes: 0` but must
+                    # NOT read as "slept 0 hours": the label says "no sleep data",
+                    # `is_in_bed_only` is surfaced, and `in_bed_minutes` carries
+                    # what was measured. Mirrors the iOS assembler's F2 rule that
+                    # the in-bed number "MUST be labelled 'in bed', never as
+                    # sleep" (2026-07-27). This text lived on the retired
+                    # `_select_primary_sessions` until 2026-09-25.
                     "duration_label": (
                         _NO_SLEEP_DATA_LABEL
                         if is_in_bed_only
                         else "{}h{:02d}m".format(*divmod(total_sleep_min, 60))
                     ),
-                    "in_bed_minutes": int(stage_minutes.get("inBed", 0)),
+                    # None when no in-bed time was recorded: a Watch night has
+                    # stages and no `inBed` samples, and 0 read as "measured
+                    # zero minutes in bed" (pre-release review, 2026-10-02).
+                    "in_bed_minutes": int(stage_minutes["inBed"]) if stage_minutes.get("inBed") else None,
                     "has_stage_detail": has_stage_detail,
                     "is_in_bed_only": is_in_bed_only,
                     "stage_minutes": stage_minutes,
                     "stage_intervals": stage_intervals_out,
                     "stage_vitals": stage_vitals,
+                    # A mean over a couple of samples is not a night's heart rate:
+                    # 2026-07-31 reported "100 bpm asleep" from exactly 2 samples
+                    # (median night: ~90). Below the floor it is None, and the
+                    # count travels so a reader can see why.
+                    "sleep_hr_mean": (
+                        round(sum(asleep_hr) / len(asleep_hr), 1)
+                        if len(asleep_hr) >= _MIN_SLEEP_HR_SAMPLES else None
+                    ),
+                    "sleep_hr_min": (
+                        round(min(asleep_hr), 1) if len(asleep_hr) >= _MIN_SLEEP_HR_SAMPLES else None
+                    ),
+                    "sleep_rr_mean": (
+                        round(sum(asleep_rr) / len(asleep_rr), 1)
+                        if len(asleep_rr) >= _MIN_SLEEP_RR_SAMPLES else None
+                    ),
+                    "sleep_hr_samples": len(asleep_hr),
+                    "source": night_source,
+                    "awakenings": awakenings if has_stage_detail else None,
+                    "longest_sleep_bout_minutes": longest_bout if has_stage_detail else None,
                     "hr_samples": len(hrs),
                     "rr_samples": len(rrs),
                     "stage_samples": len(samples),
@@ -3479,6 +4891,28 @@ class VaultbeatLocalService:
                 -(datetime.fromisoformat(n["bedtime"]).timestamp()
                   if n.get("bedtime") else 0),
             ))
+            # Other MEASURED sleep that day that does not overlap the main one:
+            # a nap, or the second half of a broken night. Until 2026-09-24
+            # only the main session survived, so 18 of 323 real days lost a
+            # real sleep (a 12:26-13:48 nap, a night split 01:42-02:54 +
+            # 05:52-10:23). A candidate that OVERLAPS a kept one is the same
+            # sleep written by another source, never a second sleep.
+            kept = [best]
+            others: list[dict[str, Any]] = []
+            for n in sorted(candidates, key=lambda n: n.get("bedtime") or ""):
+                if n is best or n.get("is_in_bed_only") or not n.get("total_sleep_minutes"):
+                    continue
+                if any(_sessions_overlap(n, k) for k in kept):
+                    continue
+                kept.append(n)
+                others.append({
+                    "bedtime": n.get("bedtime"),
+                    "wake_time": n.get("wake_time"),
+                    "asleep_minutes": n.get("total_sleep_minutes"),
+                })
+            best["other_sleep"] = others
+            best["other_sleep_minutes"] = sum(o["asleep_minutes"] for o in others)
+            best["sleep_segments"] = len(others) + (0 if best.get("is_in_bed_only") else 1)
             result_nights.append(best)
 
         _avail = len(result_nights)
@@ -3505,12 +4939,50 @@ class VaultbeatLocalService:
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
+    async def sleep_nights(
+        self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False,
+        since: str | None = None,
+    ) -> dict[str, Any]:
+        """Every night as one flat row: timing, stages, continuity, vitals.
+
+        The source for BOTH the sleep series in `get_metric` and the
+        `get_sleep_nights` table, so an average and the rows it came from can
+        never disagree. Built on `sleep_detail_records` (primary session per
+        night, same selection as the app) with the timeline dropped — a year of
+        nights fits in one read this way, which is the whole point.
+        """
+
+        detail = await self.sleep_detail_records(limit=None, owner=owner, fresh=fresh)
+        rows = [sleep_night_row(n) for n in detail.get("nights", [])]
+        avail = len(rows)
+        oldest = rows[-1]["local_date"] if rows else None
+        if since:
+            # A calendar bound, filtered BEFORE coverage so the block describes
+            # the rows actually returned. `more_available` then correctly says
+            # older nights exist beyond `since`.
+            rows = [r for r in rows if str(r.get("local_date") or "") >= since]
+        if limit is not None:
+            rows = rows[:limit]
+        summary: dict[str, Any] = {"nights": rows, "count": len(rows)}
+        sources = _source_summary(rows)
+        if sources:
+            summary["sources"] = sources
+            if len(sources) > 1:
+                summary["source_note"] = SLEEP_SOURCE_NOTE
+        _attach_coverage(summary, rows=rows, requested=limit, unit="nights", total_available=avail, oldest_raw=oldest)
+        errors = list(detail.get("errors") or [])
+        _attach_errors(summary, errors)
+        for key in ("mixed_owners", "owner_user_id_prefixes", "warning"):
+            if key in detail:
+                summary[key] = detail[key]
+        return summary
+
     async def water_intake_summary(self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
         """Return recent daily water intake plus the computed average over the window."""
 
         records, errors = await self._records_for_metric(METRIC_WATER, limit=None, fresh=fresh)
         if owner:
-            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+            records = _select_owner(records, owner)
         days: list[WaterDay] = []
         for record in records:
             try:
@@ -3545,7 +5017,7 @@ class VaultbeatLocalService:
 
         records, errors = await self._records_for_metric(METRIC_BODY, limit=None, fresh=fresh)
         if owner:
-            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+            records = _select_owner(records, owner)
         days: list[BodyDay] = []
         for record in records:
             try:
@@ -3579,7 +5051,7 @@ class VaultbeatLocalService:
 
         records, errors = await self._records_for_metric(METRIC_MENSTRUAL, limit=None, fresh=fresh)
         if owner:
-            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+            records = _select_owner(records, owner)
         if not records:
             _LOG.info("no menstrual envelopes present (likely not opted in on iOS)")
         else:
@@ -3596,13 +5068,20 @@ class VaultbeatLocalService:
         # prediction is only as good as the newest bleeding day it can see.
         days.sort(key=lambda d: d.day_start_date, reverse=True)
         _avail, _oldest = len(days), (days[-1].day_start_date if days else None)
-        if limit is not None:
-            days = days[:limit]
-        # Owners come from the days that survived the cut, so the wrist-temp
-        # calibration guard below judges the same window it is calibrating.
+        # 🔴 The prediction is computed over the WHOLE history; `limit` only
+        # trims the days returned. It used to be computed on the cut window,
+        # so the answer depended on how many rows the caller asked to see —
+        # measured 2026-09-24 on real data: limit=3 misplaced the last cycle
+        # start (a mid-period day read as a start) and reported "insufficient
+        # history" over 48 recorded days; 10 / 20 / 90 predicted three
+        # different dates. An agent lowering `limit` to save tokens should get
+        # a shorter list, never a different forecast.
         menstrual_owners = {d.owner_user_id for d in days if d.owner_user_id}
         wrist_readings = await self._wrist_readings_for_owner(menstrual_owners, errors, fresh=fresh)
         summary = summarize_menstrual_cycle(days, wrist_readings=wrist_readings)
+        if limit is not None:
+            summary["days"] = summary["days"][:limit]
+            summary["day_count"] = len(summary["days"])
         _attach_coverage(summary, rows=summary["days"], requested=limit, unit="days", total_available=_avail, oldest_raw=_oldest)
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
@@ -3641,7 +5120,7 @@ class VaultbeatLocalService:
 
         records, errors = await self._records_for_metric(METRIC_ACTIVITY, limit=None, fresh=fresh)
         if owner:
-            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+            records = _select_owner(records, owner)
         days: list[ActivityDay] = []
         for record in records:
             try:
@@ -3666,7 +5145,7 @@ class VaultbeatLocalService:
 
         records, errors = await self._records_for_metric(METRIC_RESTING_HR, limit=None, fresh=fresh)
         if owner:
-            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+            records = _select_owner(records, owner)
         hr_records: list[RestingHrRecord] = []
         for record in records:
             try:
@@ -3697,7 +5176,7 @@ class VaultbeatLocalService:
 
         records, errors = await self._records_for_metric(METRIC_WORKOUT, limit=None, fresh=fresh)
         if owner:
-            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+            records = _select_owner(records, owner)
         workouts: list[WorkoutRecord] = []
         for record in records:
             try:
@@ -3724,7 +5203,7 @@ class VaultbeatLocalService:
 
         records, errors = await self._records_for_metric(METRIC_MINDFULNESS, limit=None, fresh=fresh)
         if owner:
-            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+            records = _select_owner(records, owner)
         days: list[MindfulnessDay] = []
         for record in records:
             try:
@@ -3751,7 +5230,7 @@ class VaultbeatLocalService:
 
         records, errors = await self._records_for_metric(METRIC_HRV, limit=None, fresh=fresh)
         if owner:
-            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+            records = _select_owner(records, owner)
         hrv_list: list[HRVRecord] = []
         for record in records:
             try:
@@ -3802,7 +5281,7 @@ class VaultbeatLocalService:
 
         records, errors = await self._records_for_metric(METRIC_HRV_HOURLY, limit=None, fresh=fresh)
         if owner:
-            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+            records = _select_owner(records, owner)
         buckets: list[HRVHourlyBucket] = []
         for record in records:
             try:
@@ -3840,7 +5319,7 @@ class VaultbeatLocalService:
 
         records, errors = await self._records_for_metric(METRIC_WRIST_TEMP, limit=None, fresh=fresh)
         if owner:
-            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+            records = _select_owner(records, owner)
         temp_list: list[WristTempRecord] = []
         for record in records:
             try:
@@ -3869,7 +5348,7 @@ class VaultbeatLocalService:
         limit: int | None = None,
         owner: str | None = None,
         fresh: bool = False,
-        day_limit: int | None = 30,
+        day_limit: int | None = None,
     ) -> dict[str, Any]:
         """Return recent basal-energy-burned samples (Watch BMR estimate, kcal).
 
@@ -3886,17 +5365,23 @@ class VaultbeatLocalService:
         exact proportion; `incomplete` is the flag that keeps such a day out of
         any average.
 
-        `day_limit` caps how many days `daily` RETURNS (30 by default — this is
-        a display cap for a tool whose caller usually wants "recent"). It is
-        NOT a cap on what was read: pass None to get every day, which is what
-        `total_energy_burned` does. That distinction is load-bearing — consuming
-        the truncated list is how a 90-day TDEE query came to report 60 days of
-        `basal_missing` for data that was present the whole time.
+        `day_limit` caps how many days `daily` RETURNS. It is a DISPLAY cap,
+        never a cap on what was read, and it defaults to None (every day).
+        🔴 It defaulted to 30 for the per-kind `get_basal_energy` tool, and each
+        consumer that forgot to override it inherited a 30-day history: first
+        `total_energy_burned` (a 90-day TDEE query reported 60 days of
+        `basal_missing` for data present the whole time, Invariant 62), then —
+        after that tool was folded into `get_metric` in 0.9.0 and nobody wanted
+        the cap any more — the series layer, so `list_metric_series` and
+        `get_metric basal_energy` showed 29 days of a two-year history even
+        with `since`, while `coverage.more_available` told the agent to ask for
+        more (release gate G2, 2026-10-03). A default only one caller wanted is
+        a trap for every other; a caller that wants a short list passes it.
         """
 
         records, errors = await self._records_for_metric(METRIC_BASAL_ENERGY, limit=None, fresh=fresh)
         if owner:
-            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+            records = _select_owner(records, owner)
 
         parsed: list[BasalEnergyRecord] = []
         for record in records:
@@ -4045,8 +5530,9 @@ class VaultbeatLocalService:
 
         # Pull both underlying streams in parallel — this is a compute
         # aggregation, no new envelope fetches once both caches are warm.
-        # day_limit=None: `basal_energy_records` display-caps `daily` at 30 days
-        # for its own tool, and consuming that cap here reported `basal_missing`
+        # day_limit=None (now also the default, kept explicit because this is
+        # where it first bit): `basal_energy_records` display-capped `daily` at 30
+        # days for its old tool, and consuming that cap here reported `basal_missing`
         # for every day older than 30 — 60 of them on a days=90 query, for data
         # that was present and readable the whole time. That is an
         # Invariant 57 violation (rendering "I truncated the list" as "the Watch
@@ -4161,6 +5647,14 @@ class VaultbeatLocalService:
             "basal_errors": basal.get("errors", []),
             "activity_errors": activity.get("errors", []),
         }
+        # TDEE joins two readers that each guard against blending two people,
+        # but the join discarded their flags — so an unfiltered TDEE on a paired
+        # account summed one person's basal with the other's activity and said
+        # nothing. Carry the guard across the join.
+        for part in (basal, activity):
+            if part.get("mixed_owners"):
+                for key in ("mixed_owners", "owner_user_id_prefixes", "warning"):
+                    summary.setdefault(key, part.get(key))
         # The one reader whose parameter really is a WINDOW: `days=90` asks for 90
         # days. But `all_days` above takes the newest N days THAT HAVE DATA, so 90
         # rows can span seven months — `span_days` is what tells those apart, and
@@ -4184,7 +5678,7 @@ class VaultbeatLocalService:
 
         records, errors = await self._records_for_metric(METRIC_VO2MAX, limit=None, fresh=fresh)
         if owner:
-            records = [r for r in records if r.owner_user_id and r.owner_user_id.startswith(owner)]
+            records = _select_owner(records, owner)
         vo2_list: list[VO2MaxRecord] = []
         for record in records:
             try:
@@ -4219,7 +5713,58 @@ class VaultbeatLocalService:
         _attach_errors(summary, errors)
         return _attach_owner_guard(summary, records, owner)
 
-    async def symptom_summary(self, *, limit: int | None = None, fresh: bool = False) -> dict[str, Any]:
+    async def user_profile(self, *, owner: str | None = None, fresh: bool = False) -> dict[str, Any]:
+        """The owner's Health Profile: biological sex, age, height (GitHub #14).
+
+        One record per user; every device overwrites the same row, so the
+        newest upload is the profile. `profile` is None when nothing was
+        uploaded — an app older than the feature, Apple Health fields never
+        filled in, or reading them not allowed all look the same from here.
+        """
+
+        records, errors = await self._records_for_metric(METRIC_PROFILE, limit=None, fresh=fresh)
+        if owner:
+            records = _select_owner(records, owner)
+        parsed: list[tuple[str, ProfileRecord]] = []
+        for record in records:
+            try:
+                parsed.append((str(record.created_at or ""), parse_profile_record(record.payload, owner_user_id=record.owner_user_id)))
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        parsed.sort(key=lambda item: item[0], reverse=True)
+        newest = parsed[0][1] if parsed else None
+        # #14 also asked for `is_partner_paired`. Deliberately absent: a profile
+        # is own-devices-only, so nothing in THIS kind says whether a partner
+        # exists. Whether a partner shares something is answered per kind, by
+        # reading it with `partner=true` (doctor's `owner_prefixes` answered it
+        # until 2026-10-02, at the price of downloading every record).
+        # 🚫 No upload timestamp (GitHub #42). The only one available is the
+        # row's `created_at`, i.e. the FIRST upload: the upsert RPC's conflict
+        # branch rewrites only `ciphertext` / `encryption_version`, and this kind
+        # overwrites one row per user forever. Shipped as `uploaded_at` it read
+        # as "how current", which an edited profile proves false. A real
+        # freshness signal needs a server-maintained column; until then, no
+        # field beats a misleading one.
+        profile = newest.to_dict(today=date.today()) if newest else None
+        summary: dict[str, Any] = {"profile": profile}
+        if newest is None:
+            summary["note"] = (
+                "No health profile has been uploaded. The iOS app uploads it from "
+                "Settings → Health Profile once the person has allowed Apple Health "
+                "to share sex, date of birth and height, or picked their sex there. "
+                "An older app, fields never filled in, and access not allowed all look "
+                "the same from here — do not guess which."
+            )
+        # Every read tool carries the block (test_every_read_tool_reports_coverage).
+        # A profile is not a series, so `days_covered` is 0 by construction and
+        # `total_available` counts uploaded copies, not days.
+        _attach_coverage(summary, rows=[], requested=None, unit="records", total_available=len(parsed))
+        _attach_errors(summary, errors)
+        return _attach_owner_guard(summary, records, owner)
+
+    async def symptom_summary(
+        self, *, limit: int | None = None, fresh: bool = False, owner: str | None = None
+    ) -> dict[str, Any]:
         """Return recent symptom days grouped by data owner.
 
         Symptom blobs only arrive when someone opted in on iOS (own AI or the
@@ -4233,30 +5778,67 @@ class VaultbeatLocalService:
         else:
             _LOG.info("decoding %d symptom envelope(s); sensitive, kept local", len(records))
         days: list[SymptomDay] = []
+        entries: list[SymptomEntry] = []
         for record in records:
             try:
-                days.append(parse_symptom_day(record.payload, owner_user_id=record.owner_user_id))
+                if is_symptom_entry_payload(record.payload):
+                    entries.append(
+                        parse_symptom_entry(record.payload, owner_user_id=record.owner_user_id)
+                    )
+                else:
+                    days.append(parse_symptom_day(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        # A deleted entry is a tombstone blob; it is nobody's symptom.
+        entries = [e for e in entries if not e.deleted]
+        # Same owner filter as every other reader (`me` or `!me` for the partner).
+        days = _select_owner(days, owner)
+        entries = _select_owner(entries, owner)
         days, _avail, _oldest = _cut_newest_by_with_span(days, limit, key=lambda d: d.day_start_date)
-        summary = summarize_symptoms(days)
+        # The two shapes are cut separately on their own business dates
+        # (Invariant 38): `limit` HealthKit days AND `limit` reported episodes.
+        entries, _e_avail, _e_oldest = _cut_newest_by_with_span(
+            entries, limit, key=lambda e: e.sort_key()
+        )
+        summary = summarize_symptoms(days, entries)
         # Rows live one level down, grouped per owner. Flattened here so coverage
         # describes the days actually reported, which after the per-owner dedup is
         # also what `window_satisfied` should be measured against.
         # ⚠️ With both partners tracking, the span blends two people — read it
         # alongside each owner's own `day_count`.
+        day_rows = [d for o in summary["owners"] for d in o["days"]]
+        entry_rows = [e for o in summary["owners"] for e in o["reported"]]
+        # Oldest day behind EITHER cut, normalised to a bare local day so the two
+        # shapes compare (`_oldest` is an ISO instant, an entry's key a day).
+        oldest_days = [
+            d
+            for d in (
+                _local_date_fields(_oldest).get("local_date") if _oldest else None,
+                _e_oldest.split("|", 1)[0] if _e_oldest else None,
+            )
+            if d
+        ]
         _attach_coverage(
             summary,
-            rows=[d for o in summary["owners"] for d in o["days"]],
+            rows=day_rows + entry_rows,
             requested=limit,
             unit="days",
-            total_available=_avail,
-            oldest_raw=_oldest,
+            # Each list was cut to `limit` on its own, so the binding count is the
+            # larger of the two — summing them would call two half-full lists a
+            # satisfied window.
+            cut_count=max(len(day_rows), len(entry_rows)),
+            total_available=_avail + _e_avail,
+            oldest_raw=min(oldest_days) if oldest_days else None,
         )
         return _attach_errors(summary, errors)
 
     async def notes_summary(
-        self, *, limit: int | None = None, target_kind: str | None = None, fresh: bool = False
+        self,
+        *,
+        limit: int | None = None,
+        target_kind: str | None = None,
+        fresh: bool = False,
+        partner: bool | None = None,
     ) -> dict[str, Any]:
         """Return recent free-text notes grouped by target kind.
 
@@ -4280,6 +5862,20 @@ class VaultbeatLocalService:
                 notes.append(parse_note(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        # Whose notes. `partner=None` keeps the old everyone-grouped read for
+        # internal callers. Me = notes I wrote about myself; partner = notes the
+        # partner wrote (shared from their app) PLUS notes my AI wrote about
+        # them, which live in my account with `about: "partner"`.
+        me = self.person_owner() if partner is not None else None
+        if me:
+            def _mine(n: NoteRecord) -> bool:
+                # Case-folded for the reason `_select_owner` gives.
+                return bool(n.owner_user_id and n.owner_user_id.lower().startswith(me.lower()))
+
+            if partner:
+                notes = [n for n in notes if not _mine(n) or n.about == "partner"]
+            else:
+                notes = [n for n in notes if _mine(n) and n.about != "partner"]
         # Span facts come from the notes the caller ASKED FOR, not from every
         # note fetched — the one reader where those differ. `target_kind` filters
         # AFTER the cut, so measuring `more_available` over the unfiltered pool
@@ -4408,14 +6004,13 @@ class VaultbeatLocalService:
         ):
             raise RuntimeError(
                 "This bind predates the agent write path (missing owner identity/device). "
-                # Name the MCP tools first: the caller is usually a pure MCP client
-                # that cannot run a shell command at all, and until 2026-07-28 this
-                # only offered the CLI, sending agents off to debug an install that
-                # was never broken. `vaultbeat-apple-health` is the console script
-                # since the 0.6.2 rename; `vaultbeat-mcp` / `vaultbeat-mcp-local`
-                # are back-compat aliases (see pyproject.toml [project.scripts]).
-                "Re-pair with `vaultbeat_start_binding`, then `vaultbeat_poll_binding` "
-                "(CLI equivalent: `vaultbeat-apple-health bind`)."
+                # CLI only, on purpose: 0.9.0 removed the MCP pairing tools this
+                # message used to name first (setup does not belong in the tool
+                # list), so `bind` in a terminal is the one way to re-pair.
+                # `vaultbeat-apple-health` is the console script since the 0.6.2
+                # rename; `vaultbeat-mcp` / `vaultbeat-mcp-local` are back-compat
+                # aliases (see pyproject.toml [project.scripts]).
+                "Re-pair by running `uvx vaultbeat-apple-health@latest bind` in a terminal."
             )
 
         existing_summary = await self.strength_summary(fresh=True)
@@ -4459,7 +6054,7 @@ class VaultbeatLocalService:
         )
 
         now_iso_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        entry_id = existing_entry_id or ("strength-" + secrets.token_hex(16))
+        entry_id = existing_entry_id or new_entry_blob_id(METRIC_STRENGTH)
         plaintext_obj = {
             "entryID": entry_id,
             "date": _local_midnight_iso(requested_day),
@@ -4503,9 +6098,9 @@ class VaultbeatLocalService:
             for envelope in sealed_envelopes
         ]
 
-        server_response = await self._client(config).write_strength_blob(
+        server_response = await self._committed(METRIC_STRENGTH, self._client(config).write_strength_blob(
             server_token, blob=blob, envelopes=envelope_rows
-        )
+        ))
 
         refreshed = await self.strength_summary(fresh=True)
         session = next(
@@ -4520,20 +6115,34 @@ class VaultbeatLocalService:
             # Empty in merge mode and on a fresh day. Surfaced because the caller
             # is an LLM with no view of the day it just overwrote.
             "replaced_exercises": replaced_exercises,
-            "server_response": server_response,
+            "server_response": _server_facts(server_response),
             "session": session,
         }
 
     async def food_summary(
-        self, *, limit: int | None = None, limit_days: int | None = None, fresh: bool = False
+        self,
+        *,
+        limit: int | None = None,
+        limit_days: int | None = None,
+        fresh: bool = False,
+        since: str | None = None,
+        until: str | None = None,
     ) -> dict[str, Any]:
         """Return recent daily food-intake logs with per-day meals + items.
 
         Logged manually in Vaultbeat (no automatic HealthKit source — HealthKit's
         dietary types are point samples that don't survive as "what a meal actually
         was"). Owner's own days only — food has no partner fan-out in v1.
+
+        `since` / `until` ("YYYY-MM-DD", local calendar days, both inclusive)
+        select a window instead of the newest days (GitHub #9). Without them,
+        reading a fortnight a month ago meant reading the whole month between,
+        which a food log — about 1k tokens a day — does not fit in one result.
         """
 
+        since, until, bad = _parse_day_range(since, until)
+        if bad:
+            return bad
         # Invariant 38 — see the identical note in strength_summary.
         records, errors = await self._records_for_metric(METRIC_FOOD, limit=None, fresh=fresh)
         if not records:
@@ -4544,7 +6153,21 @@ class VaultbeatLocalService:
                 entries.append(parse_food(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
-        entries, _avail, _oldest = _cut_newest_by_with_span(entries, limit, key=lambda e: e.date)
+        # The span facts come from EVERY day, before the window narrows the list,
+        # so `more_available` can say that older days exist beyond `since`.
+        _, _avail, _oldest = _cut_newest_by_with_span(entries, None, key=lambda e: e.date)
+        if since or until:
+            # By the LOCAL day the entry is about, the same day `local_date` shows;
+            # the wire value is an instant (local midnight in UTC), and comparing
+            # it as a string would move every UTC+ user's window by a day.
+            def in_window(entry: FoodRecord) -> bool:
+                day = str(_local_date_fields(entry.date).get("local_date") or "")
+                if not day:
+                    return False
+                return (since is None or day >= since) and (until is None or day <= until)
+
+            entries = [entry for entry in entries if in_window(entry)]
+        entries, _, _ = _cut_newest_by_with_span(entries, limit, key=lambda e: e.date)
         summary = summarize_food(entries, limit_days=limit_days)
         # Same double cap as strength_summary — see the note there.
         _attach_coverage(
@@ -4555,6 +6178,7 @@ class VaultbeatLocalService:
             total_available=_avail,
             oldest_raw=_oldest,
         )
+        _apply_range_coverage(summary, since, until)
         return _attach_errors(summary, errors)
 
     async def log_food_entry(
@@ -4610,14 +6234,13 @@ class VaultbeatLocalService:
         ):
             raise RuntimeError(
                 "This bind predates the agent write path (missing owner identity/device). "
-                # Name the MCP tools first: the caller is usually a pure MCP client
-                # that cannot run a shell command at all, and until 2026-07-28 this
-                # only offered the CLI, sending agents off to debug an install that
-                # was never broken. `vaultbeat-apple-health` is the console script
-                # since the 0.6.2 rename; `vaultbeat-mcp` / `vaultbeat-mcp-local`
-                # are back-compat aliases (see pyproject.toml [project.scripts]).
-                "Re-pair with `vaultbeat_start_binding`, then `vaultbeat_poll_binding` "
-                "(CLI equivalent: `vaultbeat-apple-health bind`)."
+                # CLI only, on purpose: 0.9.0 removed the MCP pairing tools this
+                # message used to name first (setup does not belong in the tool
+                # list), so `bind` in a terminal is the one way to re-pair.
+                # `vaultbeat-apple-health` is the console script since the 0.6.2
+                # rename; `vaultbeat-mcp` / `vaultbeat-mcp-local` are back-compat
+                # aliases (see pyproject.toml [project.scripts]).
+                "Re-pair by running `uvx vaultbeat-apple-health@latest bind` in a terminal."
             )
 
         existing_summary = await self.food_summary(fresh=True)
@@ -4659,7 +6282,7 @@ class VaultbeatLocalService:
         cleaned_note = _resolve_note(note, existing_day.get("note") if existing_day else None)
 
         now_iso_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        entry_id = existing_entry_id or ("food-" + secrets.token_hex(16))
+        entry_id = existing_entry_id or new_entry_blob_id(METRIC_FOOD)
         plaintext_obj = {
             "entryID": entry_id,
             "date": _local_midnight_iso(requested_day),
@@ -4703,9 +6326,9 @@ class VaultbeatLocalService:
             for envelope in sealed_envelopes
         ]
 
-        server_response = await self._client(config).write_food_blob(
+        server_response = await self._committed(METRIC_FOOD, self._client(config).write_food_blob(
             server_token, blob=blob, envelopes=envelope_rows
-        )
+        ))
 
         refreshed = await self.food_summary(fresh=True)
         day = next(
@@ -4719,7 +6342,7 @@ class VaultbeatLocalService:
             # Meals this call deleted (replace mode over a day that had data).
             # Empty in merge mode and on a fresh day.
             "replaced_meals": replaced_meals,
-            "server_response": server_response,
+            "server_response": _server_facts(server_response),
             "day": day,
         }
 
@@ -4737,7 +6360,7 @@ class VaultbeatLocalService:
         weight card. Sealed for owner + this MCP server (own AI only).
 
         ⚠️ CAVEAT: agent-written weight ONLY lands in Vaultbeat cloud + MCP
-        (visible to `get_weight_trend`). It does NOT write to Apple Health
+        (visible to `get_metric` series "weight_kg"). It does NOT write to Apple Health
         (HealthKit is iOS-only). If the owner also wants the number in the
         iPhone Health app, they need to record it manually in the Vaultbeat
         weight card (which does the HealthKit write). Design decision:
@@ -4769,26 +6392,24 @@ class VaultbeatLocalService:
         ):
             raise RuntimeError(
                 "This bind predates the agent write path (missing owner identity/device). "
-                # Name the MCP tools first: the caller is usually a pure MCP client
-                # that cannot run a shell command at all, and until 2026-07-28 this
-                # only offered the CLI, sending agents off to debug an install that
-                # was never broken. `vaultbeat-apple-health` is the console script
-                # since the 0.6.2 rename; `vaultbeat-mcp` / `vaultbeat-mcp-local`
-                # are back-compat aliases (see pyproject.toml [project.scripts]).
-                "Re-pair with `vaultbeat_start_binding`, then `vaultbeat_poll_binding` "
-                "(CLI equivalent: `vaultbeat-apple-health bind`)."
+                # CLI only, on purpose: 0.9.0 removed the MCP pairing tools this
+                # message used to name first (setup does not belong in the tool
+                # list), so `bind` in a terminal is the one way to re-pair.
+                # `vaultbeat-apple-health` is the console script since the 0.6.2
+                # rename; `vaultbeat-mcp` / `vaultbeat-mcp-local` are back-compat
+                # aliases (see pyproject.toml [project.scripts]).
+                "Re-pair by running `uvx vaultbeat-apple-health@latest bind` in a terminal."
             )
 
         if weight_kg <= 0 or weight_kg > 500:
             raise ValueError(f"weight_kg out of realistic range: {weight_kg}")
 
         # Match iOS: dayID = "body-{dayStart.epoch}", dayStart = local midnight
-        local_tz = datetime.now(timezone.utc).astimezone().tzinfo
-        day_start_local = datetime(
-            requested_day.year, requested_day.month, requested_day.day, tzinfo=local_tz
-        )
+        # with that day's offset — a summer day written in winter must land on
+        # the id the phone minted in summer, or it becomes a second row.
+        day_start_local = _local_midnight(requested_day)
         day_start_epoch = int(day_start_local.timestamp())
-        day_id = f"body-{day_start_epoch}"
+        day_id = body_day_blob_id(day_start_epoch)
 
         # Invariant 41 (no-silent-day-erasure): this rewrites the day's WHOLE blob,
         # so anything the caller did not mention has to be carried over. Body
@@ -4813,6 +6434,19 @@ class VaultbeatLocalService:
                 "leanBodyMassKg": day.get("lean_body_mass_kg"),
             }
             break
+
+        # Which ROW this day lives in. `day_id` above is the day's identity and
+        # stays in the payload; the row may carry the remapped id instead (see
+        # `body_day_blob_id`), and writing the plain one would then fail as
+        # another account's — or, if nobody holds it yet, start a second row
+        # for the same day. The read above was fresh, so this hits the cache.
+        remapped_id = body_day_blob_id(day_start_epoch, config.owner_user_id)
+        own_rows = {
+            record.blob_id
+            for record in (await self._records_for_metric(METRIC_BODY, limit=None))[0]
+            if (record.owner_user_id or "").lower() == config.owner_user_id.lower()
+        }
+        blob_id = remapped_id if remapped_id in own_rows else day_id
 
         plaintext_obj = {
             "dayID": day_id,
@@ -4858,7 +6492,7 @@ class VaultbeatLocalService:
         )
 
         blob = {
-            "id": day_id,
+            "id": blob_id,
             "owner_user_id": config.owner_user_id,
             "source_device_id": config.owner_device_id,
             "metric_type": METRIC_BODY,
@@ -4874,9 +6508,21 @@ class VaultbeatLocalService:
             for envelope in sealed_envelopes
         ]
 
-        server_response = await self._client(config).write_body_blob(
-            server_token, blob=blob, envelopes=envelope_rows
-        )
+        try:
+            server_response = await self._committed(METRIC_BODY, self._client(config).write_body_blob(
+                server_token, blob=blob, envelopes=envelope_rows
+            ))
+        except VaultbeatBlobOwnerConflictError:
+            if blob["id"] == remapped_id:
+                raise
+            # Another account recorded this day first, in this time zone
+            # (measured 2026-10-02: 10 of 76 body rows carry the remap, across 4
+            # accounts). Until this retry, an agent could not log a weight on any
+            # such day at all. Same id the app would get; same envelopes.
+            blob["id"] = remapped_id
+            server_response = await self._committed(METRIC_BODY, self._client(config).write_body_blob(
+                server_token, blob=blob, envelopes=envelope_rows
+            ))
 
         # Verify by re-reading (cache-bypass)
         refreshed = await self.weight_trend_summary(fresh=True, limit=30)
@@ -4888,7 +6534,7 @@ class VaultbeatLocalService:
             # Says what this write carried over rather than overwrote, so a caller
             # can see that the day's scale composition survived (Invariant 41).
             "preserved_composition": preserved,
-            "server_response": server_response,
+            "server_response": _server_facts(server_response),
             "latest_after_write": latest,
         }
 
@@ -4899,8 +6545,19 @@ class VaultbeatLocalService:
         kind: str = "general",
         date: str | None = None,
         merge: bool = False,
+        partner: bool = False,
     ) -> dict[str, Any]:
         """Encrypt and upsert one agent-authored note on the owner's behalf.
+
+        `partner=True` (2026-09-23): the note is ABOUT the partner — "she had
+        diarrhoea twice this morning". It is still written into the USER's own
+        account and sealed to the user + this server only; the partner's account
+        is never touched and the partner never receives it. It carries
+        `about: "partner"`, which is what keeps it out of the user's own reads
+        and puts it into `partner=True` reads. Notes only, deliberately: iOS
+        never pulls notes back, so an extra field cannot surface in the app as
+        the user's own data — food, strength and body ARE pulled and merged per
+        day, and a partner row there would overwrite the user's.
 
         Fills the gap the 2026-07-23 roadmap entry describes: "今天为什么情绪
         低落 / 发生了什么" narratives had nowhere to live in Vaultbeat (the
@@ -4923,7 +6580,7 @@ class VaultbeatLocalService:
           (kind, day), newline-separated. Nothing already logged can be lost.
 
         Merge matters most for `kind="general"`, which is where symptoms land
-        (CLAUDE.md rule: log any symptom the owner mentions). Discomfort arrives
+        (the owner's standing rule: log any symptom they mention). Discomfort arrives
         in installments across a day — 恶心 at noon, 头晕 at night — so the
         second write of the day is the norm, not the exception. Until
         2026-07-28 this tool had no merge and the docstring pushed
@@ -4963,23 +6620,30 @@ class VaultbeatLocalService:
         ):
             raise RuntimeError(
                 "This bind predates the agent write path (missing owner identity/device). "
-                # Name the MCP tools first: the caller is usually a pure MCP client
-                # that cannot run a shell command at all, and until 2026-07-28 this
-                # only offered the CLI, sending agents off to debug an install that
-                # was never broken. `vaultbeat-apple-health` is the console script
-                # since the 0.6.2 rename; `vaultbeat-mcp` / `vaultbeat-mcp-local`
-                # are back-compat aliases (see pyproject.toml [project.scripts]).
-                "Re-pair with `vaultbeat_start_binding`, then `vaultbeat_poll_binding` "
-                "(CLI equivalent: `vaultbeat-apple-health bind`)."
+                # CLI only, on purpose: 0.9.0 removed the MCP pairing tools this
+                # message used to name first (setup does not belong in the tool
+                # list), so `bind` in a terminal is the one way to re-pair.
+                # `vaultbeat-apple-health` is the console script since the 0.6.2
+                # rename; `vaultbeat-mcp` / `vaultbeat-mcp-local` are back-compat
+                # aliases (see pyproject.toml [project.scripts]).
+                "Re-pair by running `uvx vaultbeat-apple-health@latest bind` in a terminal."
             )
 
         # Upsert key: an existing agent-authored note for the same (kind, day).
         existing_note_id: str | None = None
         existing_created_at: str | None = None
         existing_text: str | None = None
+        # One note per (kind, day, ABOUT WHOM), and only among notes this account
+        # wrote: a note about the partner must never overwrite the user's own
+        # note for that day, nor append onto it.
         existing_summary = await self.notes_summary(target_kind=kind, fresh=True)
+        wanted_about = "partner" if partner else "self"
         for kind_group in existing_summary.get("kinds", []):
             for note_row in kind_group.get("notes", []):
+                if note_row.get("about", "self") != wanted_about:
+                    continue
+                if not str(note_row.get("owner_user_id") or "").startswith(config.owner_user_id):
+                    continue
                 raw_date = note_row.get("target_date")
                 if not isinstance(raw_date, str):
                     continue
@@ -5011,7 +6675,7 @@ class VaultbeatLocalService:
             replaced_text = existing_text
 
         now_iso_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        note_id = existing_note_id or ("note-" + secrets.token_hex(16))
+        note_id = existing_note_id or new_entry_blob_id(METRIC_NOTE)
         plaintext_obj = {
             "noteID": note_id,
             "targetKind": kind,
@@ -5019,6 +6683,9 @@ class VaultbeatLocalService:
             "text": cleaned_text,
             "createdAt": existing_created_at or now_iso_utc,
             "updatedAt": now_iso_utc,
+            # Only when true: a note about oneself stays byte-identical to what
+            # every earlier version wrote.
+            **({"about": "partner"} if partner else {}),
         }
         plaintext_bytes = json.dumps(plaintext_obj, ensure_ascii=False).encode("utf-8")
 
@@ -5055,9 +6722,9 @@ class VaultbeatLocalService:
             for envelope in sealed_envelopes
         ]
 
-        server_response = await self._client(config).write_note_blob(
+        server_response = await self._committed(METRIC_NOTE, self._client(config).write_note_blob(
             server_token, blob=blob, envelopes=envelope_rows
-        )
+        ))
 
         refreshed = await self.notes_summary(target_kind=kind, fresh=True)
         written = None
@@ -5069,6 +6736,7 @@ class VaultbeatLocalService:
         return {
             "note_id": note_id,
             "kind": kind,
+            "about": "partner" if partner else "self",
             "date": requested_day.isoformat(),
             "updated_existing_note": existing_note_id is not None,
             "merge_mode": merge,
@@ -5076,8 +6744,257 @@ class VaultbeatLocalService:
             # one). None in merge mode and on a fresh day. Surfaced because the
             # caller is an LLM with no view of the note it just overwrote.
             "replaced_text": replaced_text,
-            "server_response": server_response,
+            "server_response": _server_facts(server_response),
             "note": written,
+        }
+
+    # ── Self-reported symptoms (GitHub #3, 2026-09-30) ──────────────────────
+
+    def _require_agent_write_config(self) -> LocalServerConfig:
+        """The bound config, provided the bind carried owner identity (Invariant 21 ①)."""
+
+        config = self._require_bound_config()
+        if not (
+            config.server_token
+            and config.owner_user_id
+            and config.owner_public_key_base64
+            and config.owner_device_id
+            and config.server_id
+        ):
+            raise RuntimeError(
+                "This bind predates the agent write path (missing owner identity/device). "
+                "Re-pair by running `uvx vaultbeat-apple-health@latest bind` in a terminal."
+            )
+        return config
+
+    async def _seal_and_write_symptom(
+        self, config: LocalServerConfig, plaintext_obj: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Seal one symptom entry for owner + this server and POST it.
+
+        Same recipients as every agent write (owner_user + this mcp_server, no
+        partner). The blob id IS the entry id, so rewriting an entry is an
+        upsert of the same row.
+        """
+
+        plaintext_bytes = json.dumps(plaintext_obj, ensure_ascii=False).encode("utf-8")
+        recipients = [
+            RecipientKey(
+                recipient_kind="owner_user",
+                recipient_id=config.owner_user_id or "",
+                public_key_base64=config.owner_public_key_base64 or "",
+            ),
+            RecipientKey(
+                recipient_kind="mcp_server",
+                recipient_id=config.server_id or "",
+                public_key_base64=config.public_key_base64,
+            ),
+        ]
+        ciphertext_base64, sealed_envelopes = encrypt_blob_payload(
+            plaintext=plaintext_bytes, recipients=recipients
+        )
+        blob = {
+            "id": plaintext_obj["entryID"],
+            "owner_user_id": config.owner_user_id,
+            "source_device_id": config.owner_device_id,
+            "metric_type": METRIC_SYMPTOM,
+            "encryption_version": "v1",
+            "ciphertext": ciphertext_base64,
+        }
+        envelope_rows = [
+            {
+                "recipient_kind": envelope.recipient_kind,
+                "recipient_id": envelope.recipient_id,
+                "encrypted_data_key": envelope.encrypted_data_key_base64,
+            }
+            for envelope in sealed_envelopes
+        ]
+        return await self._committed(METRIC_SYMPTOM, self._client(config).write_symptom_blob(
+            config.server_token or "", blob=blob, envelopes=envelope_rows
+        ))
+
+    async def _find_own_symptom_entry(
+        self, entry_id: str, config: LocalServerConfig
+    ) -> SymptomEntry:
+        """The live (not deleted) reported entry `entry_id`, written by this account."""
+
+        if not isinstance(entry_id, str) or not entry_id.strip():
+            raise ValueError("entry_id must be a non-empty string")
+        wanted = entry_id.strip()
+        records, _errors = await self._records_for_metric(METRIC_SYMPTOM, limit=None, fresh=True)
+        me = (config.owner_user_id or "").lower()
+        for record in records:
+            if not is_symptom_entry_payload(record.payload):
+                continue
+            try:
+                entry = parse_symptom_entry(record.payload, owner_user_id=record.owner_user_id)
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError):
+                continue
+            if entry.entry_id != wanted:
+                continue
+            if entry.deleted:
+                raise ValueError(f"symptom entry {wanted!r} was already deleted")
+            if (entry.owner_user_id or "").lower() != me:
+                raise ValueError(f"symptom entry {wanted!r} belongs to another account")
+            return entry
+        raise ValueError(
+            f"no symptom entry {wanted!r} readable by this server — read `entry_id` "
+            "from get_symptoms' `reported` list (HealthKit-imported days cannot be edited here)"
+        )
+
+    async def _read_back_symptom_entry(self, entry_id: str, owner: str | None) -> dict[str, Any] | None:
+        refreshed = await self.symptom_summary(fresh=True, owner=owner)
+        for owner_group in refreshed.get("owners", []):
+            for row in owner_group.get("reported", []):
+                if row.get("entry_id") == entry_id:
+                    found: dict[str, Any] = row
+                    return found
+        return None
+
+    async def log_symptom(
+        self,
+        *,
+        symptom_type: str,
+        severity: str = "unspecified",
+        onset_at: str | None = None,
+        end_at: str | None = None,
+        date: str | None = None,
+        display_name: str | None = None,
+        body_location: str | None = None,
+        triggers: list[str] | str | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Encrypt and write one self-reported symptom episode (agent write).
+
+        One blob per episode (`symptom-` + 16 random bytes, opaque like food and
+        note ids — Invariant 53), sealed for owner + this MCP server. Never
+        touches a HealthKit-imported day. Validation runs before the demo and
+        bind checks so a malformed call reports its real error everywhere.
+        """
+
+        now = datetime.now(timezone.utc)
+        fields = _validate_symptom_fields(
+            symptom_type=symptom_type,
+            severity=severity,
+            onset_at=onset_at,
+            end_at=end_at,
+            day=date,
+            display_name=display_name,
+            body_location=body_location,
+            triggers=triggers,
+            note=note,
+            default_onset=now,
+        )
+
+        if self._demo:
+            return _demo_write_refusal("log_symptom")
+        config = self._require_agent_write_config()
+
+        entry_id = new_entry_blob_id(METRIC_SYMPTOM)
+        stamp = _symptom_wire_instant(now)
+        payload = _symptom_entry_payload(entry_id, fields, created_at=stamp, updated_at=stamp)
+        server_response = await self._seal_and_write_symptom(config, payload)
+        return {
+            "entry_id": entry_id,
+            "server_response": _server_facts(server_response),
+            "entry": await self._read_back_symptom_entry(entry_id, config.owner_user_id),
+        }
+
+    async def update_symptom(
+        self,
+        *,
+        entry_id: str,
+        symptom_type: str | None = None,
+        severity: str | None = None,
+        onset_at: str | None = None,
+        end_at: str | None = None,
+        date: str | None = None,
+        display_name: str | None = None,
+        body_location: str | None = None,
+        triggers: list[str] | str | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Change the given fields of one reported entry; every other field stays.
+
+        `None` = leave as is. `""` clears an optional text field or `end_at`
+        (an end logged by mistake), `[]` clears `triggers`. The result carries
+        `previous` — the old value of every field this call changed — because the
+        caller cannot otherwise see what it overwrote.
+        """
+
+        if self._demo:
+            return _demo_write_refusal("update_symptom")
+        config = self._require_agent_write_config()
+        existing = await self._find_own_symptom_entry(entry_id, config)
+
+        def _keep(new: Any, old: Any) -> Any:
+            return old if new is None else (new or None)
+
+        onset_value = onset_at if onset_at is not None else (existing.onset_at or existing.local_date)
+        fields = _validate_symptom_fields(
+            symptom_type=symptom_type if symptom_type is not None else existing.symptom_type,
+            severity=severity if severity is not None else existing.severity,
+            onset_at=onset_value,
+            end_at=_keep(end_at, existing.end_at),
+            # A new onset re-derives the day unless the caller also names one.
+            day=date if date is not None else (None if onset_at is not None else existing.local_date),
+            display_name=_keep(display_name, existing.display_name),
+            body_location=_keep(body_location, existing.body_location),
+            triggers=list(existing.triggers) if triggers is None else triggers,
+            note=_keep(note, existing.note),
+            default_onset=None,
+        )
+
+        stamp = _symptom_wire_instant(datetime.now(timezone.utc))
+        payload = _symptom_entry_payload(
+            existing.entry_id, fields, created_at=existing.created_at or stamp, updated_at=stamp
+        )
+        before = existing.to_dict()
+        server_response = await self._seal_and_write_symptom(config, payload)
+        after = await self._read_back_symptom_entry(existing.entry_id, config.owner_user_id)
+        compared = (
+            "symptom_type", "severity", "local_date", "onset_at", "end_at",
+            "display_name", "body_location", "triggers", "note",
+        )
+        previous = {
+            key: before.get(key)
+            for key in compared
+            if after is not None and after.get(key) != before.get(key)
+        }
+        return {
+            "entry_id": existing.entry_id,
+            "changed_fields": sorted(previous),
+            "previous": previous,
+            "server_response": _server_facts(server_response),
+            "entry": after,
+        }
+
+    async def delete_symptom(self, *, entry_id: str) -> dict[str, Any]:
+        """Erase one reported entry by overwriting its blob with a tombstone.
+
+        There is no delete endpoint on the agent write path, and adding one
+        would widen what a server token can do. Overwriting instead removes the
+        content itself — the ciphertext that held the symptom is replaced by one
+        holding only the id — and tells every reader, the app included, that
+        the entry is gone. `deleted_entry` hands back what was erased so a
+        mistaken delete can be re-logged.
+        """
+
+        if self._demo:
+            return _demo_write_refusal("delete_symptom")
+        config = self._require_agent_write_config()
+        existing = await self._find_own_symptom_entry(entry_id, config)
+        tombstone = {
+            "entryID": existing.entry_id,
+            "deleted": True,
+            "updatedAt": _symptom_wire_instant(datetime.now(timezone.utc)),
+        }
+        server_response = await self._seal_and_write_symptom(config, tombstone)
+        return {
+            "entry_id": existing.entry_id,
+            "deleted": True,
+            "deleted_entry": existing.to_dict(),
+            "server_response": _server_facts(server_response),
         }
 
     def _probe_cloud(self, api_base_url: str) -> tuple[bool, str]:
@@ -5225,7 +7142,8 @@ class VaultbeatLocalService:
     _SERIES_MAX_WIDENINGS = 5
 
     async def _series_points(
-        self, spec: Any, *, days: int, owner: str | None, fresh: bool
+        self, spec: Any, *, days: int, owner: str | None, fresh: bool,
+        since: str | None = None, until: str | None = None,
     ) -> tuple[dict[str, float], int, dict[str, Any]]:
         """Fetch one series and cut it to the newest `days` calendar days.
 
@@ -5239,6 +7157,19 @@ class VaultbeatLocalService:
         fetch = getattr(self, spec.method, None)
         if fetch is None:  # pragma: no cover — SERIES is checked by a test
             raise VaultbeatUnsupportedMetricError(spec.method)
+
+        if since or until:
+            # A calendar window: read the whole history once, keep the days in
+            # range. Counting "newest N days with data" cannot express "July"
+            # (2026-09-24: comparing a summer with a semester meant hand-picking
+            # dates out of a table).
+            summary = await fetch(limit=None, owner=owner, fresh=fresh)
+            points, consumed = daily_series(summary, spec)
+            kept = {
+                d: v for d, v in points.items()
+                if (since is None or d >= since) and (until is None or d <= until)
+            }
+            return kept, consumed, summary
 
         limit = max(days * self._SERIES_ROW_MULTIPLIER, self._SERIES_ROW_FLOOR)
         summary = await fetch(limit=limit, owner=owner, fresh=fresh)
@@ -5259,16 +7190,18 @@ class VaultbeatLocalService:
         # trend was computed over a third of the requested span while the agent
         # was told to send the user to re-sync data that was already there.
         #
-        # ⚠️ Counted on the RAW rows, not on `consumed`: `daily_series` drops
-        # rows with no day, a non-numeric field, a bool or a NaN, so `consumed`
-        # can sit below `limit` on a response that was in fact truncated — and
-        # reading it as "the history ended" is exactly the mistake this loop is
-        # here to stop making.
+        # ⚠️ "Arrived at the ceiling" is asked of the READ METHOD first, through
+        # its `coverage.more_available` (`_fetch_was_cut`): only the method knows
+        # what its `limit` counts, and basal energy counts hourly samples while
+        # returning days. Raw rows are only the fallback for a reader that does
+        # not say — and even then never `consumed`: `daily_series` drops rows
+        # with no day, a non-numeric field, a bool or a NaN, so `consumed` can
+        # sit below `limit` on a response that was in fact truncated.
         #
         # `fresh` is not repeated: the first ask already refreshed the cache if
         # it was going to, and every widening after that is served locally.
         for _ in range(self._SERIES_MAX_WIDENINGS):
-            if len(points) >= days or _rows_returned(summary, spec) < limit:
+            if len(points) >= days or not _fetch_was_cut(summary, spec, limit):
                 break
             limit *= 2
             summary = await fetch(limit=limit, owner=owner, fresh=False)
@@ -5276,6 +7209,43 @@ class VaultbeatLocalService:
 
         newest = sorted(points)[-days:] if days > 0 else []
         return {d: points[d] for d in newest}, consumed, summary
+
+    async def _analysis_points(
+        self, spec: Any, *, days: int, owner: str | None, fresh: bool,
+        since: str | None = None, until: str | None = None,
+    ) -> tuple[dict[str, float], int, dict[str, Any], str | None]:
+        """`_series_points` for the analysis tools: today left out of accruing series.
+
+        `get_metric` has always kept today off every aggregate of a cumulative
+        series (it is shown, marked `partial`). Trend, compare and correlate
+        read the same points and did not, so at 9am today's 800 steps sat in
+        compare's "recent" window and dragged its mean down — the "steps are
+        down today" sentence the partial marker exists to prevent, and a number
+        that disagreed with `get_metric` over the same data. One extra day is
+        fetched so dropping today still leaves `days` complete days.
+
+        Returns the dropped day (or None) so the caller can name it in
+        `excluded_days` with the same `partial_today` reason `get_metric` uses.
+        """
+
+        if since or until:
+            points, consumed, raw = await self._series_points(
+                spec, days=days, owner=owner, fresh=fresh, since=since, until=until
+            )
+            if not spec.cumulative:
+                return points, consumed, raw, None
+            today = _local_calendar_day(datetime.now(timezone.utc)).isoformat()
+            dropped = today if today in points else None
+            return {d: v for d, v in points.items() if d != today}, consumed, raw, dropped
+        if not spec.cumulative:
+            points, consumed, raw = await self._series_points(spec, days=days, owner=owner, fresh=fresh)
+            return points, consumed, raw, None
+        today = _local_calendar_day(datetime.now(timezone.utc)).isoformat()
+        points, consumed, raw = await self._series_points(spec, days=days + 1, owner=owner, fresh=fresh)
+        dropped = today if today in points else None
+        complete = {d: v for d, v in points.items() if d != today}
+        newest = sorted(complete)[-days:] if days > 0 else []
+        return {d: complete[d] for d in newest}, consumed, raw, dropped
 
     @staticmethod
     def _unknown_series(name: str) -> dict[str, Any]:
@@ -5290,31 +7260,167 @@ class VaultbeatLocalService:
             "error": "unknown_series",
             "requested": name,
             "message": (
-                f"No series named {name!r}. Pick one of `available_series` below, or "
-                "call the matching `get_<kind>` tool if you need the raw rows instead "
-                "of one number per day."
+                f"No series named {name!r}. Pick one of `available_series` below "
+                "(`list_metric_series` also says how much data backs each). Kinds that "
+                "are not one number per day — workouts, strength, food, notes, symptoms, "
+                "cycle, the sex/age/height profile — have their own tools; sleep nights as a table are "
+                "`get_sleep_nights`."
             ),
             "available_series": series_catalog(),
         }
 
+    async def _prefetch_series_kinds(self, names: list[str], *, owner: str | None, fresh: bool) -> None:
+        """Warm the cache for every kind behind `names`, a few at a time.
+
+        `metric_values` reads its series one by one; cold, that summed each kind's
+        download (every series at once was 50 s on one account). Fetching the kinds
+        concurrently first leaves that loop reading the local cache. Skipped for
+        `fresh` (the loop's own fresh read would download each kind a second time)
+        and for a single kind (nothing to overlap). Failures are left to the loop,
+        which reports them per series.
+        """
+        methods = list(dict.fromkeys(spec.method for spec in map(series_lookup, names) if spec is not None))
+        # With the cache off (TTL 0) a warmed kind is not kept, and the loop would
+        # download it a second time.
+        if fresh or len(methods) < 2 or self.cache.ttl_seconds <= 0:
+            return
+        gate = asyncio.Semaphore(_CONCURRENT_KIND_READS)
+
+        async def warm(method: str) -> None:
+            async with gate:
+                try:
+                    await getattr(self, method)(limit=None, owner=owner, fresh=False)
+                except Exception:  # noqa: BLE001 — reported per series by the caller
+                    pass
+
+        await asyncio.gather(*(warm(method) for method in methods))
+
+    async def series_overview(
+        self, *, owner: str | None = None, fresh: bool = False
+    ) -> list[dict[str, Any]]:
+        """Every series with how much data actually backs it, not just its name.
+
+        The catalog on its own answers "what may I ask for". It cannot answer the
+        question an agent asks first — "is there anything there" — so the only way
+        to find out a kind is empty used to be reading it and getting nothing back.
+        That is one round trip per kind, and it is the wrong shape entirely once a
+        second data source lands and the list stops being seventeen names long.
+
+        One read per backing method, not one per series — activity alone carries
+        five series out of the same response — then each series is counted with
+        `daily_series`, the function `get_metric` reads it with. `rows` is
+        therefore the days that have a value for THAT series, and `first_date` /
+        `last_date` are its own extent. (Until 2026-10-02 every series of a kind
+        reported the kind's row count and coverage dates: a partner's BMI said 14
+        rows while 2 days had one.) Dates come from the read methods, which parse
+        each payload for its own business date — not from `created_at`, an
+        upload-batch timestamp a backfill makes meaningless (Invariant 38).
+        """
+
+        by_method: dict[str, list[Any]] = {}
+        for spec in SERIES:
+            by_method.setdefault(spec.method, []).append(spec)
+
+        # Concurrently, a few at a time: each read is mostly a wait on the cloud,
+        # and back to back they summed to 170 s cold (see
+        # `sync_decrypted_records`). Results are consumed in catalog order.
+        gate = asyncio.Semaphore(_CONCURRENT_KIND_READS)
+
+        async def read(method: str) -> Any:
+            async with gate:
+                try:
+                    return await getattr(self, method)(limit=None, owner=owner, fresh=fresh)
+                except Exception as error:  # noqa: BLE001 — reported per row below
+                    return error
+
+        results = await asyncio.gather(*(read(method) for method in by_method))
+
+        out: list[dict[str, Any]] = []
+        for (method, specs), result in zip(by_method.items(), results, strict=True):
+            if isinstance(result, Exception):
+                error = result
+                # One unreadable kind must not blank the whole catalog: the agent
+                # still needs the other fourteen names to work with, and "this one
+                # could not be read" is itself the answer for this row.
+                for spec in specs:
+                    out.append(
+                        {
+                            "series": spec.name,
+                            "unit": spec.unit,
+                            "cumulative": spec.cumulative,
+                            "available": False,
+                            "reason": str(error)[:200],
+                            **({"note": spec.direction_note} if spec.direction_note else {}),
+                        }
+                    )
+                continue
+
+            # Counted PER SERIES with the function `get_metric` reads them with.
+            # One count per kind said 14 rows for a partner's BMI and body fat
+            # because 14 body days existed, while 2 had a BMI and none a body fat —
+            # `get_metric` then returned 0-2 points for a series "with 14 rows"
+            # (pre-release review, 2026-10-02).
+            for spec in specs:
+                # A binding that cannot tell its owner apart averages two people
+                # into each day here exactly as `get_metric` would — which refuses
+                # (Invariant 87). The catalog has to refuse too, or its `latest`
+                # is a number true of neither (82.9 kg and 39.5 kg → 61.2; review
+                # R7 on #9).
+                if (refusal := _mixed_owner_refusal(spec, result, owner)) is not None:
+                    out.append({
+                        "series": spec.name, "unit": spec.unit, "cumulative": spec.cumulative,
+                        "available": False, "error": refusal["error"],
+                        "owner_user_id_prefixes": refusal["owner_user_id_prefixes"],
+                        "reason": refusal["message"],
+                    })
+                    continue
+                points, _consumed = daily_series(result, spec)
+                days = sorted(points)
+                out.append(
+                    {
+                        "series": spec.name,
+                        "unit": spec.unit,
+                        "cumulative": spec.cumulative,
+                        "available": bool(days),
+                        "rows": len(days),
+                        "first_date": days[0] if days else None,
+                        "last_date": days[-1] if days else None,
+                        "latest": points[days[-1]] if days else None,
+                        **({"note": spec.direction_note} if spec.direction_note else {}),
+                    }
+                )
+
+        out.sort(key=lambda row: str(row.get("series")))
+        return out
+
     async def metric_trend(
-        self, *, series: str, days: int = 30, owner: str | None = None, fresh: bool = False
+        self, *, series: str, days: int = 30, owner: str | None = None, fresh: bool = False,
+        since: str | None = None, until: str | None = None,
     ) -> dict[str, Any]:
         spec = series_lookup(series)
         if spec is None:
             return self._unknown_series(series)
-        points, consumed, raw = await self._series_points(
-            spec, days=days, owner=owner, fresh=fresh
+        since, until, bad = _parse_day_range(since, until)
+        if bad:
+            return bad
+        points, consumed, raw, partial = await self._analysis_points(
+            spec, days=days, owner=owner, fresh=fresh, since=since, until=until
         )
+        if (refusal := _mixed_owner_refusal(spec, raw, owner)) is not None:
+            return refusal
         result = trend(points, spec)
         result["requested_days"] = days
         result["rows_consumed"] = consumed
+        _attach_series_exclusions(result, points, raw, spec, partial_today=partial)
+        _attach_sources(result, points, raw)
         result["note"] = _SERIES_NOTE
         _attach_series_coverage(result, points, requested=days, source=raw)
+        _apply_range_coverage(result, since, until)
         return result
 
     async def metric_compare_periods(
-        self, *, series: str, days: int = 7, owner: str | None = None, fresh: bool = False
+        self, *, series: str, days: int = 7, owner: str | None = None, fresh: bool = False,
+        period: str | None = None, baseline: str | None = None,
     ) -> dict[str, Any]:
         """Compare the newest `days` days against the `days` immediately before them.
 
@@ -5328,9 +7434,15 @@ class VaultbeatLocalService:
         spec = series_lookup(series)
         if spec is None:
             return self._unknown_series(series)
-        points, consumed, raw = await self._series_points(
+        if period or baseline:
+            return await self._compare_explicit_periods(
+                spec, period=period, baseline=baseline, owner=owner, fresh=fresh
+            )
+        points, consumed, raw, partial = await self._analysis_points(
             spec, days=days * 2, owner=owner, fresh=fresh
         )
+        if (refusal := _mixed_owner_refusal(spec, raw, owner)) is not None:
+            return refusal
         ordered = sorted(points)
         recent_days = ordered[-days:]
         previous_days = ordered[: -days][-days:] if len(ordered) > days else []
@@ -5341,6 +7453,8 @@ class VaultbeatLocalService:
         )
         result["requested_days_per_window"] = days
         result["rows_consumed"] = consumed
+        _attach_series_exclusions(result, points, raw, spec, partial_today=partial)
+        _attach_sources(result, {d: points[d] for d in recent_days + previous_days}, raw)
         result["note"] = _SERIES_NOTE
         # Over BOTH windows, and `requested` is therefore `days * 2`: the block
         # has to describe the set the comparison rests on, and a comparison
@@ -5353,6 +7467,49 @@ class VaultbeatLocalService:
         )
         return result
 
+    async def _compare_explicit_periods(
+        self, spec: Any, *, period: str | None, baseline: str | None,
+        owner: str | None, fresh: bool,
+    ) -> dict[str, Any]:
+        """Two named calendar windows — "this semester vs the summer" — side by side."""
+
+        if not (period and baseline):
+            return {"error": "invalid_periods",
+                    "message": 'Pass BOTH `period` and `baseline` as "YYYY-MM-DD..YYYY-MM-DD".'}
+        p_since, p_until, bad = _parse_period(period, "period")
+        if bad:
+            return bad
+        b_since, b_until, bad = _parse_period(baseline, "baseline")
+        if bad:
+            return bad
+        recent, consumed, raw, partial = await self._analysis_points(
+            spec, days=0, owner=owner, fresh=fresh, since=p_since, until=p_until
+        )
+        if (refusal := _mixed_owner_refusal(spec, raw, owner)) is not None:
+            return refusal
+        earlier = {
+            d: v for d, v in daily_series(raw, spec)[0].items()
+            if (b_since is None or d >= b_since) and (b_until is None or d <= b_until)
+        }
+        result = compare_periods(recent, earlier, spec)
+        result["period"] = {"since": p_since, "until": p_until}
+        result["baseline"] = {"since": b_since, "until": b_until}
+        result["rows_consumed"] = consumed
+        both = {**earlier, **recent}
+        _attach_series_exclusions(result, both, raw, spec, partial_today=partial)
+        _attach_sources(result, both, raw)
+        result["note"] = _SERIES_NOTE
+        _attach_series_coverage(result, both, requested=None, source=raw)
+        # The span both windows cover: an open end on EITHER side keeps it open.
+        # min()/max() over the non-None ends dropped an open `until`, so
+        # "2026-09-01.." vs "July-August" reported a range ending 08-31.
+        span_since = None if None in (p_since, b_since) else min(p_since, b_since)  # type: ignore[type-var]
+        span_until = None if None in (p_until, b_until) else max(p_until, b_until)  # type: ignore[type-var]
+        _apply_range_coverage(result, span_since, span_until)
+        if span_since is None and span_until is None:
+            result["range"] = {"since": None, "until": None}
+        return result
+
     async def metric_correlate(
         self,
         *,
@@ -5361,20 +7518,45 @@ class VaultbeatLocalService:
         days: int = 30,
         owner: str | None = None,
         fresh: bool = False,
+        since: str | None = None,
+        until: str | None = None,
+        lag_days: int = 0,
     ) -> dict[str, Any]:
+        since, until, bad = _parse_day_range(since, until)
+        if bad:
+            return bad
+        if not -30 <= lag_days <= 30:
+            return {"error": "invalid_lag_days", "requested": lag_days,
+                    "message": "`lag_days` must be between -30 and 30."}
         spec_a = series_lookup(series_a)
         if spec_a is None:
             return self._unknown_series(series_a)
         spec_b = series_lookup(series_b)
         if spec_b is None:
             return self._unknown_series(series_b)
-        a_points, a_rows, a_raw = await self._series_points(
-            spec_a, days=days, owner=owner, fresh=fresh
+        a_points, a_rows, a_raw, a_partial = await self._analysis_points(
+            spec_a, days=days, owner=owner, fresh=fresh, since=since, until=until
         )
-        b_points, b_rows, _ = await self._series_points(
-            spec_b, days=days, owner=owner, fresh=fresh
+        b_points, b_rows, b_raw, b_partial = await self._analysis_points(
+            spec_b, days=days + abs(lag_days), owner=owner, fresh=fresh,
+            since=since,
+            until=(date.fromisoformat(until) + timedelta(days=max(lag_days, 0))).isoformat()
+            if until else None,
         )
+        if lag_days:
+            # Pair a on day D with b on day D + lag: "a short night → HRV two
+            # days later" is lag_days=2. Re-keyed onto a's calendar so the
+            # shared-day logic below needs no second path.
+            b_points = {
+                (date.fromisoformat(d) - timedelta(days=lag_days)).isoformat(): v
+                for d, v in b_points.items()
+            }
+        for spec_x, raw_x in ((spec_a, a_raw), (spec_b, b_raw)):
+            if (refusal := _mixed_owner_refusal(spec_x, raw_x, owner)) is not None:
+                return refusal
         result = correlate(a_points, b_points, spec_a, spec_b)
+        if partial := (a_partial or b_partial):
+            result["excluded_days"] = [{"day": partial, "reason": "partial_today"}]
         result["requested_days"] = days
         result["rows_consumed"] = {"a": a_rows, "b": b_rows}
         result["note"] = _SERIES_NOTE
@@ -5383,8 +7565,243 @@ class VaultbeatLocalService:
         # describe the set the numbers come from rather than the set that was
         # fetched. A union here would report 30 days behind an r built on 11.
         shared = {d: a_points[d] for d in sorted(set(a_points) & set(b_points))}
+        if lag_days:
+            result["lag_days"] = lag_days
+            result["lag_note"] = (
+                f"`{series_a}` on each day is paired with `{series_b}` {abs(lag_days)} "
+                f"day(s) {'later' if lag_days > 0 else 'earlier'}."
+            )
+        _attach_sources(result, shared, a_raw)
         _attach_series_coverage(result, shared, requested=days, source=a_raw)
+        _apply_range_coverage(result, since, until)
         return result
+
+    # ── Generic reader: get_metric / get_intraday ──────────────────────────
+    #
+    # One tool for every one-number-per-day quantity instead of one tool per kind
+    # (owner, 2026-09-22: more data sources are coming, and the per-kind shape
+    # costs a tool, a prompt reference and a doc row for every one of them).
+    # It reads through `_series_points` — the same path trend/compare/correlate
+    # use — so a value printed here can never disagree with an analysis of it.
+
+    def person_owner(self, *, partner: bool = False) -> str | None:
+        """Turn "me" / "my partner" into the `owner` filter the readers take.
+
+        Me = the account that paired this machine. Partner = every OTHER owner in
+        the data (see `NOT_OWNER_MARK`). Returns None only when the binding does
+        not know whose account it is (a pre-2026 binding) — the readers then fall
+        back to their unfiltered behaviour, where the mixed-owner guard still
+        refuses or warns rather than blending two people silently.
+        """
+
+        if self._demo:
+            from vaultbeat_mcp_local.demo import DEMO_OWNER_ID
+
+            me: str | None = DEMO_OWNER_ID
+        else:
+            config = self.store.load()
+            me = config.owner_user_id if config else None
+        if not me:
+            return None
+        return f"{NOT_OWNER_MARK}{me}" if partner else me
+
+    async def total_energy_records(
+        self, *, limit: int | None = None, owner: str | None = None, fresh: bool = False
+    ) -> dict[str, Any]:
+        """`total_energy_burned` under the `limit=` signature every series method shares.
+
+        TDEE's own parameter is a real window (`days`), which is what `limit`
+        means for the day-keyed kinds anyway; this only renames it so the series
+        table can treat it like every other method.
+        """
+
+        # `None` means "all of it" for every other reader; here it used to mean
+        # 30 days, so a calendar-window read of TDEE silently lost the rest.
+        return await self.total_energy_burned(days=limit or _ALL_DAYS, owner=owner, fresh=fresh)
+
+    async def metric_values(
+        self,
+        *,
+        series: str | list[str] | None = None,
+        days: int = 30,
+        aggregation: str = "none",
+        granularity: str = "day",
+        owner: str | None = None,
+        fresh: bool = False,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> dict[str, Any]:
+        """Per-day values for one, several or all series, optionally aggregated server-side."""
+
+        since, until, bad = _parse_day_range(since, until)
+        if bad:
+            return bad
+
+        if aggregation not in _AGGREGATIONS:
+            return {
+                "error": "invalid_aggregation",
+                "requested": aggregation,
+                "allowed": list(_AGGREGATIONS),
+            }
+        if granularity not in _GRANULARITIES:
+            return {
+                "error": "invalid_granularity",
+                "requested": granularity,
+                "allowed": list(_GRANULARITIES),
+            }
+        if days < 1:
+            return {"error": "invalid_days", "requested": days, "message": "`days` must be at least 1."}
+
+        if series is None:
+            names = [spec.name for spec in SERIES]
+        elif isinstance(series, str):
+            names = [series]
+        else:
+            names = list(dict.fromkeys(series))
+
+        await self._prefetch_series_kinds(names, owner=owner, fresh=fresh)
+
+        today = _local_calendar_day(datetime.now(timezone.utc)).isoformat()
+        refreshed: set[str] = set()
+        metrics: list[dict[str, Any]] = []
+        unknown = False
+        for name in names:
+            spec = series_lookup(name)
+            if spec is None:
+                unknown = True
+                metrics.append({"series": name, "error": "unknown_series"})
+                continue
+            # Refresh each BACKING METHOD once: activity alone backs five series,
+            # and a fresh read per series would pull the same kind five times.
+            want_fresh = fresh and spec.method not in refreshed
+            refreshed.add(spec.method)
+            try:
+                points, consumed, raw = await self._series_points(
+                    spec, days=days, owner=owner, fresh=want_fresh, since=since, until=until
+                )
+            except Exception as error:  # noqa: BLE001
+                # One unreadable kind must not blank the others the agent asked for.
+                metrics.append(
+                    {"series": name, "error": "read_failed", "reason": str(error)[:300]}
+                )
+                continue
+            refusal = _mixed_owner_refusal(spec, raw, owner)
+            if refusal is not None:
+                metrics.append(refusal)
+                continue
+            entry = _metric_entry(
+                spec,
+                points,
+                raw,
+                consumed=consumed,
+                days=days,
+                aggregation=aggregation,
+                granularity=granularity,
+                today=today,
+            )
+            _apply_range_coverage(entry, since, until)
+            # "Not shared" only when the partner's kind came back with no rows at
+            # all. Rows present but no points means the kind IS shared and this
+            # field was never measured — body composition on a partner who weighs
+            # in on a plain scale (seen on the owner's account 2026-09-23: 14 days
+            # of her weight, zero of body fat). Calling that "not shared" would
+            # send the user to a sharing switch that is already on.
+            if (
+                not points
+                and owner
+                and owner.startswith(NOT_OWNER_MARK)
+                and _rows_returned(raw, spec) == 0
+            ):
+                entry["hint"] = PARTNER_EMPTY_HINT
+            metrics.append(entry)
+
+        # The coverage note is identical on every series and is ~2.5k characters;
+        # repeated per series it was 40k of a 66k reply for "every series, 30
+        # days" (measured on a real account 2026-09-23). Said once, here, and
+        # stripped from each block — the fields stay per series because they
+        # genuinely differ, the explanation of them does not.
+        for entry in metrics:
+            block = entry.get("coverage")
+            if isinstance(block, dict):
+                block.pop("note", None)
+        # Same reasoning for `excluded_days`: several sleep series drop the same
+        # unworn nights, and a four-series read printed one 25-day list four
+        # times (2026-09-24). A day excluded for the same reason from EVERY
+        # series that has a list is said once; each series keeps only its own.
+        common = _hoist_common_exclusions(metrics)
+        # And the source note: it is one paragraph, identical on every sleep
+        # series; `sources` stays per series because the night counts differ.
+        source_note = None
+        for entry in metrics:
+            source_note = entry.pop("source_note", None) or source_note
+        result: dict[str, Any] = {
+            "metrics": metrics,
+            "requested_days": days,
+            "aggregation": aggregation,
+            "granularity": granularity,
+            "note": _METRIC_NOTE,
+            "coverage_note": _COVERAGE_NOTE,
+        }
+        if common:
+            result["excluded_days_all_series"] = common
+        if source_note:
+            result["source_note"] = source_note
+        if since or until:
+            result["range"] = {"since": since, "until": until}
+        if unknown:
+            result["available_series"] = series_catalog()
+        return result
+
+    async def intraday_values(
+        self,
+        *,
+        series: str = "hrv_sdnn",
+        granularity: str = "hourly",
+        limit: int = 168,
+        owner: str | None = None,
+        fresh: bool = False,
+    ) -> dict[str, Any]:
+        """Sub-daily samples for the kinds that record several per day."""
+
+        if series not in _INTRADAY_SERIES:
+            return {
+                "error": "unknown_intraday_series",
+                "requested": series,
+                "available": sorted(_INTRADAY_SERIES),
+                "message": (
+                    "Only the listed series keep sub-daily samples. For one number per "
+                    "day use `get_metric`."
+                ),
+            }
+        if granularity not in ("hourly", "raw"):
+            return {
+                "error": "invalid_granularity",
+                "requested": granularity,
+                "allowed": ["hourly", "raw"],
+            }
+
+        if granularity == "raw":
+            return await self.hrv_records(limit=limit, owner=owner, fresh=fresh)
+
+        # Hourly first, raw as the fallback. `hrv_hourly` only started being
+        # written by iOS build 77 (2026-07-22): an account on an older app has
+        # plenty of raw HRV and zero hourly buckets, and serving the empty hourly
+        # result would report "no HRV" to someone whose HRV is right there. App
+        # and MCP versions drift independently and permanently, so the aggregate
+        # kind degrades to the kind it aggregates instead of pretending absence.
+        hourly = await self.hrv_hourly_records(limit=limit, owner=owner, fresh=fresh)
+        if hourly.get("records"):
+            return hourly
+        raw = await self.hrv_records(limit=limit, owner=owner, fresh=fresh)
+        if not raw.get("records"):
+            return hourly
+        raw["granularity"] = "raw"
+        raw["granularity_note"] = (
+            "Requested hourly averages, but this account has none — hourly HRV "
+            "requires the iOS app from 2026-07-22 or later. Returned raw per-sample "
+            "HRV instead; the numbers are the same measurements, just not hour-averaged."
+        )
+        return raw
 
     async def doctor(self) -> dict[str, Any]:
         """Aggregated self-diagnosis for the install/binding first mile
@@ -5527,16 +7944,26 @@ class VaultbeatLocalService:
             "bound", config.is_bound,
             f"server_id={config.server_id}" if config.is_bound else "not bound to an iOS app",
             hint="Run `vaultbeat-apple-health bind`, then scan the QR with Vaultbeat on iOS "
-            "(Settings → Data & AI → Connect an AI server). Codes expire after 10 minutes — "
+            f"({CONNECT_SERVER}). Codes expire after 10 minutes — "
             "if the phone scanned but this side stayed pending, re-run bind for a fresh code.",
         )
         # Informational only: legacy bindings predate the owner-identity
         # handshake and still decrypt fine — absence must not fail the doctor.
+        #
+        # The second half of the legacy line is conditional on purpose. It used
+        # to be printed only when `capabilities.owner_prefixes` showed two
+        # people, and that list needed every record downloaded (GitHub #9), so
+        # the condition is now stated instead of tested: this binding cannot
+        # tell whether a partner shares data, and if one does, reads cannot
+        # tell the two apart.
         add(
             "owner_identity", True,
             "owner identity received"
             if config.owner_user_id and config.owner_public_key_base64
-            else "owner identity missing (legacy binding — reads unaffected)",
+            else "owner identity missing (legacy binding — decryption is unaffected; "
+            "if a partner shares data with this account, reads cannot tell the two "
+            "of you apart: row reads return both people and daily aggregates refuse. "
+            "Re-pairing this machine from the Vaultbeat app fixes it)",
         )
         # Informational, always ok=True: the pairing-time trial snapshot
         # (vb-016). It never fails the doctor — the LIVE answer is the
@@ -5549,12 +7976,80 @@ class VaultbeatLocalService:
         if access:
             add("access", True, access["note"])
 
+        counts, counts_failure = await self._data_roundtrip_check(config, reachable, add)
+
+        installed, latest, version_note = self._client_version_status()
+        add(
+            "client_version",
+            latest is None or not self._version_is_older(installed, latest),
+            version_note,
+            hint=(
+                f"Run `uvx --refresh vaultbeat-apple-health` (or `pip install -U vaultbeat-apple-health`) "
+                f"to move from {installed} to {latest}. Older clients re-download the "
+                f"entire history on every read instead of only what changed."
+            ),
+        )
+
+        report: dict[str, Any] = {
+            "ok": all(check["ok"] for check in checks),
+            "checks": checks,
+            "scope": self._scope_report(),
+        }
+        if config.is_bound:
+            report["capabilities"] = await self._capability_report(
+                config, counts=counts, failure=counts_failure
+            )
+        return report
+
+    async def _data_roundtrip_check(
+        self,
+        config: LocalServerConfig,
+        reachable: bool,
+        add: Callable[..., None],
+    ) -> tuple[dict[str, int | None] | None, Exception | None]:
+        """The doctor's `data_roundtrip` row, and the per-kind counts it fetched.
+
+        Returns ``(counts, failure)`` for `_capability_report`: the counts when
+        they were had, else the reason they were not, so the report neither asks
+        twice nor makes the same doomed requests again.
+        """
+        counts: dict[str, int | None] | None = None
+        counts_failure: Exception | None = None
         if config.is_bound and reachable:
             try:
-                records, errors = await self._records_for_metric(
-                    METRIC_SLEEP, limit=1, fresh=True
+                # 🔴 The cost of this block was the bug (2026-10-02, GitHub #9).
+                # It used to read sleep with `fresh=True` and the capability
+                # report then decrypted EVERY kind just to count them: 51 MB and
+                # ~100 s on a cold machine, past the 60 s many MCP clients allow
+                # one tool call — on the command every guide names as the first
+                # stop. Counts now come from per-kind digests (~100 bytes each)
+                # and the round trip decrypts a sample of up to
+                # `ROUNDTRIP_SAMPLE` records. A full read of a kind proves no
+                # more about the pipe than three records of it do.
+                counts = await self._kind_counts(config)
+                sample = (
+                    await self._roundtrip_sample(config, counts)
+                    if counts is not None
+                    else None
                 )
-                if errors and not records:
+                if sample is not None:
+                    kind, decrypted, sampled, errors = sample
+                    roundtrip_detail = (
+                        f"decrypted {decrypted} of {sampled} sampled {kind} record(s)"
+                        if sampled
+                        else "the cloud accepted this server's token, but no records "
+                        "are sealed for it yet, so decryption has not been tested"
+                    )
+                else:
+                    # A transport without the catalog trio, or an edge too old
+                    # to serve it: the old full read of one kind, which every
+                    # deployment answers.
+                    sleep_records, errors = await self._records_for_metric(
+                        METRIC_SLEEP, limit=1, fresh=True
+                    )
+                    decrypted = len(sleep_records)
+                    roundtrip_detail = f"decrypted {decrypted} sleep record(s)"
+                if errors and not decrypted:
                     add(
                         "data_roundtrip", False,
                         f"fetch ok but decrypt failed ({errors[0]})",
@@ -5588,8 +8083,9 @@ class VaultbeatLocalService:
                         "/ note log. Anything older than those windows is gone.",
                     )
                 else:
-                    add("data_roundtrip", True, f"decrypted {len(records)} sleep record(s)")
+                    add("data_roundtrip", True, roundtrip_detail)
             except VaultbeatTrialExpiredError as error:
+                counts_failure = error
                 # 🔴 Must precede the generic handler below, which would call
                 # this a dead server token and prescribe a re-bind. That advice
                 # is worse than useless here: re-binding SUCCEEDS, the trial does
@@ -5605,6 +8101,36 @@ class VaultbeatLocalService:
                     "Re-running `bind` will not help.",
                 )
             except Exception as error:  # noqa: BLE001 — diagnostic surface, report everything
+                counts_failure = error
+                if isinstance(error, VaultbeatCloudError) and error.code == "rate_limited":
+                    # mcp-sync limits an address only after repeated rejected
+                    # tokens, so "nothing points at the pairing" would be the
+                    # opposite of true here (review V7 follow-up).
+                    add(
+                        "data_roundtrip", False, f"{type(error).__name__}: {error}",
+                        hint="The cloud is refusing this address for a while, which it "
+                        "does after repeated requests with a token it does not accept. "
+                        "Wait 15 minutes and run the doctor once; if it then says the "
+                        "token is not accepted, re-run `vaultbeat-apple-health bind`.",
+                    )
+                    return counts, counts_failure
+                if not (isinstance(error, VaultbeatCloudError) and error.rejects_credentials):
+                    # 🔴 Review V7 (2026-10-03): since the doctor probes ONE kind
+                    # before the rest (R4), a single 503, 429 or dropped
+                    # connection on that probe landed here and was told "the
+                    # server token is no longer accepted — re-run bind". Before
+                    # R4 it took all 18 kinds failing. Only a rejected
+                    # credential is a re-bind; anything else is said as itself.
+                    add(
+                        "data_roundtrip", False, f"{type(error).__name__}: {error}",
+                        hint="This check did not complete, and nothing in the error "
+                        "points at this machine's pairing: the cloud did not reject its "
+                        "token. A network drop, a timeout or a server error clears on "
+                        "its own — run the doctor again in a minute. Do not re-pair for "
+                        "this; if it keeps failing with the same error, report it at "
+                        "github.com/Fino-wind/vaultbeat-apple-health.",
+                    )
+                    return counts, counts_failure
                 add(
                     "data_roundtrip", False, f"{type(error).__name__}: {error}",
                     # The old wording sent the user to verify the row still
@@ -5621,30 +8147,9 @@ class VaultbeatLocalService:
                     "`vaultbeat-apple-health bind` — this is expected if you bound this machine "
                     "again since, which replaces the old token. The server still being "
                     "listed in the iOS app does not rule this out. If binding does not "
-                    "fix it, check the server is still listed (Settings → Data & AI → "
-                    "Authorized AI Servers).",
+                    f"fix it, check the server is still listed ({AUTHORIZED_SERVERS}).",
                 )
-
-        installed, latest, version_note = self._client_version_status()
-        add(
-            "client_version",
-            latest is None or not self._version_is_older(installed, latest),
-            version_note,
-            hint=(
-                f"Run `uvx --refresh vaultbeat-apple-health` (or `pip install -U vaultbeat-apple-health`) "
-                f"to move from {installed} to {latest}. Older clients re-download the "
-                f"entire history on every read instead of only what changed."
-            ),
-        )
-
-        report: dict[str, Any] = {
-            "ok": all(check["ok"] for check in checks),
-            "checks": checks,
-            "scope": self._scope_report(),
-        }
-        if config.is_bound:
-            report["capabilities"] = await self._capability_report()
-        return report
+        return counts, counts_failure
 
     # ── Client version freshness ─────────────────────────────────────────────
     #
@@ -5737,7 +8242,126 @@ class VaultbeatLocalService:
         "hrv_hourly": "2026-07-22",
     }
 
-    async def _capability_report(self) -> dict[str, Any]:
+    #: Records the doctor's round trip decrypts. More than one so that a single
+    #: damaged record cannot fail the check on its own (it passes when ANY
+    #: decrypts, like the full read it replaced); small so it stays a probe.
+    ROUNDTRIP_SAMPLE = 3
+
+    async def _kind_counts(self, config: LocalServerConfig) -> dict[str, int | None] | None:
+        """Records sealed for this server, per kind, from one digest per kind.
+
+        A digest is ~100 bytes whatever the library size: one probe kind, then
+        the rest `_CONCURRENT_KIND_READS` at a time, where decrypting everything
+        to count it took ~100 s and 51 MB.
+
+        ``None`` per kind = that kind could not be counted (a transient failure,
+        an unparseable digest); the report lists it as unchecked rather than as
+        empty. ``None`` overall = this transport cannot ask for digests, and the
+        caller falls back to counting decrypted records.
+
+        Raises when the probe kind fails, when EVERY kind failed, or on an
+        expired trial: those are account-level answers, and the caller reports
+        them as such.
+        """
+        client = self._client(config)
+        if not callable(getattr(client, "sync_digest", None)):
+            return None
+        token = config.server_token or ""
+        kinds = sorted(KNOWN_METRIC_TYPES)
+
+        async def one(kind: str) -> int | None:
+            try:
+                digest, legacy = await client.sync_digest(token, metric_type=kind)
+            except VaultbeatUnsupportedMetricError:
+                # The deployed edge does not know this kind, so nothing of it
+                # can be stored there: empty, not unknown.
+                return 0
+            if legacy is not None:
+                # An edge older than the catalog sent the kind's rows instead.
+                return len(legacy)
+            count = digest.get("count") if isinstance(digest, dict) else None
+            return count if isinstance(count, int) and count >= 0 else None
+
+        # 🔴 One kind first, alone, and the rest a few at a time. All eighteen used
+        # to go out at once, so a dead token produced eighteen 401s in a second —
+        # and `mcp-sync` locks an IP out for 15 minutes after 20 of them, so the
+        # agent's very next read tripped the lock and the doctor that was meant
+        # to explain the failure had caused a second one (review R4 on #9). A
+        # failed probe is an account- or network-level answer: it is raised
+        # without asking the other seventeen the same question. Once the probe
+        # has answered, the token is good and the lockout cannot be reached, so
+        # the rest go `_CONCURRENT_DIGESTS` at a time — a digest is ~100 bytes,
+        # and at `_CONCURRENT_KIND_READS` (4) the real doctor took 29 s against
+        # 18 s fully concurrent (release gate, 2026-10-03).
+        first = await one(kinds[0])
+        gate = asyncio.Semaphore(_CONCURRENT_DIGESTS)
+
+        async def gated(kind: str) -> int | None:
+            async with gate:
+                return await one(kind)
+
+        rest = await asyncio.gather(*(gated(kind) for kind in kinds[1:]), return_exceptions=True)
+        results: list[int | None | BaseException] = [first, *rest]
+        failures = [r for r in results if isinstance(r, BaseException)]
+        for failure in failures:
+            if isinstance(failure, VaultbeatTrialExpiredError):
+                raise failure
+        if failures and len(failures) == len(results):
+            raise failures[0]
+        return {
+            kind: None if isinstance(result, BaseException) else result
+            for kind, result in zip(kinds, results)
+        }
+
+    async def _roundtrip_sample(
+        self, config: LocalServerConfig, counts: dict[str, int | None]
+    ) -> tuple[str, int, int, list[str]] | None:
+        """Fetch and decrypt up to `ROUNDTRIP_SAMPLE` records of one kind.
+
+        Returns ``(kind, decrypted, sampled, errors)``; ``sampled == 0`` when no
+        kind has records. ``None`` when this transport or deployment cannot
+        fetch by id, so the caller falls back to a full read.
+
+        The kind is the smallest one holding at least a sample's worth, because
+        its catalog is the cheapest to list. Decryption uses the same key for
+        every kind, so which kind proves it does not matter. Nothing is cached
+        and nothing is reported as damaged: this is a probe, and the next real
+        read of the kind does both.
+        """
+        client = self._client(config)
+        if not all(callable(getattr(client, name, None)) for name in ("sync_catalog", "sync_blobs")):
+            return None
+        filled = sorted((count, kind) for kind, count in counts.items() if count)
+        if not filled:
+            return "", 0, 0, []
+        _, kind = next(
+            ((count, kind) for count, kind in filled if count >= self.ROUNDTRIP_SAMPLE),
+            filled[-1],
+        )
+        token = config.server_token or ""
+        catalog = await client.sync_catalog(token, metric_type=kind)
+        if catalog is None:
+            return None
+        blob_ids = [str(row["blob_id"]) for row in catalog if row.get("blob_id")][: self.ROUNDTRIP_SAMPLE]
+        rows = await client.sync_blobs(token, blob_ids=blob_ids, metric_type=kind) if blob_ids else []
+        decrypted = 0
+        errors: list[str] = []
+        for row in rows:
+            try:
+                self._decrypt_row(row, config)
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
+                errors.append(f"{_safe_row_id(row.get('id', '<unknown>'))}: decrypt_failed ({type(error).__name__})")
+            else:
+                decrypted += 1
+        return kind, decrypted, len(rows), errors
+
+    async def _capability_report(
+        self,
+        config: LocalServerConfig | None = None,
+        *,
+        counts: dict[str, int | None] | None = None,
+        failure: Exception | None = None,
+    ) -> dict[str, Any]:
         """Which metric kinds actually have data for this account, and which
         tools are consequently dead weight.
 
@@ -5747,11 +8371,28 @@ class VaultbeatLocalService:
         the same way, because the actionable advice is identical — update the app
         and check the permission — and pretending to distinguish them would be
         guessing.
+
+        `counts` are the doctor's per-kind digests when it already has them;
+        `failure` is why it could not get them, so the same requests are not
+        made twice. Without either, this asks for the digests itself.
         """
         present: list[str] = []
         absent: list[str] = []
         try:
-            records, _ = await self.sync_decrypted_records()
+            if failure is not None:
+                raise failure
+            if counts is None and config is not None and not self._demo:
+                counts = await self._kind_counts(config)
+            if counts is None:
+                # Demo mode, or a transport with no digests: count what decrypts.
+                # Demo records come from this same call, so the demo report is
+                # derived rather than written by hand.
+                records, _ = await self.sync_decrypted_records()
+                tallied: dict[str, int | None] = {}
+                for record in records:
+                    kind = record.metric_type or "sleep"
+                    tallied[kind] = (tallied.get(kind) or 0) + 1
+                counts = tallied
         except VaultbeatTrialExpiredError as error:
             # Distinguished from the generic failure below because it is not one:
             # nothing is broken and nothing is missing. Reporting it as "could not
@@ -5762,16 +8403,15 @@ class VaultbeatLocalService:
         except Exception:  # noqa: BLE001 — diagnostics must not raise
             return {"available": False, "reason": "could not read cloud data"}
 
-        counts: dict[str, int] = {}
-        for record in records:
-            kind = record.metric_type or "sleep"
-            counts[kind] = counts.get(kind, 0) + 1
-
+        unchecked: list[str] = []
         for kind in sorted(KNOWN_METRIC_TYPES):
-            (present if kind in counts else absent).append(kind)
+            if kind in counts and counts[kind] is None:
+                unchecked.append(kind)
+            else:
+                (present if counts.get(kind) else absent).append(kind)
 
         gated = {k: v for k, v in self.KIND_MIN_APP_RELEASE.items() if k in absent}
-        return {
+        report: dict[str, Any] = {
             "available": True,
             "kinds_with_data": present,
             "kinds_without_data": absent,
@@ -5788,42 +8428,21 @@ class VaultbeatLocalService:
             # precise-looking range that is simply false. A real range needs each
             # kind's payload parsed for its own business date; until then a count
             # is the honest signal.
+            #
+            # 🔑 Since 2026-10-02 these are the per-kind digest counts: records
+            # SEALED FOR THIS SERVER, which includes any this server cannot
+            # decrypt (a damaged one is reported by the read that reaches it).
+            # Counting by decrypting was 51 MB on a cold machine (GitHub #9).
             "record_counts": {k: counts[k] for k in present},
-            # ⭐ (2026-09-06) The one place these can be produced for free — this
-            # function already holds every decrypted record, and each carries its
-            # owner id.
-            #
-            # 🔑 Why they need a home at all: `skill.md` tells the agent to pass
-            # `owner` on EVERY read of a paired account, because omitting it
-            # silently pools two people's records into one average with nothing
-            # in the payload saying so. It also said to get the prefixes from
-            # `vaultbeat_status` — which has never returned them. The only way to
-            # discover a prefix was to make exactly the unfiltered call the rule
-            # exists to prevent, and then read an id out of the blended result.
-            #
-            # NOT put on `status`: that is a local-binding report, it makes no
-            # network call and decrypts nothing, and answering THIS question
-            # there would mean parsing a cache file that reaches ~20 MB — on the
-            # most frequently polled tool in the product.
-            #
-            # ⚠️ `status.owner_user_id_prefix` (added 2026-09-07) is NOT that,
-            # and the two must not be merged in either direction. They answer
-            # different questions and have different costs:
-            #   · here, "WHO IS IN THIS DATA" — derived from the records, so it
-            #     sees the partner too, and pays the decrypt this comment is
-            #     about.
-            #   · there, "WHICH ONE AM I" — one field off the config that is
-            #     already loaded, zero I/O, and undefined for anybody else.
-            # A list of two prefixes does not say which of them is the user, so
-            # this field alone cannot satisfy skill.md's rule ("pass `owner` to
-            # select ONE PERSON"): measured on the owner's own account, the two
-            # prefixes are an 82.9 kg body and a 39.5 kg body, and an agent
-            # picking the wrong one answers "you are 39.5 kg" with no error
-            # anywhere. Conversely the config prefix cannot replace this one —
-            # it never mentions the partner, so it cannot warn about blending.
-            "owner_prefixes": sorted(
-                {r.owner_user_id[:8] for r in records if r.owner_user_id}
-            ),
+            # 🗑 `owner_prefixes` lived here (2026-09-06 → 2026-10-02): every owner
+            # present in the data, so an agent could pick one for the `owner`
+            # argument. 0.9.0 removed that argument (reads default to the paired
+            # account, `partner=true` selects the other), and the list cost a
+            # download of every record to build — the bulk of a 100 s cold
+            # doctor. The one job left to it, warning a LEGACY binding that two
+            # people's rows are indistinguishable, is now the `owner_identity`
+            # check's own wording. Whether a partner shares a kind is answered by
+            # reading that kind with `partner=true`.
             "possibly_needs_newer_app": gated,
             # 🔴 Cause (1) is FIRST because it is the one a brand-new user actually
             # hits, and the only one they can act on in seconds. Until 2026-08-11 this
@@ -5838,17 +8457,40 @@ class VaultbeatLocalService:
                 "causes, in the order worth checking: (1) this MCP server was bound "
                 "recently and your history has not finished sealing for it — each "
                 "server gets its own encrypted copy, so a new one starts empty and "
-                "fills in; open the app and tap Settings → Data & AI → 'Re-sync all "
-                "health data to AI', then re-run this check in a few minutes. "
+                f"fills in; open the app and tap {RESYNC}, then re-run this check "
+                "in a few minutes. "
                 "(2) the app is older than the stated date for that kind. (3) Apple "
                 "Health access for the kind was never granted — a read denial is "
                 "invisible to the app, so it looks identical to having no data; "
-                "recover via Settings → Data & AI → 'Apple Health access'. (4) it "
+                f"recover via {HEALTH_ACCESS}. (4) it "
                 "genuinely has not been recorded yet."
             )
             if gated
+            # ⚠️ Until 2026-10-02 everything that was not `gated` read "Every kind
+            # has data" — including an account with no water or no workouts at
+            # all, whose empty kinds are simply not ones an app date explains.
+            else (
+                "Kinds under kinds_without_data have nothing sealed for this server. "
+                "Three possible causes, in the order worth checking: (1) this MCP "
+                "server was bound recently and your history has not finished sealing "
+                f"for it; open the app and tap {RESYNC}, then re-run this check in a "
+                "few minutes. (2) Apple Health access for the kind was never granted "
+                f"— recover via {HEALTH_ACCESS}. (3) it genuinely has not been "
+                "recorded yet."
+            )
+            if absent
             else "Every kind this server knows about has data.",
         }
+        if unchecked:
+            # Not folded into either list: a kind whose count request failed is
+            # neither known to be empty nor known to hold data (Invariant 57
+            # (absence-has-more-than-one-cause)).
+            report["kinds_not_checked"] = unchecked
+            report["not_checked_note"] = (
+                "The cloud did not answer for the kinds under kinds_not_checked this "
+                "time, so they are in neither list. Re-run the check to count them."
+            )
+        return report
 
     def status(self) -> dict[str, Any]:
         # Demo facts ride ON TOP of the real ones; `initialized` and `bound` keep
@@ -5925,7 +8567,7 @@ class VaultbeatLocalService:
                     "Not paired yet — this is the expected state before first use. "
                     "Run: uvx vaultbeat-apple-health@latest bind "
                     "then scan the QR code in the iOS app under "
-                    "Settings → Data & AI → Connect an AI server. "
+                    f"{CONNECT_SERVER}. "
                     "Requires the Vaultbeat iOS app; connecting is open on every plan."
                 ),
             }
@@ -5954,7 +8596,7 @@ class VaultbeatLocalService:
                 }
             ),
             "server_name": config.server_name,
-            "server_id": config.server_id,
+            "server_id": _bound_uuid(config.server_id),
             "api_base_url": config.api_base_url,
             "poll_id": config.poll_id,
             "public_key_base64": config.public_key_base64,
@@ -5987,7 +8629,7 @@ class VaultbeatLocalService:
             # carries the same note). Zero extra I/O: `config` is already loaded
             # on the line above. Absent rather than null when unbound — absence
             # is the claim-free rendering, same as `access`.
-            **({"owner_user_id_prefix": config.owner_user_id[:8]} if config.owner_user_id else {}),
+            **({"owner_user_id_prefix": uid[:8]} if (uid := _bound_uuid(config.owner_user_id)) else {}),
             "owner_device_bound": bool(config.owner_device_id),
             "config_path": str(self.store.path),
         }
@@ -6022,12 +8664,15 @@ class VaultbeatLocalService:
             encrypted_data_key_base64=str(row["encrypted_data_key"]),
             private_key_base64=config.private_key_base64,
         )
-        owner_user_id = blob.get("owner_user_id")
+        # The row's plaintext columns are the server's words, and every one of
+        # them is copied into results and error lines an agent reads: each is
+        # kept only in the shape it claims to have (Anti-pattern 23, review R5).
+        kind = blob.get("metric_type")
         return DecryptedRecord(
-            envelope_id=str(row["id"]),
-            blob_id=str(row["blob_id"]),
-            metric_type=blob.get("metric_type"),
-            created_at=blob.get("created_at"),
+            envelope_id=_safe_row_id(row["id"]),
+            blob_id=_safe_row_id(row["blob_id"]),
+            metric_type=kind if kind in KNOWN_METRIC_TYPES else None,
+            created_at=_safe_shaped(blob.get("created_at"), _INSTANT),
             payload=decode_json_payload(plaintext),
-            owner_user_id=str(owner_user_id) if owner_user_id else None,
+            owner_user_id=_safe_shaped(blob.get("owner_user_id"), _UUID),
         )

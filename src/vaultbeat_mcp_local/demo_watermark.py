@@ -2,7 +2,7 @@
 
 🔀 **There is ONE exit now (2026-09-12, Invariant 81 (health-data-has-one-exit))**:
 
-    MCP tool  →  _demo_wrap  →  FastMCP  →  the agent
+    MCP tool  →  _demo_wrap  →  MCPServer  →  the agent
 
 The CLI half of this module's reason for existing is gone with the fifteen data
 subcommands — `_emit_decrypted` no longer exists, so no health payload leaves
@@ -51,7 +51,7 @@ longer calls `demo_enabled()` at all — it only sets `DEMO_ENV` in `main()`).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TypeGuard
 
 from vaultbeat_mcp_local.demo import DEMO_BANNER
 
@@ -81,9 +81,10 @@ def watermark_demo_result(result: Any) -> Any:
     it has silently downgraded the marker to something you have to go looking
     for.
 
-    A result that already carries `demo_mode` (`vaultbeat_status`,
-    `vaultbeat_doctor`, `_demo_write_refusal`, which build a richer block of
-    their own) is returned untouched rather than double-stamped — those order
+    A result that already carries `demo_mode` (`vaultbeat_doctor` and
+    `_demo_write_refusal`, which build a richer block of their own — the old
+    `vaultbeat_status` tool did too until 0.9.0 folded it into doctor's
+    `binding`) is returned untouched rather than double-stamped — those order
     their own keys the same way.
     """
 
@@ -119,13 +120,49 @@ def mark_demo_rows(result: dict[str, Any]) -> dict[str, Any]:
     (`errors` is a list of strings) are left alone.
     """
 
+    if _is_table(result):
+        # `get_intraday` is itself one table (`columns` / `rows` at the top).
+        result = _mark_table(result)
     marked: dict[str, Any] = {}
     for key, value in result.items():
         if isinstance(value, list) and any(isinstance(row, dict) for row in value):
-            marked[key] = [
-                {**row, "synthetic": True} if isinstance(row, dict) else row
-                for row in value
-            ]
+            marked[key] = [_mark_row(row) if isinstance(row, dict) else row for row in value]
         else:
             marked[key] = value
     return marked
+
+
+def _is_table(value: Any) -> TypeGuard[dict[str, Any]]:
+    return isinstance(value, dict) and isinstance(value.get("columns"), list) and isinstance(value.get("rows"), list)
+
+
+def _mark_table(table: dict[str, Any]) -> dict[str, Any]:
+    """A `{columns, rows}` table (2026-10-02, the tool results that went tabular to
+    fit a client): the mark is a `synthetic` column, so a row lifted out of it
+    still carries the flag, as a dict row would."""
+    if "synthetic" in table["columns"]:
+        return table
+    return {
+        **table,
+        "columns": [*table["columns"], "synthetic"],
+        "rows": [[*row, True] if isinstance(row, list) else row for row in table["rows"]],
+    }
+
+
+#: The one place rows sit a level down: `get_metric` returns a list of series,
+#: and each series holds the per-day `points` (or `buckets`) an agent actually
+#: quotes. Those are health values lifted out one at a time, unlike a sleep
+#: stage array, so they get the mark too. Named keys rather than recursion, for
+#: the same noise reason the docstring above gives.
+_NESTED_ROW_KEYS = ("points", "buckets")
+
+
+def _mark_row(row: dict[str, Any]) -> dict[str, Any]:
+    out = {**row, "synthetic": True}
+    for key in _NESTED_ROW_KEYS:
+        inner = out.get(key)
+        if isinstance(inner, list):
+            out[key] = [{**r, "synthetic": True} if isinstance(r, dict) else r for r in inner]
+        elif _is_table(inner):
+            out[key] = _mark_table(inner)
+    return out

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from vaultbeat_mcp_local import __version__
+from vaultbeat_mcp_local.app_paths import CONNECT_SERVER, RESYNC
 from vaultbeat_mcp_local.demo import DEMO_ENV
 from vaultbeat_mcp_local.service import VaultbeatLocalService
 from vaultbeat_mcp_local.store import DEFAULT_API_BASE_URL, ConfigStore
@@ -256,8 +257,63 @@ def handle_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_capabilities(caps: dict[str, Any]) -> None:
+    # Capability gap: tools that exist here but have nothing to read. Without
+    # this, an empty result is indistinguishable from a broken one — the
+    # question "why does get_total_energy_burned return nothing" has no
+    # answer anywhere else.
+    if caps.get("available"):
+        # 🔴 The field is `possibly_needs_newer_app` and this rendering used
+        # to drop the "possibly": it printed "needs an iOS build from <date>
+        # or later" as a flat assertion. Its own producer's docstring says
+        # the opposite — "deliberately does NOT claim to know the app's
+        # version" — and the note printed one line below ranks the version
+        # SECOND of four causes, behind "this server was bound recently".
+        #
+        # The five gated kinds are strength / food / vo2max / basal_energy /
+        # hrv_hourly: the first two are manual-entry only, vo2max is sparse
+        # by design (Apple computes it during outdoor walk/run/hike), and the
+        # last two need an Apple Watch. So a brand-new user on the CURRENT
+        # build, with no Watch and no lifts logged, was told five times that
+        # their app was out of date — at the exact step `skill.md` sends
+        # every new user to as the verification of the whole setup. They go
+        # to the App Store, find no update, and conclude the pairing failed.
+        gated = caps.get("possibly_needs_newer_app") or {}
+        if gated:
+            print()
+            print("[WARN] Some tools have no data yet on this account:")
+            print("       Most often this server was bound recently and the history")
+            print(f"       is still sealing for it — open the app and tap {RESYNC},")
+            print("       then re-run.")
+            for kind, since in sorted(gated.items()):
+                print(f"       {kind} — one possible cause is an iOS build older than {since}")
+            # The other empty kinds belong in this same block: the `elif`
+            # below never runs once one gated kind is empty, so `water` with
+            # no data was missing from the terminal while the JSON had it
+            # (2026-10-03, the CLI blind spot `0f66fdd` introduced).
+            others = [k for k in caps.get("kinds_without_data") or [] if k not in gated]
+            if others:
+                print(f"       also no data yet: {', '.join(others)}")
+            print(f"       → {caps['note']}")
+        elif caps.get("kinds_without_data"):
+            # Until 2026-10-02 this branch did not exist and an account with,
+            # say, no workouts at all was told "all N data types present".
+            print()
+            print(f"[INFO] No data yet: {', '.join(caps['kinds_without_data'])}")
+            print(f"       → {caps['note']}")
+        else:
+            print(f"[OK]   capabilities: all {len(caps.get('kinds_with_data', []))} data types present")
+
+        unchecked = caps.get("kinds_not_checked") or []
+        if unchecked:
+            print()
+            print(f"[WARN] Not counted this run: {', '.join(unchecked)}")
+            print(f"       → {caps.get('not_checked_note', '')}")
+
+
 def handle_doctor(args: argparse.Namespace) -> int:
-    report = asyncio.run(_service(args).doctor())
+    service = _service(args)
+    report = asyncio.run(service.doctor())
     if getattr(args, "json", False):
         _print_json(report)
     else:
@@ -273,49 +329,7 @@ def handle_doctor(args: argparse.Namespace) -> int:
             if not check["ok"] and check.get("hint"):
                 print(f"       → {check['hint']}")
 
-        # Capability gap: tools that exist here but have nothing to read. Without
-        # this, an empty result is indistinguishable from a broken one — the
-        # question "why does get_total_energy_burned return nothing" has no
-        # answer anywhere else.
-        caps = report.get("capabilities") or {}
-        if caps.get("available"):
-            # 🔴 The field is `possibly_needs_newer_app` and this rendering used
-            # to drop the "possibly": it printed "needs an iOS build from <date>
-            # or later" as a flat assertion. Its own producer's docstring says
-            # the opposite — "deliberately does NOT claim to know the app's
-            # version" — and the note printed one line below ranks the version
-            # SECOND of four causes, behind "this server was bound recently".
-            #
-            # The five gated kinds are strength / food / vo2max / basal_energy /
-            # hrv_hourly: the first two are manual-entry only, vo2max is sparse
-            # by design (Apple computes it during outdoor walk/run/hike), and the
-            # last two need an Apple Watch. So a brand-new user on the CURRENT
-            # build, with no Watch and no lifts logged, was told five times that
-            # their app was out of date — at the exact step `skill.md` sends
-            # every new user to as the verification of the whole setup. They go
-            # to the App Store, find no update, and conclude the pairing failed.
-            gated = caps.get("possibly_needs_newer_app") or {}
-            if gated:
-                print()
-                print("[WARN] Some tools have no data yet on this account:")
-                print("       Most often this server was bound recently and the history")
-                print("       is still sealing for it — open the app, tap Settings →")
-                print("       Data & AI → 'Re-sync all health data to AI', then re-run.")
-                for kind, since in sorted(gated.items()):
-                    print(f"       {kind} — one possible cause is an iOS build older than {since}")
-                print(f"       → {caps['note']}")
-            else:
-                print(f"[OK]   capabilities: all {len(caps.get('kinds_with_data', []))} data types present")
-
-            # Printed unconditionally when the account has more than one owner:
-            # this is the ONLY place a prefix can be discovered, and passing one
-            # is what keeps a "weight trend" from being two people's weights
-            # averaged together with nothing in the payload saying so.
-            owners = caps.get("owner_prefixes") or []
-            if len(owners) > 1:
-                print()
-                print(f"[INFO] This account has {len(owners)} data owners: {', '.join(owners)}")
-                print("       Pass one as `owner` on every read, or results blend both people.")
+        _print_capabilities(report.get("capabilities") or {})
 
         # Rows this run deliberately skipped, each with its reason. In demo mode
         # the checks that ARE run all pass, so without this the CLI ends on "All
@@ -371,10 +385,11 @@ def handle_doctor(args: argparse.Namespace) -> int:
 TRIAL_UNLOCK_LINE = "The AI interface is unlocked until {date}."
 
 UPLOAD_WINDOW_LINE = (
-    "Separately: on Free and during the trial your last 7 days are what reaches the "
-    "cloud, so that is the window your AI can read. Asking for a month returns a week "
-    "— that is the plan boundary, not a sync that has not finished. Pro uploads the "
-    "whole history."
+    "Separately: what your AI can read is what the app uploads, and that is a plan "
+    "boundary, not a sync that has not finished. From app 1.2.9, Pro or a live trial "
+    "(yours or your partner's) uploads your whole history and Free uploads nothing; "
+    "on 1.2.8 and earlier, Free and the trial upload the last 7 days — so asking for "
+    "a month there returns a week."
 )
 
 
@@ -479,7 +494,7 @@ def handle_bind(args: argparse.Namespace) -> int:
         print("What the phone side needs:")
         print("  1. Vaultbeat for iOS: free to install, free to connect.")
         print("     https://apps.apple.com/app/id6759241985")
-        print("  2. In the app: Settings -> Data & AI -> Connect an AI server")
+        print(f"  2. In the app: {CONNECT_SERVER}")
         print("     First time through, the app walks you through setup and the")
         print("     scanner comes last, follow it to the end.")
         print("  3. Scan the QR above from that screen.")
@@ -737,11 +752,11 @@ def build_parser() -> argparse.ArgumentParser:
         #   the QR OUTLIVES the wait by five minutes — raising it up to that
         #   ceiling costs nothing. Saying the flag keeps the QR valid implies
         #   the opposite: that a timeout kills the code you are looking at.
-        # · Pairing is open on EVERY plan. `vaultbeat_poll_binding`'s own
-        #   docstring states it ("Connecting is open on every plan, so there is
-        #   no tier to check"), so this line had the package contradicting
-        #   itself — and the half a new user reads first is the one that puts a
-        #   price in front of the one step that has none.
+        # · Pairing is open on EVERY plan. The `vaultbeat_poll_binding` tool (gone
+        #   in 0.9.0) said so in its docstring ("Connecting is open on every
+        #   plan, so there is no tier to check"), so this line had the package
+        #   contradicting itself — and the half a new user reads first is the
+        #   one that puts a price in front of the one step that has none.
         help=(
             "SECONDS this command waits for the phone scan before giving up. "
             "Pairing is free on every plan; raise this if you still need to "

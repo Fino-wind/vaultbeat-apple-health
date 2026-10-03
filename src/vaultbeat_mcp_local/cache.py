@@ -55,6 +55,35 @@ class LocalRecordCache:
         self.ttl_seconds = (
             _ttl_from_env(DEFAULT_TTL_SECONDS) if ttl_seconds is None else max(ttl_seconds, 0.0)
         )
+        self._sweep_abandoned_temps()
+
+    #: A temp older than this outlived its writer. `write_secret_file` publishes
+    #: with `os.replace` inside the same call, so a live write holds its temp for
+    #: milliseconds; ten minutes only guards against a concurrent writer on a
+    #: very slow disk, never against a real one.
+    _ABANDONED_TEMP_AGE_SECONDS = 600.0
+
+    def _sweep_abandoned_temps(self) -> None:
+        """Delete `records-*.tmp-*` files a killed writer left behind.
+
+        They hold decrypted health plaintext. `write_secret_file` unlinks its
+        temp only on a Python exception, so a SIGKILL, a client restarting the
+        server mid-write or a crash orphans it, and nothing else ever looked at
+        them (audit 2026-09-06 `orphaned-plaintext-cache-tmp-files`; one was
+        sitting on the owner's machine, 346 KB of activity, from 2026-08-26).
+        """
+
+        try:
+            temps = list(self.directory.glob("records-*.tmp-*"))
+        except OSError:
+            return
+        now = time.time()
+        for path in temps:
+            try:
+                if now - path.stat().st_mtime > self._ABANDONED_TEMP_AGE_SECONDS:
+                    path.unlink()
+            except OSError:
+                continue
 
     @property
     def enabled(self) -> bool:
@@ -165,8 +194,19 @@ class LocalRecordCache:
         errors: list[str] | None = None,
         digest: dict[str, Any] | None = None,
         blob_xmins: dict[str, str] | None = None,
+        started_at: float | None = None,
     ) -> None:
         """Persist a FULL (never limit-truncated) result set; best-effort.
+
+        `started_at` is when the fetch that produced these rows BEGAN. The
+        newest-starting fetch of a kind wins, across processes: the file's
+        mtime is set to its fetch's start, and a save whose fetch began before
+        that is dropped (review V5, 2026-10-03). The in-process generation
+        check (R6) could not see a second MCP process sharing this pairing —
+        two Claude Code sessions do exactly that — whose plain read, begun
+        before the other's write, landed after it and hid the write for the
+        whole TTL. Comparing starts, not save times, is what lets the writer's
+        own re-read win over an older fetch that merely finished later.
 
         `errors` carries the fetch's per-envelope decrypt failures so a cache
         hit reports the same problem set the underlying fetch did — without it,
@@ -182,6 +222,16 @@ class LocalRecordCache:
         # which is the trade they asked for.
         if not self.enabled:
             return
+        path = self._path(metric_type)
+        if started_at is not None:
+            try:
+                if path.stat().st_mtime > started_at:
+                    _LOG.debug("Cache save skipped for %s: a newer fetch already wrote it", path.name)
+                    return
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                _LOG.warning("Cache stat failed (%s); saving anyway", type(error).__name__)
         payload = {
             "server_id": server_id,
             "metric_type": metric_type,
@@ -193,18 +243,58 @@ class LocalRecordCache:
         }
         try:
             write_secret_file(
-                self._path(metric_type),
+                path,
                 json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n",
                 harden_parent=True,
             )
+            if started_at is not None:
+                os.utime(path, (started_at, started_at))
         except OSError as error:
             _LOG.warning("Cache write failed (%s); continuing uncached", type(error).__name__)
 
+    def expire(self, metric_type: str | None) -> None:
+        """Make a kind's cache stale without discarding it (review V6).
+
+        Called the moment a write is committed. The TTL path (`load`) then
+        misses and the next read goes to the cloud; the digest path
+        (`load_persisted`) keeps its rows and versions, so that read still
+        fetches only what changed. Before this, a write whose re-read failed
+        left the pre-write snapshot to answer plain reads for the whole TTL.
+        """
+        if not self.enabled:
+            return
+        path = self._path(metric_type)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError) as error:
+            _LOG.warning("Cache expire could not read %s (%s); removing it", path.name, type(error).__name__)
+            try:
+                path.unlink()
+            except OSError:
+                _LOG.warning("Cache expire could not remove %s", path.name)
+            return
+        if not isinstance(raw, dict):
+            return
+        raw["fetched_at"] = 0
+        try:
+            write_secret_file(path, json.dumps(raw, separators=(",", ":"), sort_keys=True) + "\n", harden_parent=True)
+        except OSError as error:
+            _LOG.warning("Cache expire failed (%s)", type(error).__name__)
+
     def clear(self) -> None:
-        """Drop every cached record file (used when (re)binding)."""
+        """Drop every cached record file (used when (re)binding).
+
+        `records-*`, not `records-*.json`: the narrower glob could not see the
+        `.tmp-<pid>-<hex>` files an interrupted write leaves, so re-binding to a
+        NEW account left the previous account's decrypted health data on disk —
+        precisely what the rebind call site clears the cache to prevent. The
+        directory holds nothing else.
+        """
 
         try:
-            entries = list(self.directory.glob("records-*.json"))
+            entries = list(self.directory.glob("records-*"))
         except OSError as error:
             _LOG.warning(
                 "Cache clear could not list %s (%s); stale plaintext may remain",

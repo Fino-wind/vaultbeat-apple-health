@@ -25,6 +25,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from vaultbeat_mcp_local.client import VaultbeatCloudError
+
 # `from test_service import`, NOT `from tests.test_service import`.
 #
 # tests/ has no __init__.py, so it is not a package; pytest makes sibling
@@ -385,3 +389,260 @@ def test_doctor_pypi_probe_names_the_distribution_in_pyproject() -> None:
         distribution = tomllib.load(handle)["project"]["name"]
 
     assert VaultbeatLocalService._PYPI_URL == f"https://pypi.org/pypi/{distribution}/json"
+
+
+# ── doctor on a cold machine: count by digest, decrypt a sample ──────────────
+#
+# GitHub #9 (2026-10-02): the doctor read sleep with `fresh=True` and then
+# decrypted every kind just to count them — 51 MB and ~100 s on a cold machine,
+# past the 60 s many MCP clients allow one call, on the command every guide
+# names as the first stop. These pin the cost (what was fetched), not only the
+# verdict, because the old code produced the right verdict too.
+
+
+def _doctor_ready(tmp_path: Path) -> tuple[Any, CatalogCloudClient, str]:
+    service, cloud, public_key = _catalog_service(tmp_path)
+    service._probe_cloud = lambda url: (True, "cloud answered HTTP 401")
+    return service, cloud, public_key
+
+
+def _library(public_key: str, sizes: dict[str, int], *, foreign: dict[str, int] | None = None) -> list[dict[str, Any]]:
+    """`sizes` records per kind; the first `foreign[kind]` of a kind are sealed
+    to somebody else's key, so they reach this server and fail to decrypt."""
+    import base64
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import x25519
+
+    stranger = base64.b64encode(
+        x25519.X25519PrivateKey.generate().public_key().public_bytes(
+            encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
+        )
+    ).decode()
+    rows = []
+    for kind, size in sizes.items():
+        for index in range(size):
+            key = stranger if index < (foreign or {}).get(kind, 0) else public_key
+            rows.append(
+                _make_envelope(
+                    key,
+                    b'{"v":1}',
+                    metric_type=kind,
+                    envelope_id=f"env-{kind}-{index}",
+                    blob_id=f"blob-{kind}-{index}",
+                )
+            )
+    return rows
+
+
+def _check(report: dict[str, Any], name: str) -> dict[str, Any]:
+    return next(check for check in report["checks"] if check["name"] == name)
+
+
+def test_cold_doctor_fetches_a_sample_and_never_the_library(tmp_path: Path) -> None:
+    from vaultbeat_mcp_local.service import KNOWN_METRIC_TYPES
+
+    service, cloud, public_key = _doctor_ready(tmp_path)
+    cloud.envelopes = _library(public_key, {"sleep": 50, "basal_energy": 80, "water": 5, "profile": 1})
+
+    report = asyncio.run(service.doctor())
+
+    # The whole point: no full read of anything, one digest per kind, and the
+    # only ciphertext fetched is the sample.
+    assert cloud.sync_calls == [], "a full read of a kind is the 51 MB this replaced"
+    assert sorted(cloud.digest_calls) == sorted(KNOWN_METRIC_TYPES), (
+        "one digest per kind, asked once — the capability report must reuse them"
+    )
+    assert sum(len(batch) for batch in cloud.blob_fetches) <= service.ROUNDTRIP_SAMPLE
+    # The smallest kind holding a full sample, not the 1-record profile (one
+    # damaged record would fail it alone) and not a big kind (dear to list).
+    assert cloud.catalog_calls == ["water"]
+
+    roundtrip = _check(report, "data_roundtrip")
+    assert roundtrip["ok"] is True
+    assert roundtrip["detail"] == "decrypted 3 of 3 sampled water record(s)"
+
+    caps = report["capabilities"]
+    assert caps["record_counts"] == {"basal_energy": 80, "profile": 1, "sleep": 50, "water": 5}
+    assert "kinds_not_checked" not in caps
+    assert "owner_prefixes" not in caps, "it needed every record downloaded; 0.9.0 has no `owner`"
+
+
+def test_doctor_round_trip_passes_while_any_sampled_record_decrypts(tmp_path: Path) -> None:
+    """One damaged record must not read as a broken install — the full read
+    this replaced failed only when NOTHING decrypted, and so must the sample."""
+    service, cloud, public_key = _doctor_ready(tmp_path)
+    cloud.envelopes = _library(public_key, {"water": 3}, foreign={"water": 2})
+
+    roundtrip = _check(asyncio.run(service.doctor()), "data_roundtrip")
+
+    assert roundtrip["ok"] is True
+    assert roundtrip["detail"] == "decrypted 1 of 3 sampled water record(s)"
+
+
+def test_doctor_round_trip_fails_with_the_rebind_hint_when_nothing_decrypts(tmp_path: Path) -> None:
+    service, cloud, public_key = _doctor_ready(tmp_path)
+    cloud.envelopes = _library(public_key, {"water": 4}, foreign={"water": 4})
+
+    roundtrip = _check(asyncio.run(service.doctor()), "data_roundtrip")
+
+    assert roundtrip["ok"] is False
+    assert "decrypt failed" in roundtrip["detail"]
+    assert roundtrip["hint"].index("bind") < roundtrip["hint"].index("Deleting")
+
+
+def test_doctor_with_nothing_sealed_says_decryption_was_not_tested(tmp_path: Path) -> None:
+    """A brand-new binding holds nothing yet. Passing is fair — the cloud took
+    the token — but the detail must not claim a decryption that never ran."""
+    service, cloud, _public_key = _doctor_ready(tmp_path)
+
+    report = asyncio.run(service.doctor())
+    roundtrip = _check(report, "data_roundtrip")
+
+    assert roundtrip["ok"] is True
+    assert "has not been tested" in roundtrip["detail"]
+    assert cloud.blob_fetches == [] and cloud.catalog_calls == []
+    caps = report["capabilities"]
+    assert caps["kinds_with_data"] == []
+    assert "Every kind" not in caps["note"]
+
+
+def test_doctor_lists_a_kind_it_could_not_count_in_neither_list(tmp_path: Path) -> None:
+    """Invariant 57 (absence-has-more-than-one-cause): a failed count is not an
+    empty kind. Reporting it as empty would send the reader to re-sync or to
+    Health permissions for a kind that may be full."""
+    from vaultbeat_mcp_local.client import VaultbeatCloudError
+
+    service, cloud, public_key = _doctor_ready(tmp_path)
+    cloud.envelopes = _library(public_key, {"sleep": 5, "water": 5})
+    real_digest = cloud.sync_digest
+
+    async def flaky(server_token: str, *, metric_type: str | None = None) -> Any:
+        if metric_type == "water":
+            raise VaultbeatCloudError("Cloud request failed: HTTP 502")
+        return await real_digest(server_token, metric_type=metric_type)
+
+    cloud.sync_digest = flaky  # type: ignore[method-assign]
+
+    caps = asyncio.run(service.doctor())["capabilities"]
+
+    assert caps["kinds_not_checked"] == ["water"]
+    assert "water" not in caps["kinds_with_data"]
+    assert "water" not in caps["kinds_without_data"]
+    assert caps["kinds_with_data"] == ["sleep"]
+
+
+def test_doctor_reports_an_expired_trial_once_and_does_not_ask_again(tmp_path: Path) -> None:
+    from vaultbeat_mcp_local.client import VaultbeatTrialExpiredError
+    from vaultbeat_mcp_local.service import KNOWN_METRIC_TYPES
+
+    service, cloud, _public_key = _doctor_ready(tmp_path)
+    calls: list[str | None] = []
+
+    async def refused(server_token: str, *, metric_type: str | None = None) -> Any:
+        calls.append(metric_type)
+        raise VaultbeatTrialExpiredError("2026-09-01T00:00:00Z")
+
+    cloud.sync_digest = refused  # type: ignore[method-assign]
+
+    report = asyncio.run(service.doctor())
+
+    roundtrip = _check(report, "data_roundtrip")
+    assert roundtrip["ok"] is False
+    assert "Re-running `bind` will not help" in roundtrip["hint"]
+    assert report["capabilities"]["available"] is False
+    assert report["capabilities"]["reason"] == roundtrip["detail"]
+    # One probe, then nothing: an account-level refusal is not asked seventeen
+    # more times, and the capability report does not retry what just failed.
+    assert len(calls) == 1 and calls[0] in KNOWN_METRIC_TYPES
+
+
+def test_doctor_with_a_dead_token_asks_once_not_eighteen_times(tmp_path: Path) -> None:
+    """Review R4 (2026-10-03): eighteen concurrent 401s from one doctor run.
+
+    `mcp-sync` locks an IP out for 15 minutes after 20 unauthorised requests,
+    so a doctor fanning out every kind at once with a dead token put the agent's
+    next read over the line. One probe goes first; the rest only if it worked,
+    and never more than `_CONCURRENT_DIGESTS` at a time.
+    """
+    from vaultbeat_mcp_local.client import VaultbeatCloudError
+    from vaultbeat_mcp_local.service import _CONCURRENT_DIGESTS, KNOWN_METRIC_TYPES
+
+    service, cloud, public_key = _doctor_ready(tmp_path)
+    calls: list[str | None] = []
+
+    async def unauthorised(server_token: str, *, metric_type: str | None = None) -> Any:
+        calls.append(metric_type)
+        raise VaultbeatCloudError("Cloud request failed: HTTP 401")
+
+    cloud.sync_digest = unauthorised  # type: ignore[method-assign]
+    report = asyncio.run(service.doctor())
+    assert _check(report, "data_roundtrip")["ok"] is False
+    assert len(calls) == 1
+
+    # Healthy token: every kind is asked, a few at a time.
+    service, cloud, public_key = _doctor_ready(tmp_path / "ok")
+    cloud.envelopes = _library(public_key, {"sleep": 5})
+    real_digest = cloud.sync_digest
+    in_flight = 0
+    peak = 0
+
+    async def counted(server_token: str, *, metric_type: str | None = None) -> Any:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            await asyncio.sleep(0.001)
+            return await real_digest(server_token, metric_type=metric_type)
+        finally:
+            in_flight -= 1
+
+    cloud.sync_digest = counted  # type: ignore[method-assign]
+    caps = asyncio.run(service.doctor())["capabilities"]
+    assert caps["kinds_with_data"] == ["sleep"]
+    assert len(caps["kinds_with_data"]) + len(caps["kinds_without_data"]) == len(KNOWN_METRIC_TYPES)
+    assert 1 < peak <= _CONCURRENT_DIGESTS
+
+
+@pytest.mark.parametrize(
+    ("error", "says_rebind"),
+    [
+        (lambda: VaultbeatCloudError("Cloud request failed: HTTP 503", status_code=503), False),
+        (lambda: VaultbeatCloudError(
+            "Cloud request failed: HTTP 401 error=invalid_token", status_code=401, code="invalid_token"), True),
+        (lambda: ConnectionError("connection reset"), False),
+        # A gateway 401 with no `error` code (an Edge Function redeployed with
+        # verify_jwt reset) is not this machine's token: no re-bind.
+        (lambda: VaultbeatCloudError("Cloud request failed: HTTP 401", status_code=401), False),
+    ],
+)
+def test_doctor_prescribes_a_rebind_only_for_a_rejected_token(
+    tmp_path: Path, error: Any, says_rebind: bool,
+) -> None:
+    """Review V7 (2026-10-03): with one probe going first (R4), a single 503 or
+    dropped connection was told "the server token is no longer accepted —
+    re-run bind". Only a rejected credential is a re-bind."""
+    service, cloud, _public_key = _doctor_ready(tmp_path)
+
+    async def failing(server_token: str, *, metric_type: str | None = None) -> Any:
+        raise error()
+
+    cloud.sync_digest = failing  # type: ignore[method-assign]
+    roundtrip = _check(asyncio.run(service.doctor()), "data_roundtrip")
+    assert roundtrip["ok"] is False
+    assert ("no longer accepted" in roundtrip["hint"]) is says_rebind
+    assert ("Do not re-pair" in roundtrip["hint"]) is (not says_rebind)
+
+
+def test_doctor_does_not_call_a_rate_limit_unrelated_to_the_pairing(tmp_path: Path) -> None:
+    """Review V7 follow-up: mcp-sync limits an address only after repeated
+    rejected tokens, so its 429 must not be told "nothing points at the pairing"."""
+    service, cloud, _public_key = _doctor_ready(tmp_path)
+
+    async def limited(server_token: str, *, metric_type: str | None = None) -> Any:
+        raise VaultbeatCloudError("Cloud request failed: HTTP 429 error=rate_limited", status_code=429, code="rate_limited")
+
+    cloud.sync_digest = limited  # type: ignore[method-assign]
+    roundtrip = _check(asyncio.run(service.doctor()), "data_roundtrip")
+    assert "Wait 15 minutes" in roundtrip["hint"]
+    assert "nothing in the error points at this machine's pairing" not in roundtrip["hint"]
