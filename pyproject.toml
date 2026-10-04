@@ -29,7 +29,7 @@ name = "vaultbeat-apple-health"
 # A comment cannot enforce this. `scripts/ci/check_mcp_registry_current.py`
 # now does, with one rule per failure above; if that guard is ever deleted,
 # this paragraph is what comes back.
-version = "0.9.1"
+version = "0.9.2"
 description = "Apple Health MCP server for Claude Code, Claude Desktop and any MCP agent — your end-to-end-encrypted HealthKit data (sleep, HRV, cycle, weight, workouts), decrypted only on your machine"
 readme = "README.md"
 keywords = ["apple health", "mcp", "mcp server", "healthkit", "apple health mcp", "claude", "claude code", "model context protocol", "health data", "e2ee"]
@@ -45,7 +45,12 @@ dependencies = [
   # cryptography: the old ceiling was <47.0.0, which excluded 48.0.1 — the fix for
   # the vulnerable OpenSSL shipped inside the wheels. The range could not resolve to
   # a clean version at all, so raising the floor REQUIRED raising the ceiling too.
-  "cryptography>=48.0.1,<50.0.0",
+  # Same shape again on 2026-10-04 (#76): <50.0.0 shut out 50.0.0, the fix for
+  # GHSA-g6cj-pr64-35w5 (PKCS#7 EnvelopedData Bleichenbacher oracle — not a path we
+  # use, but the scanner badge is what a buyer reads). A ceiling one major ahead
+  # blocks every fix that lands in the next major; check osv.dev for the locked
+  # version before each release.
+  "cryptography>=50.0.0,<52.0.0",
   "httpx>=0.28.0,<1.0.0",
   "keyring>=24",
   # mcp: 1.27.2 fixes "HTTP transports serve session requests without validation"

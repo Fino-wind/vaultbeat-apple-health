@@ -6,15 +6,26 @@
     "url": "https://github.com/Fino-wind/vaultbeat-apple-health",
     "source": "github"
   },
-  "version": "0.9.1",
+  "version": "0.9.2",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "vaultbeat-apple-health",
-      "version": "0.9.1",
+      "version": "0.9.2",
       "transport": {
         "type": "stdio"
-      }
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "serve"
+        },
+        {
+          "type": "named",
+          "name": "--transport",
+          "value": "stdio"
+        }
+      ]
     }
   ]
 }

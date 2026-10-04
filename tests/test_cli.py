@@ -37,6 +37,61 @@ def test_serve_defaults_to_stdio_transport(monkeypatch: Any, tmp_path: Path) -> 
     assert captured["stateless_http"] is True
 
 
+class _FakeStdin:
+    def __init__(self, tty: bool) -> None:
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+def test_bare_command_from_an_mcp_client_serves_stdio(
+    monkeypatch: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#75: directories built from the Registry launch `uvx vaultbeat-apple-health`
+    with no subcommand. A client launches us with stdin on a pipe, so that must
+    start the stdio server — with global options intact and nothing on stdout,
+    which is the protocol stream."""
+    captured: dict[str, Any] = {}
+
+    def fake_run_mcp_server(store: ConfigStore, **kwargs: Any) -> None:
+        captured["store"] = store
+        captured.update(kwargs)
+
+    import vaultbeat_mcp_local.mcp_server as mcp_server_module
+
+    monkeypatch.setattr(mcp_server_module, "run_mcp_server", fake_run_mcp_server)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=False))
+
+    exit_code = cli.main(["--config", str(tmp_path / "config.json")])
+
+    out = capsys.readouterr()
+    assert exit_code == 0
+    assert captured["transport"] == "stdio"
+    assert captured["store"].path == tmp_path / "config.json"
+    assert out.out == ""
+    assert "starting the MCP server over stdio" in out.err
+
+
+def test_bare_command_at_a_terminal_prints_help_instead_of_hanging(
+    monkeypatch: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import vaultbeat_mcp_local.mcp_server as mcp_server_module
+
+    def must_not_serve(*_: Any, **__: Any) -> None:
+        raise AssertionError("a person at a terminal must not get a silent stdio server")
+
+    monkeypatch.setattr(mcp_server_module, "run_mcp_server", must_not_serve)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(tty=True))
+
+    exit_code = cli.main([])
+
+    out = capsys.readouterr().out
+    assert exit_code == 2
+    assert "usage: vaultbeat-apple-health" in out
+    assert "vaultbeat-apple-health bind" in out
+
+
 def test_serve_http_transport_options_are_forwarded(monkeypatch: Any, tmp_path: Path) -> None:
     captured: dict[str, Any] = {}
 
