@@ -708,7 +708,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command", required=False)  # main() handles bare (#75)
 
     init_parser = subparsers.add_parser("init", help="Generate a local keypair and config file.")
     init_parser.add_argument("--server-name", default="Local AI Server")
@@ -845,9 +845,43 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _stdin_is_terminal() -> bool:
+    stdin = sys.stdin
+    if stdin is None:
+        return False
+    try:
+        return stdin.isatty()
+    except (ValueError, OSError):  # closed or detached stream
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw = sys.argv[1:] if argv is None else list(argv)
+    args = parser.parse_args(raw)
+
+    # A bare `uvx vaultbeat-apple-health` is what every directory that builds its
+    # config from the MCP Registry hands out, because the Registry entry carried
+    # no package arguments (#75). Until 0.9.2 that exited with a usage error on
+    # the user's machine — the first step of the main acquisition path failing
+    # where no telemetry could see it. An MCP client launches us with stdin on a
+    # pipe, so a non-terminal stdin means "be the server". A person at a terminal
+    # gets the help instead: a stdio server would sit there looking hung.
+    # The notice goes to stderr — stdout is the MCP protocol stream.
+    if args.command is None:
+        if _stdin_is_terminal():
+            parser.print_help()
+            print(
+                "\nPair this computer with the iPhone app:  vaultbeat-apple-health bind\n"
+                "Your AI client runs the server with:      vaultbeat-apple-health serve --transport stdio"
+            )
+            return 2
+        print(
+            "vaultbeat-apple-health: no command given and stdin is not a terminal; "
+            "starting the MCP server over stdio (same as `serve --transport stdio`).",
+            file=sys.stderr,
+        )
+        args = parser.parse_args([*raw, "serve"])
 
     # Set here, once, rather than inside `_service()` / `_store()`: `serve` never
     # goes through either — it hands a ConfigStore to `run_mcp_server`, which asks
