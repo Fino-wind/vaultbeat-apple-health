@@ -42,7 +42,7 @@ _SERIES_CATALOG_NOTE = (
     "wake, stage minutes and shares, awakenings, sleep vitals); the night-by-night "
     "picture — naps, recording source, unworn or stage-less nights — is "
     "`get_sleep_nights`. Kinds that are not here at all (workouts, strength sets, "
-    "food, notes, symptoms, menstrual cycle) are richer than one number and are read "
+    "food, notes, symptoms, states of mind, menstrual cycle) are richer than one number and are read "
     "with their own `get_*` tool — their absence from this list is a design choice, "
     "not missing data."
 )
@@ -231,6 +231,65 @@ def _access_wrap(function: _F, service: VaultbeatLocalService) -> _F:
     return cast(_F, sync_wrapper)
 
 
+def _surfaced(error: Exception) -> Exception:
+    """The exception the SDK should see for `error`: our own failures as a ToolError.
+
+    🔴 The MCP SDK hands an agent the message of a `ToolError` and NOTHING of any
+    other exception — `tools/base.py` turns it into "Error executing tool <name>"
+    and drops the text (verified through `mcp.client.Client` on 2.2.0, GitHub #88).
+    So every sentence this package writes for a person — the trial-expired
+    paywall path, "this kind needs a newer app", a write the cloud refused — was
+    reaching agents as one bare line, at exactly the moments the person needed
+    the reason. Our own exceptions carry LOCALLY written text (Anti-pattern 23:
+    never the server's prose), so passing them through is safe; anything else
+    (a bug, a library failure) stays as it is and keeps the SDK's opaque line.
+    """
+
+    from vaultbeat_mcp_local.client import VaultbeatCloudError
+    from vaultbeat_mcp_local.crypto import VaultbeatCryptoError
+    from vaultbeat_mcp_local.service import VaultbeatArgumentRefusedError
+
+    # The third type is an argument refusal whose sentence names what to call
+    # instead (GitHub #92: a mood is no longer a note) — mute, it is no refusal.
+    if not isinstance(error, (VaultbeatCloudError, VaultbeatCryptoError, VaultbeatArgumentRefusedError)):
+        return error
+    # Function-local for the reason `run_mcp_server` imports the SDK lazily: a
+    # missing SDK must produce a sentence, not a traceback at import time.
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    return ToolError(str(error) or type(error).__name__)
+
+
+def _surface_wrap(function: _F) -> _F:
+    """Wrap one tool so our own exceptions reach the agent with their message (#88)."""
+
+    if inspect.iscoroutinefunction(function):
+
+        @functools.wraps(function)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await function(*args, **kwargs)
+            except Exception as error:
+                surfaced = _surfaced(error)
+                if surfaced is error:
+                    raise
+                raise surfaced from error
+
+        return cast(_F, async_wrapper)
+
+    @functools.wraps(function)
+    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return function(*args, **kwargs)
+        except Exception as error:
+            surfaced = _surfaced(error)
+            if surfaced is error:
+                raise
+            raise surfaced from error
+
+    return cast(_F, sync_wrapper)
+
+
 #: `get_sleep_nights` columns: (output name, row field). Order is the order an
 #: analyst reads a night in — when, how long, how it was built, how it held.
 _SLEEP_NIGHT_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -409,9 +468,9 @@ def _partner_note(result: dict[str, Any], partner: bool) -> dict[str, Any]:
 def _owner_unknown_note(
     result: dict[str, Any], service: VaultbeatLocalService, partner: bool
 ) -> dict[str, Any]:
-    """Say so when a notes/symptoms read could not be split into "you" and "partner".
+    """Say so when a notes/symptoms/state-of-mind read could not be split into "you" and "partner".
 
-    Both readers select a person by comparing against the account that paired
+    These readers select a person by comparing against the account that paired
     this machine (Invariant 88 (partner-is-not-me)). A pre-2026 binding never
     recorded that account, so the comparison has nothing to compare with and
     both readers fall back to returning EVERYONE's rows — identically for
@@ -686,6 +745,13 @@ def _compact_tool_results() -> None:
 #: ~20k tokens, leaving the client's framing room.
 MAX_RESULT_BYTES = 60_000
 
+#: `get_state_of_mind`'s default page: the newest 100 records, ~46 KB measured —
+#: about three months of daily moods, NOT a year (a year was ~163 KB; the cap
+#: holds ~130 records). Older moods are reached by `since` / `until`, never by
+#: a larger `limit` (GitHub #82). Pinned by
+#: `test_the_default_mood_page_fits_the_result_cap_for_a_daily_logger`.
+STATE_OF_MIND_DEFAULT_LIMIT = 100
+
 #: What to narrow, per tool, in a `result_too_large` answer.
 _NARROW_HINTS: dict[str, str] = {
     "get_food_log": "a smaller `limit` (days, newest first), or a narrower `since`/`until` window",
@@ -700,6 +766,7 @@ _NARROW_HINTS: dict[str, str] = {
     "get_strength_log": "a smaller `limit` or `limit_days`",
     "get_notes": "a smaller `limit`, or a `target_kind`",
     "get_symptoms": "a smaller `limit`",
+    "get_state_of_mind": "a narrower `since`/`until` window (a month or a quarter at a time), or a smaller `limit`",
     "get_menstrual_cycle": "a smaller `limit`",
 }
 
@@ -867,6 +934,9 @@ def run_mcp_server(
                 # keeps the lesson; git has the mechanism).
                 prepared = _demo_wrap(prepared)
             prepared = _bound_wrap(prepared)
+            # Outermost, so a failure in any layer above still reaches the agent
+            # with its reason rather than the SDK's bare line (#88).
+            prepared = _surface_wrap(prepared)
             return cast(_F, mcp.tool(title=title, annotations=annotations)(prepared))
 
         return decorator
@@ -962,13 +1032,86 @@ def run_mcp_server(
         server can decrypt days OLDER than `first_day` that your `limit` left behind —
         re-read with a larger `limit`, or quote `coverage.oldest_available` as the real
         start of their history. Never report a `limit`-shaped window as the extent of
-        their data.
+        their data. `limit` cuts each list on its own: that many imported days AND that
+        many reported entries, so a day with three reports can come back with one.
         """
 
         return _owner_unknown_note(
             _partner_note(
                 await service.symptom_summary(
                     limit=limit, fresh=fresh, owner=service.person_owner(partner=partner)
+                ),
+                partner,
+            ),
+            service,
+            partner,
+        )
+
+    @tool(title="State of mind (moods)", annotations=_read_only_tool())
+    async def get_state_of_mind(
+        limit: int | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        partner: bool = False,
+        fresh: bool = False,
+    ) -> dict[str, Any]:
+        """Decrypt recent states of mind (how the person felt) locally — both sources.
+
+        SENSITIVE. Apple Health's "State of Mind": each record is one feeling with
+        `valence` (-1 very unpleasant … 0 neutral … +1 very pleasant),
+        `valence_classification` (Apple's seven regions, veryUnpleasant …
+        veryPleasant — use these words rather than inventing a grade), `labels`
+        (Apple's feeling words: drained, stressed, calm, grateful…),
+        `associations` (the life area: work, family, partner, health…), `kind`
+        (`momentaryEmotion` = how they felt at that moment, `dailyMood` = how the
+        day went overall), `local_date` / `local_time`.
+        `source` says where it came from:
+        · "apple_health" — logged by the person on their Watch, in the Health app
+          or in another app, and imported by their iPhone (`app` names it);
+        · "ai" — recorded by an AI through `log_state_of_mind` (`entry_id`,
+          `note`). Remove a mistaken one with `delete_state_of_mind`.
+        Each owner also carries `daily` (per day: `count`, `mean_valence`,
+        `lowest_valence`, `highest_valence`, `daily_mood_valence`) and counts per
+        region, label and life area. Describe what was logged; a day with one
+        record says far less than a day with ten — quote `count` beside any
+        average, and never read a day with no record as a neutral day.
+
+        By default the newest 100 records (about three months of daily moods).
+        `since` / `until` ("YYYY-MM-DD", local days, both inclusive) read a
+        calendar window instead — "how was I in March", or anything older than
+        the default page — and then `limit` applies only if you pass it. A
+        record with its tallies is roughly 450 bytes, so about 130 fit in one
+        result; a longer window comes back as `result_too_large` — read it a
+        month or a quarter at a time.
+
+        Returns YOUR records by default; `partner=true` returns your partner's —
+        only if they turned on sharing their moods with your AI in their own
+        Vaultbeat app (off by default). Stays on-device, never re-exported.
+
+        Carries a `coverage` block: quote `coverage.days_covered` (distinct days, not
+        the row count) and `coverage.span_days` beside any average or trend.
+        `coverage.window_satisfied: false` alone does NOT mean a short history: it is
+        also false when older days exist beyond your window. 🔴 Before saying how far
+        back someone's data goes, read `coverage.more_available`: `true` means this
+        server can decrypt records OLDER than `first_day` that your read left behind —
+        read them with a `since` / `until` window ending before `first_day` (a much
+        larger `limit` does not fit in one result), or quote
+        `coverage.oldest_available` as the real start of their history. Never report a
+        `limit`-shaped window as the extent of their data.
+        """
+
+        # An empty string is "no bound", the same as omitting it — see get_food_log.
+        since, until = since or None, until or None
+        if limit is None and since is None and until is None:
+            limit = STATE_OF_MIND_DEFAULT_LIMIT
+        return _owner_unknown_note(
+            _partner_note(
+                await service.state_of_mind_summary(
+                    limit=limit,
+                    fresh=fresh,
+                    owner=service.person_owner(partner=partner),
+                    since=since,
+                    until=until,
                 ),
                 partner,
             ),
@@ -989,8 +1132,12 @@ def run_mcp_server(
         `target_kind`, and `target_date` (the local day it annotates) — join
         against the same-day metric data for pattern analysis. Kinds:
         "sleep" | "menstrual" are written manually in the iOS app by either
-        partner (e.g. "昨晚舍友很吵" on a sleep day); "mood" | "general" are
-        agent-authored via `log_note`. Pass target_kind to filter.
+        partner (e.g. "昨晚舍友很吵" on a sleep day), and "day" is what the
+        person wrote about the day itself in the app's notes list (app 1.3.0+);
+        "general" is
+        agent-authored via `log_note`; "mood" notes are ones an AI wrote before
+        moods moved to `get_state_of_mind` — read them here, write no new ones.
+        Pass target_kind to filter.
         Stays on-device, never re-exported.
 
         Returns notes about YOU by default. `partner=true` returns notes about your
@@ -1284,10 +1431,15 @@ def run_mcp_server(
     ) -> dict[str, Any]:
         """Log a free-text note on the owner's behalf (agent write).
 
-        For narratives that belong next to the metric data instead of in chat
-        history: `kind="mood"` for emotional state ("为什么今天情绪低落"),
-        `kind="general"` for day events worth joining against sleep/HRV later.
-        (sleep/menstrual notes stay iOS-authored — this tool refuses them.)
+        For day events that belong next to the metric data instead of in chat
+        history, worth joining against sleep/HRV later (`kind="general"`, the
+        default and the only kind this tool writes).
+        A feeling does NOT go here, nor the story behind it: call
+        `log_state_of_mind`, which keeps it as Apple Health's fields and has its
+        own `note` for the why. This tool refuses `kind="mood"` — one feeling
+        recorded twice, once structured and once as free text, is what that kind
+        produced. (sleep, menstrual and day notes are written in the iOS app —
+        refused too.)
 
         ⚠️ THIS TOOL DELETES. There is one note per (kind, day), and your `text`
         becomes its ENTIRE contents — anything already written for that kind+day
@@ -1306,18 +1458,19 @@ def run_mcp_server(
         Symptoms do NOT go here: use `log_symptom`, one call per symptom. A
         note is free text nothing can be matched against; a symptom entry keeps
         its type, severity and timing so it can later be lined up with sleep,
-        food and heart rate. A note is for what surrounds it (mood, events, how
-        a day went).
+        food and heart rate. A note is for what surrounds it (events, how a day
+        went).
 
         `date` = LOCAL calendar day "YYYY-MM-DD" (default today). Read back via
-        `get_notes` (optionally `target_kind="mood"`/`"general"`). Encrypted
-        end-to-end before it ever leaves this machine.
+        `get_notes` (optionally `target_kind="general"`). Encrypted end-to-end
+        before it ever leaves this machine.
 
         `partner=true` records a note ABOUT your partner ("she had a stomach ache
-        this morning"). It is stored in YOUR account and sealed to you and this
-        machine only — your partner's account is never touched, and it never
-        mixes into your own notes: plain reads leave it out, `get_notes(partner=true)`
-        returns it. Default `false` = a note about you.
+        this morning"). It is stored in YOUR account and sealed for you and your own
+        AI machines only (the Vaultbeat app passes it on to your other paired
+        machines) — never for your partner or their AI. Your partner's account is
+        never touched, and it never mixes into your own notes: plain reads leave it
+        out, `get_notes(partner=true)` returns it. Default `false` = a note about you.
         """
 
         return await service.log_note(
@@ -1345,20 +1498,22 @@ def run_mcp_server(
         ENTIRE contents and whatever is there now to be deleted (e.g. correcting
         something you yourself wrote a minute ago).
 
-        `kind="general"` for day events worth joining against sleep/HRV later,
-        `kind="mood"` for emotional state. (sleep/menstrual notes stay iOS-authored
-        — this tool refuses them.) `date` = LOCAL calendar day "YYYY-MM-DD"
-        (default today). Read back via `get_notes`.
+        `kind="general"` (the default and the only kind it writes) for day events
+        worth joining against sleep/HRV later. A feeling and the story behind it
+        go to `log_state_of_mind` and its `note`; this tool refuses `kind="mood"`,
+        and sleep, menstrual and day notes are written in the iOS app. `date` = LOCAL calendar day
+        "YYYY-MM-DD" (default today). Read back via `get_notes`.
 
         The result is the same shape `log_note` returns. `replaced_text` is always
         `null` here — that null is the receipt that this call deleted nothing.
         Encrypted end-to-end before it ever leaves this machine.
 
         `partner=true` records a note ABOUT your partner ("she had a stomach ache
-        this morning"). It is stored in YOUR account and sealed to you and this
-        machine only — your partner's account is never touched, and it never
-        mixes into your own notes: plain reads leave it out, `get_notes(partner=true)`
-        returns it. Default `false` = a note about you.
+        this morning"). It is stored in YOUR account and sealed for you and your own
+        AI machines only (the Vaultbeat app passes it on to your other paired
+        machines) — never for your partner or their AI. Your partner's account is
+        never touched, and it never mixes into your own notes: plain reads leave it
+        out, `get_notes(partner=true)` returns it. Default `false` = a note about you.
         """
 
         return await service.log_note(
@@ -1480,13 +1635,105 @@ def run_mcp_server(
         person, a symptom they did not have. A symptom that simply ended is NOT
         deleted: record its end with `update_symptom(entry_id, end_at=…)`.
 
-        The entry's content is overwritten in the cloud, so it disappears from
-        `get_symptoms` and from the app. The result carries `deleted_entry` — the
+        It disappears from `get_symptoms` at once, and from the app and every
+        other reader once the person's iPhone next syncs (it then overwrites the
+        entry's own copy in the cloud, and from app 1.3.0 removes the copies
+        earlier `update_symptom` calls left; an older app leaves those sealed
+        there, readable only by the person and the server that wrote them). The
+        result carries `deleted_entry` — the
         full entry as it was — so a mistaken delete can be logged again with
         `log_symptom`. Symptoms imported from Apple Health cannot be deleted here.
         """
 
         return await service.delete_symptom(entry_id=entry_id)
+
+    @tool(title="Log state of mind", annotations=_mutating_tool(destructive=False))
+    async def log_state_of_mind(
+        valence: float,
+        labels: list[str] | None = None,
+        associations: list[str] | None = None,
+        kind: str = "momentaryEmotion",
+        logged_at: str | None = None,
+        date: str | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Record how the person says they feel, as Apple Health's State of Mind (agent write).
+
+        This is where "今天工作好累，被掏空了" / "刚散步回来，心情特别平静" /
+        "I'm so anxious about tomorrow" goes when they tell you how they feel —
+        people rarely open an app to log a feeling, but they say it to you. One
+        call per feeling. This tool only ever adds; `delete_state_of_mind`
+        removes a mistaken one.
+
+        `valence`: -1 (very unpleasant) … 0 (neutral) … +1 (very pleasant), YOUR
+        reading of how pleasant it felt FROM THEIR WORDS. Apple splits the range
+        into seven equal regions: about -0.85 very unpleasant, -0.55 unpleasant,
+        -0.3 slightly unpleasant, 0 neutral, +0.3 slightly pleasant, +0.55
+        pleasant, +0.85 very pleasant. Stay inside what they said; do not
+        dramatise "有点烦" into very unpleasant.
+
+        `labels`: Apple's feeling words that THEIR words support, usually one to
+        three — amazed, amused, angry, annoyed, anxious, ashamed, brave, calm,
+        confident, content, disappointed, discouraged, disgusted, drained,
+        embarrassed, excited, frustrated, grateful, guilty, happy, hopeful,
+        hopeless, indifferent, irritated, jealous, joyful, lonely, overwhelmed,
+        passionate, peaceful, proud, relieved, sad, satisfied, scared, stressed,
+        surprised, worried. Leave it empty rather than guess when they only said
+        "心情还行".
+        `associations`: what it is about, only if they said — community,
+        current_events, dating, education, family, fitness, friends, health,
+        hobbies, identity, money, partner, self_care, spirituality, tasks,
+        travel, weather, work.
+        `kind`: "momentaryEmotion" (default — how they feel right now or at one
+        moment) or "dailyMood" (how the whole day has been).
+        `logged_at`: the moment, ISO 8601 with their UTC offset, e.g.
+        "2026-10-04T14:20+08:00"; omit it for right now. A `dailyMood` about a past
+        day may give just that day as `date` ("2026-10-03") — do not invent an hour.
+        `note`: a short summary in their words, only if useful later. It stays in
+        Vaultbeat; Apple Health has no place for text.
+
+        The person's iPhone writes it into Apple Health (Mental Wellbeing → State
+        of Mind) only if they turned on "Allow AI to update Apple Health" in the
+        app — it is off by default; either way it shows in Vaultbeat's mood
+        calendar (app 1.3.0 and later; an older app keeps it without showing it). Returns `entry_id` (for `delete_state_of_mind`) and the entry as
+        read back. Read everything with `get_state_of_mind`. Encrypted end to end
+        before it leaves here, for the owner and this machine; the owner's iPhone
+        then re-seals it for their other paired machines and — only if they turned
+        on sharing moods with their partner's AI — for that AI too, `note`
+        included, so write nothing in `note` they would not want that reader to see.
+        """
+
+        return await service.log_state_of_mind(
+            valence=valence,
+            labels=labels,
+            associations=associations,
+            kind=kind,
+            logged_at=logged_at,
+            date=date,
+            note=note,
+        )
+
+    @tool(
+        title="Delete state of mind (erases the entry)",
+        annotations=_mutating_tool(destructive=True),
+    )
+    async def delete_state_of_mind(entry_id: str) -> dict[str, Any]:
+        """Erase one state of mind an AI recorded by mistake (agent write).
+
+        Only for an entry that should never have existed — a duplicate, the wrong
+        reading of what they said, the wrong person. To record that a feeling
+        changed, log a new one; feelings change and both are true.
+
+        It disappears from `get_state_of_mind` at once. The person's iPhone, on
+        its next sync, drops it from the app, overwrites its content in the cloud
+        for every reader it was shared with, and removes the sample it wrote into
+        Apple Health, if it wrote one. The result carries
+        `deleted_entry` — the full entry as it was — so a mistaken delete can be
+        logged again. Records with `source: "apple_health"` cannot be deleted
+        here; they are edited in Apple Health.
+        """
+
+        return await service.delete_state_of_mind(entry_id=entry_id)
 
     # Found by the generalised rule in `test_destructive_titles_name_their_
     # consequence`, not by anyone auditing this line: its own docstring says
@@ -1502,19 +1749,18 @@ def run_mcp_server(
         (dayID = "body-{dayStart.epoch}") — re-logging the same day overwrites.
         Encrypted end-to-end before it ever leaves this machine.
 
-        Written data always lands in Vaultbeat cloud + MCP (visible to
-        `get_metric` series "weight_kg"). Whether it also reaches Apple Health depends on an
-        iOS setting, OFF by default: the MCP tab → "Allow AI to update Apple
-        Health" (app 1.2.8 and earlier: Settings → Data & AI). When it is on,
-        weigh-ins logged here sync back into Apple Health on the next app sync.
+        A weight's home is Apple Health: the phone carries this one there on its
+        next sync, through the iOS setting "Allow AI to update Apple Health" (MCP
+        tab; OFF by default). It is also readable here at once (`get_metric`
+        series "weight_kg").
 
-        ⚠️ If the owner wants this number in the Apple Health app, tell them to
-        turn that toggle ON — do NOT tell them to re-enter it by hand in the
-        Vaultbeat weight card. Logging it in both places produces two entries
-        for the same day from different sources and corrupts the trend line.
-        (Before 2026-07-28 this docstring said propagation was impossible and
-        instructed exactly that manual double-entry; the toggle shipped
-        2026-07-22.)
+        ⚠️ When no iPhone of this account has that setting on (with Weight access
+        granted), the write is REFUSED and nothing is saved — from app 1.3.0 a
+        weight may not live only in the cloud. The error says what to turn on;
+        pass it on and do not retry until the person has done it. Never tell them
+        to re-enter the number by hand in the Vaultbeat weight card instead:
+        logging it in both places makes two entries for one day from different
+        sources and corrupts the trend line.
         """
 
         return await service.log_weight_entry(weight_kg=weight_kg, date=date)

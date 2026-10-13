@@ -393,12 +393,27 @@ UPLOAD_WINDOW_LINE = (
 )
 
 
-def handle_bind(args: argparse.Namespace) -> int:
-    service = _service(args)
+def _start_binding(service: VaultbeatLocalService, args: argparse.Namespace) -> Any:
+    """Opens the pairing session, then — with `--setup-code` — tells the phone that
+    handed out the code that the computer side is running (GitHub #106).
+
+    The report goes BEFORE the QR code is drawn, so the phone's onboarding can say
+    "scan now" while the code is on screen. Silent and bounded (3 s): nothing it
+    does can stop the bind.
+    """
+
     session = service.start_binding(
         server_name=args.server_name,
         api_base_url=args.api_base_url,
     )
+    if args.setup_code:
+        asyncio.run(service.report_bind_started(args.setup_code))
+    return session
+
+
+def handle_bind(args: argparse.Namespace) -> int:
+    service = _service(args)
+    session = _start_binding(service, args)
     # 🔴 Say this BEFORE the QR, and say it to the agent rather than to the human.
     #
     # An agent relaying this command CANNOT know whether the person can see the
@@ -493,7 +508,7 @@ def handle_bind(args: argparse.Namespace) -> int:
         # not enough to decide.
         print("What the phone side needs:")
         print("  1. Vaultbeat for iOS: free to install, free to connect.")
-        print("     https://apps.apple.com/app/id6759241985")
+        print("     https://apps.apple.com/app/id6759241985?pt=94022652&ct=ai_agent_cli&mt=8")
         print(f"  2. In the app: {CONNECT_SERVER}")
         print("     First time through, the app walks you through setup and the")
         print("     scanner comes last, follow it to the end.")
@@ -683,38 +698,22 @@ def handle_serve(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    # `--help` is where a stuck user checks what this thing is called. Reporting
-    # the deprecated alias there sent them toward a name that `uvx` — the only
-    # install path the docs give — cannot resolve.
-    parser = argparse.ArgumentParser(prog="vaultbeat-apple-health")
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    parser.add_argument("--config", help="Path to config JSON. Defaults to ~/.tether/mcp-local/config.json.")
-    # 🔴 A FLAG AND AN ENV VAR, NEVER A CONFIG FIELD. Both die with the process.
-    # A persisted `"demo": true` would survive a reboot while being invisible in
-    # every screen anyone looks at — and weeks later "how did I sleep last week?"
-    # would get a confident, plausible, entirely fabricated answer about a real
-    # person's health. That failure has no loud edge; it just quietly stops being
-    # true. The cost of this choice is that demo mode must be re-stated on every
-    # invocation, which is the point.
-    parser.add_argument(
-        "--demo",
-        action="store_true",
+def _add_setup_code_argument(bind_parser: Any) -> None:
+    """`--setup-code` (GitHub #106): the code the phone's onboarding minted and put
+    in the command it handed this computer. See `_start_binding`."""
+
+    bind_parser.add_argument(
+        "--setup-code",
+        default=None,
         help=(
-            "Serve SYNTHETIC health records instead of reading a real account. No "
-            "binding, no network, no decryption; write commands refuse. For trying "
-            "the tools out or reproducing a bug without handing over a key. Applies "
-            "to this invocation only — equivalent to setting VAULTBEAT_DEMO=1."
+            "The code the Vaultbeat iOS app shows during setup (VB-XXXXXXXX). "
+            "With it, the app sees this computer start and tells you when to scan. "
+            "Optional: binding works the same without it."
         ),
     )
 
-    subparsers = parser.add_subparsers(dest="command", required=False)  # main() handles bare (#75)
 
-    init_parser = subparsers.add_parser("init", help="Generate a local keypair and config file.")
-    init_parser.add_argument("--server-name", default="Local AI Server")
-    init_parser.add_argument("--api-base-url", default=DEFAULT_API_BASE_URL)
-    init_parser.set_defaults(func=handle_init)
-
+def _add_bind_parser(subparsers: Any) -> None:
     bind_parser = subparsers.add_parser("bind", help="Show a QR payload and wait for iOS authorization.")
     # Every option carries help text because `bind` is the first command a new user
     # runs, and until 2026-08-11 `bind --help` printed the flag names and nothing
@@ -785,7 +784,43 @@ def build_parser() -> argparse.ArgumentParser:
             "or paste it manually."
         ),
     )
+    _add_setup_code_argument(bind_parser)
     bind_parser.set_defaults(func=handle_bind)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    # `--help` is where a stuck user checks what this thing is called. Reporting
+    # the deprecated alias there sent them toward a name that `uvx` — the only
+    # install path the docs give — cannot resolve.
+    parser = argparse.ArgumentParser(prog="vaultbeat-apple-health")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--config", help="Path to config JSON. Defaults to ~/.tether/mcp-local/config.json.")
+    # 🔴 A FLAG AND AN ENV VAR, NEVER A CONFIG FIELD. Both die with the process.
+    # A persisted `"demo": true` would survive a reboot while being invisible in
+    # every screen anyone looks at — and weeks later "how did I sleep last week?"
+    # would get a confident, plausible, entirely fabricated answer about a real
+    # person's health. That failure has no loud edge; it just quietly stops being
+    # true. The cost of this choice is that demo mode must be re-stated on every
+    # invocation, which is the point.
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help=(
+            "Serve SYNTHETIC health records instead of reading a real account. No "
+            "binding, no network, no decryption; write commands refuse. For trying "
+            "the tools out or reproducing a bug without handing over a key. Applies "
+            "to this invocation only — equivalent to setting VAULTBEAT_DEMO=1."
+        ),
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=False)  # main() handles bare (#75)
+
+    init_parser = subparsers.add_parser("init", help="Generate a local keypair and config file.")
+    init_parser.add_argument("--server-name", default="Local AI Server")
+    init_parser.add_argument("--api-base-url", default=DEFAULT_API_BASE_URL)
+    init_parser.set_defaults(func=handle_init)
+
+    _add_bind_parser(subparsers)
 
     poll_parser = subparsers.add_parser("poll", help="Poll once for a pending iOS authorization.")
     poll_parser.set_defaults(func=handle_poll)

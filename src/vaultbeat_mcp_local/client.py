@@ -112,7 +112,9 @@ class VaultbeatRecordNotAgentWritableError(VaultbeatCloudError):
     #: as itself — server text in the agent's context (review R5, 2026-10-03).
     _WHO = {
         "partner_user": "your partner",
-        "mcp_server": "another AI server (likely your partner's)",
+        # Not "likely your partner's": the app re-seals records for EVERY server
+        # the owner has, so the commoner case is their own second machine (#79).
+        "mcp_server": "another AI server — one of yours, or your partner's",
     }
 
     def __init__(self, uncoverable_kinds: list[str] | None = None) -> None:
@@ -124,8 +126,42 @@ class VaultbeatRecordNotAgentWritableError(VaultbeatCloudError):
             f"re-encrypt for{audience}, so it cannot be rewritten from here — "
             "doing so would leave them unable to read it. "
             "Edit this day in the Vaultbeat iOS app instead; the app can seal "
-            "for every recipient. Days that only you can see (strength, food, "
-            "notes) are unaffected."
+            "for every recipient."
+        )
+
+
+class VaultbeatWeightNeedsAppleHealthError(VaultbeatCloudError):
+    """No iPhone of this account will carry an AI's weight into Apple Health.
+
+    A weight has one home, Apple Health (owner, 2026-10-03). `mcp-write-body`
+    therefore refuses a weight unless some phone of the account has reported that
+    "Allow AI to update Apple Health" is on and body-mass access is granted
+    (GitHub #46, 2026-10-06) — accepted, it would have lived only in the cloud,
+    invisible in the app and lost for good when the cloud copy is cleared.
+
+    Nothing was written. The sentence is built HERE from a bare error code
+    (Anti-pattern 23); it names the switch and the permission, because those are
+    the two things the person can change, and it tells the agent not to retry —
+    a retry gets the same answer until a phone reports otherwise.
+
+    Three states produce it, and the sentence has to fix each: the switch off; the
+    switch on but writing Weight never asked (Settings → Health data access asks —
+    the Health app lists no Weight row to turn on until iOS has asked, owner's
+    phone with State of Mind, 2026-10-07); Weight asked and declined (only the
+    Health app can turn it back on).
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Nothing was saved. A weight in Vaultbeat lives in Apple Health, and none of "
+            "this account's iPhones is set up to put one your AI records there. Ask the "
+            "person to open the Vaultbeat app: in the MCP tab, turn on \"Allow AI to "
+            "update Apple Health\"; if it is already on, open Settings → Health data "
+            "access and allow Weight when iOS asks. If they declined Weight before, it "
+            "is turned on in the Health app → profile picture → Privacy → Apps → "
+            "Vaultbeat. Then log the weight again — retrying before that gets the same answer.",
+            status_code=409,
+            code="weight_needs_apple_health",
         )
 
 
@@ -178,10 +214,11 @@ class PollBindingResult:
 #: context is a prompt-injection channel, so error codes, ids and timestamps are
 #: let through only when they look like what they claim to be.
 _REQUEST_ID = re.compile(r"[A-Za-z0-9-]{1,64}")
-#: A metric kind's shape: one or two short words (`sleep`, `hrv_hourly`). Kept on
-#: the exception only; the message an agent reads names the kind the CALLER
-#: asked for (`_sync_decrypted_records`), never this echo.
-_METRIC_KIND = re.compile(r"[a-z][a-z0-9]{1,15}(?:_[a-z0-9]{1,15})?")
+#: A metric kind's shape: one to three short words (`sleep`, `hrv_hourly`,
+#: `state_of_mind` — the first with three, 2026-10-04; at one-or-two its echo read
+#: as "<unknown>"). Kept on the exception only; the message an agent reads names
+#: the kind the CALLER asked for (`_sync_decrypted_records`), never this echo.
+_METRIC_KIND = re.compile(r"[a-z][a-z0-9]{1,15}(?:_[a-z0-9]{1,15}){0,2}")
 
 #: Every error code the Vaultbeat edge functions send (`error: "…"` across
 #: supabase/functions). A code reaches the agent's text only if it is one of
@@ -197,7 +234,8 @@ KNOWN_ERROR_CODES = frozenset({
     "device_lookup_failed", "device_not_owned_by_caller", "due_query_failed",
     "empty_blob_ids", "envelope_query_failed", "envelope_recipient_not_allowed",
     "envelope_recipients_not_coverable", "envelopes_required",
-    "fields_and_blob_ids_are_exclusive", "forbidden", "internal_error",
+    "fields_and_blob_ids_are_exclusive", "forbidden",
+    "health_writeback_lookup_failed", "internal_error",
     "invalid_blob", "invalid_blob_id", "invalid_body", "invalid_envelope_key",
     "invalid_envelopes", "invalid_fields", "invalid_invite_code", "invalid_items",
     "invalid_json", "invalid_metric_type", "invalid_request", "invalid_token",
@@ -205,7 +243,7 @@ KNOWN_ERROR_CODES = frozenset({
     "not_active", "not_found", "owner_mismatch", "rate_limited",
     "relationship_conflict", "rpc_failed", "signature_invalid",
     "too_many_blob_ids", "too_many_items", "trial_expired", "unauthorized",
-    "unsupported_metric_type", "upsert_failed", "write_conflict",
+    "unsupported_metric_type", "upsert_failed", "weight_needs_apple_health", "write_conflict",
     "xmin_unavailable", "xmin_unparseable",
 })
 _ISO_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}(T[0-9:.]{5,15}(Z|[+-]\d{2}:?\d{2})?)?")
@@ -729,6 +767,24 @@ class VaultbeatCloudClient:
         )
         return self._decode_response(response)
 
+    async def write_state_of_mind_blob(
+        self,
+        server_token: str,
+        *,
+        blob: dict[str, Any],
+        envelopes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Agent-write path for state-of-mind entries (GitHub #13).
+        Same shape as symptom; the edge fn narrows to metric_type="state_of_mind"."""
+
+        response = await self._request(
+            "POST",
+            "/mcp-write-state-of-mind",
+            headers={"Authorization": f"Bearer {server_token}"},
+            json={"blob": blob, "envelopes": envelopes},
+        )
+        return self._decode_response(response)
+
     async def report_decrypt_failures(
         self,
         server_token: str,
@@ -764,6 +820,31 @@ class VaultbeatCloudClient:
             json={"items": items},
         )
 
+    async def report_bind_started(
+        self, setup_code: str, *, os_name: str | None, client_version: str | None
+    ) -> None:
+        """Tells the phone that minted `setup_code` that `bind` has started here
+        (GitHub #106) — `mcp-bind-started`, anonymous, like the poll.
+
+        The phone's onboarding polls its own code and moves on to "your computer is
+        ready, scan now" when this lands; the row it stamps is also the only record
+        of how far a stalled user's computer got. The answer carries nothing (the
+        endpoint says the same whether the code matched or not), so it is not
+        decoded. The caller bounds the time and swallows every failure: a report
+        must never hold up or break the bind it describes.
+        """
+
+        await self._request(
+            "POST",
+            "/mcp-bind-started",
+            # A field left out is stored as null (`clean` in the function's request.ts).
+            json={
+                "setup_code": setup_code,
+                **({"os": os_name} if os_name else {}),
+                **({"client_version": client_version} if client_version else {}),
+            },
+        )
+
     @staticmethod
     def _decode_response(response: "httpx.Response") -> dict[str, Any]:
         try:
@@ -796,9 +877,12 @@ class VaultbeatCloudClient:
                     [str(k) for k in kinds] if isinstance(kinds, list) else None
                 )
 
-            # Checked before the generic branches: an ended trial is the one
-            # 4xx here that is not a malfunction, and the generic wording
-            # ("Cloud request failed") would send the user to debug a network.
+            # Checked before the generic branches: an ended trial and a weight no
+            # phone will carry into Apple Health are the 4xx here that are not
+            # malfunctions, and the generic wording ("Cloud request failed")
+            # would send the user to debug a network.
+            if error_code == "weight_needs_apple_health":
+                raise VaultbeatWeightNeedsAppleHealthError()
             if error_code == "trial_expired":
                 ended = payload.get("trial_ended_at") if isinstance(payload, dict) else None
                 raise VaultbeatTrialExpiredError(server_token(ended, _ISO_TIMESTAMP))

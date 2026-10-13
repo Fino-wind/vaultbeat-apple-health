@@ -102,6 +102,8 @@ _ARGS: dict[str, dict[str, Any]] = {
     "log_symptom": {"symptom_type": "headache"},
     "update_symptom": {"entry_id": "symptom-00000000000000000000000000000000", "severity": "mild"},
     "delete_symptom": {"entry_id": "symptom-00000000000000000000000000000000"},
+    "log_state_of_mind": {"valence": -0.4, "labels": ["drained"]},
+    "delete_state_of_mind": {"entry_id": "state_of_mind-00000000000000000000000000000000"},
     # READ tools with a required argument. The analysis trio takes a `series`
     # on purpose (no sensible default quantity to trend, and a default would let
     # a typo silently return a different metric), so every sweep below has to
@@ -118,7 +120,7 @@ _ARGS: dict[str, dict[str, Any]] = {
 #: Tools that write to the cloud on a real install, mapped to the service method
 #: whose demo guard actually refuses them. In demo mode every one must refuse.
 #:
-#: TEN tools, SEVEN methods — `log_*_append` is the same method called with
+#: TWELVE tools, NINE methods — `log_*_append` is the same method called with
 #: `merge=True`, published as a separate tool because an ARGUMENT cannot be
 #: annotated non-destructive. They share the refusal, so asserting only the four
 #: methods would leave three published tools unproven at the layer a client sees.
@@ -139,6 +141,8 @@ _WRITE_TOOLS: dict[str, str] = {
     "log_symptom": "log_symptom",
     "update_symptom": "update_symptom",
     "delete_symptom": "delete_symptom",
+    "log_state_of_mind": "log_state_of_mind",
+    "delete_state_of_mind": "delete_state_of_mind",
 }
 
 #: The synthetic-data sentence travels under ONE key everywhere: `demo_warning`.

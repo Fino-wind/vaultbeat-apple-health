@@ -133,3 +133,25 @@ def test_known_error_codes_cover_the_edge() -> None:
     }
     assert sent, "found no error codes — the pattern no longer matches the functions"
     assert sent <= KNOWN_ERROR_CODES, sorted(sent - KNOWN_ERROR_CODES)
+
+
+def test_a_refused_weight_names_the_switch_and_says_nothing_was_saved() -> None:
+    """GitHub #46: `mcp-write-body` answers 409 `weight_needs_apple_health` when no
+    phone of the account will carry the weight into Apple Health. The sentence is
+    built here from the code alone, and it must give the person something to do."""
+    import httpx
+    import pytest
+
+    from vaultbeat_mcp_local.client import VaultbeatWeightNeedsAppleHealthError
+
+    with pytest.raises(VaultbeatWeightNeedsAppleHealthError) as caught:
+        VaultbeatCloudClient._decode_response(
+            httpx.Response(409, json={"error": "weight_needs_apple_health", "request_id": "r"})
+        )
+    message = str(caught.value)
+    assert "Nothing was saved" in message
+    assert "Allow AI to update Apple Health" in message
+    # The switch already on but Weight never asked: the Health app has no row to
+    # turn on yet, so the sentence must also name where the app asks (2026-10-07).
+    assert "Settings → Health data access" in message
+    assert caught.value.code == "weight_needs_apple_health" and caught.value.status_code == 409

@@ -29,7 +29,7 @@ name = "vaultbeat-apple-health"
 # A comment cannot enforce this. `scripts/ci/check_mcp_registry_current.py`
 # now does, with one rule per failure above; if that guard is ever deleted,
 # this paragraph is what comes back.
-version = "0.9.2"
+version = "0.9.3"
 description = "Apple Health MCP server for Claude Code, Claude Desktop and any MCP agent — your end-to-end-encrypted HealthKit data (sleep, HRV, cycle, weight, workouts), decrypted only on your machine"
 readme = "README.md"
 keywords = ["apple health", "mcp", "mcp server", "healthkit", "apple health mcp", "claude", "claude code", "model context protocol", "health data", "e2ee"]
@@ -80,8 +80,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=8.3.0,<9.0.0",
-  "ruff>=0.11.0,<1.0.0",
+  # <10: pytest 8.4.2 carries GHSA-6w46-j5rx-g56g, fixed in 9 (lock upgrade for 0.9.3, #78).
+  "pytest>=8.3.0,<10.0.0",
+  # <0.16: 0.16 turned on rules that flag 132 style sites; adopt them as their own change.
+  "ruff>=0.11.0,<0.16.0",
   "mypy>=1.13.0,<2.0.0",
   # The streamable-HTTP transport tests reach uvicorn through `mcp`'s server
   # stack. It was never declared: this checkout's venv happened to carry it, so

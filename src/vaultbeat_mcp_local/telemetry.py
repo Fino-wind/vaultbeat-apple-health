@@ -63,14 +63,23 @@ _ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,48}$")
 _QUEUE_MAX = 500
 
 
-def telemetry_disabled_reason(*, demo: bool) -> str | None:
-    """Why telemetry is off, or None when it is on."""
+def telemetry_opt_out_reason() -> str | None:
+    """The person's own opt-out, or None. Also honoured by `bind --setup-code`'s
+    report, which sends no machine facts when it is set."""
 
     if os.environ.get(OPT_OUT_ENV, "").strip().lower() in _FALSY:
         return f"{OPT_OUT_ENV} is off"
     dnt = os.environ.get("DO_NOT_TRACK", "").strip().lower()
     if dnt and dnt not in _FALSY:
         return "DO_NOT_TRACK is set"
+    return None
+
+
+def telemetry_disabled_reason(*, demo: bool) -> str | None:
+    """Why telemetry is off, or None when it is on."""
+
+    if (reason := telemetry_opt_out_reason()) is not None:
+        return reason
     if demo:
         return "demo mode"
     if "pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST"):
@@ -292,6 +301,13 @@ def _outcome(result: Any) -> dict[str, Any]:
         if isinstance(code, str) and _ERROR_CODE.match(code):
             out["ok"] = False
             out["error_code"] = code
+        # A write that landed but could not be confirmed (GitHub #84): still
+        # `ok` — the agent is told not to retry — yet a failure the person may
+        # meet, so it is counted. A bool only; `read_back` also carries what was
+        # written, which never leaves this machine.
+        read_back = structured.get("read_back")
+        if isinstance(read_back, dict) and read_back.get("ok") is False:
+            out["read_back_failed"] = True
     return out
 
 

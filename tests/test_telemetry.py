@@ -46,6 +46,10 @@ def _server(sender: _Capture, monkeypatch: pytest.MonkeyPatch, account: str | No
     def boom(note: str) -> dict[str, Any]:
         raise ValueError(SECRET)
 
+    @server.tool()
+    def unconfirmed_write(note: str) -> dict[str, Any]:
+        return {"entry_id": "x", "read_back": {"ok": False, "error_class": "ReadTimeout", "as_written": {"text": SECRET}}}
+
     return server
 
 
@@ -86,6 +90,18 @@ def test_errors_carry_codes_we_wrote_but_never_free_text(monkeypatch: pytest.Mon
     assert calls["soft_fail"]["ok"] is False and calls["soft_fail"]["error_code"] == "mixed_owners"
     assert "error_code" not in calls["free_text_error"], "free text must not pass as a code"
     assert calls["boom"]["ok"] is False
+
+
+def test_an_unconfirmed_write_is_counted_without_what_was_written(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GitHub #84: a write that landed but whose re-read failed is `ok` for the
+    agent (it must not retry) and still a failure worth counting — as a bool,
+    never with the `as_written` payload beside it."""
+    sender = _Capture()
+    _run(_server(sender, monkeypatch), [("unconfirmed_write", {"note": "n"}), ("get_metric", {"series": "steps"})])
+    assert SECRET not in json.dumps(sender.events)
+    calls = {e["properties"]["tool"]: e["properties"] for e in sender.events if e["event"] == "mcp_tool_called"}
+    assert calls["unconfirmed_write"]["ok"] is True and calls["unconfirmed_write"]["read_back_failed"] is True
+    assert "read_back_failed" not in calls["get_metric"]
 
 
 def test_nothing_is_sent_for_an_unpaired_machine(monkeypatch: pytest.MonkeyPatch) -> None:

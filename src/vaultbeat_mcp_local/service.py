@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import platform
 import re
 import secrets
 import time
@@ -34,6 +35,7 @@ from vaultbeat_mcp_local.client import (
     VaultbeatBlobOwnerConflictError,
     VaultbeatCloudClient,
     VaultbeatCloudError,
+    VaultbeatRecordNotAgentWritableError,
     VaultbeatTrialExpiredError,
     VaultbeatUnsupportedMetricError,
     server_token,
@@ -54,9 +56,14 @@ from vaultbeat_mcp_local.store import (
     LocalServerConfig,
     now_iso,
 )
+from vaultbeat_mcp_local.telemetry import telemetry_opt_out_reason
 
 
 _LOG = logging.getLogger("vaultbeat_mcp_local.service")
+
+# The shape `create_bind_setup_code()` mints (GitHub #106): `VB-` + 8 of a
+# 31-letter alphabet without 0/O, 1/I/L. Mirrors the edge function's check.
+_SETUP_CODE = re.compile(r"VB-[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{8}")
 
 _T = TypeVar("_T")
 
@@ -83,6 +90,9 @@ METRIC_VO2MAX = "vo2max"
 METRIC_BASAL_ENERGY = "basal_energy"
 # One record per user: biological sex, date of birth, height (GitHub #14).
 METRIC_PROFILE = "profile"
+# Apple Health's State of Mind (HKStateOfMind) and the moods an agent records
+# (GitHub #13). Two payload shapes, like symptom — see STATE_OF_MIND_KINDS.
+METRIC_STATE_OF_MIND = "state_of_mind"
 
 # Every metric kind this layer understands. Doubles as the safety gate for
 # anything derived from a caller-supplied metric_type (cache file names, the
@@ -108,6 +118,7 @@ KNOWN_METRIC_TYPES = frozenset(
         METRIC_VO2MAX,
         METRIC_BASAL_ENERGY,
         METRIC_PROFILE,
+        METRIC_STATE_OF_MIND,
     }
 )
 
@@ -133,19 +144,46 @@ KNOWN_METRIC_TYPES = frozenset(
 _BASAL_HOURS_PER_DAY = 24
 _BASAL_MIN_HOURS_COVERED = 22
 
-# Note target kinds (mirrors iOS VaultbeatNoteTargetKind). Unknown kinds are
-# accepted as-is so a newer app adding a kind doesn't brick older decoders.
-NOTE_TARGET_KINDS = frozenset({"sleep", "menstrual"})
+# Note target kinds (mirrors iOS VaultbeatNoteTargetKind) — written in the app only.
+# Unknown kinds are accepted as-is so a newer app adding a kind doesn't brick older
+# decoders (0.9.2 and earlier list a `day` note under its raw name). `day` (app
+# 1.3.0, GitHub #71) is what the person writes about the day in the notes list —
+# kept apart from the agent's `general` because `log_note` replaces its whole
+# (kind, day) note: one shared kind would let the next `log_note` erase what the
+# person typed.
+NOTE_TARGET_KINDS = frozenset({"sleep", "menstrual", "day"})
 
 # Agent-authored note kinds — the only ones `log_note` will WRITE (iOS owns
 # sleep/menstrual). Reading is a different question: every kind above and here
 # can show up in a `get_notes` result, so a read-side filter must accept the
 # union (2026-07-27: the CLI's `notes --kind` offered only the iOS pair, so
 # there was no way to filter for the kinds this server itself writes).
-AGENT_NOTE_KINDS = frozenset({"mood", "general"})
+AGENT_NOTE_KINDS = frozenset({"general"})
+
+# Kinds an agent USED to write and no longer may (0.9.3, GitHub #92). "mood" was
+# the only home for "why I feel low today" until moods became State of Mind
+# (GitHub #13); with both open, one feeling landed twice — a structured
+# `log_state_of_mind` entry and a free-text mood note beside it. `log_note`
+# refuses these and names the tool that replaced them; what earlier versions
+# wrote stays in the cloud and stays readable, so they remain in the read set.
+RETIRED_NOTE_KINDS = frozenset({"mood"})
 
 # Everything `notes_summary` / `notes --kind` may legitimately be asked to keep.
-READABLE_NOTE_KINDS = NOTE_TARGET_KINDS | AGENT_NOTE_KINDS
+READABLE_NOTE_KINDS = NOTE_TARGET_KINDS | AGENT_NOTE_KINDS | RETIRED_NOTE_KINDS
+
+
+class VaultbeatArgumentRefusedError(ValueError):
+    """A call this package refuses on its arguments, with a sentence written here.
+
+    The MCP SDK hands an agent the text of a `ToolError` and nothing of a plain
+    `ValueError` — it arrives as "Error executing tool <name>" (measured through
+    `mcp.client.Client`, 2026-10-07). A refusal whose whole point is to tell the
+    agent what to call instead is useless in that form, so this type joins
+    `VaultbeatCloudError` / `VaultbeatCryptoError` in what `_surfaced` passes
+    through (Invariant 97 (our-errors-reach-the-agent)). Its message may quote
+    the caller's own argument, never a server's text (Anti-pattern 23). Still a
+    `ValueError`, so every existing `except ValueError` keeps catching it.
+    """
 
 # String forms of the three HK category-value enums the iOS reader maps
 # (HKCategoryValueSeverity / HKCategoryValuePresence / HKCategoryValueAppetiteChanges).
@@ -207,6 +245,56 @@ _SYMPTOM_TRIGGERS_MAX = 20
 # Menstrual flow enum (mirrors the iOS HKCategoryValueVaginalBloodFlow mapping).
 MENSTRUAL_FLOW_VALUES = frozenset({"unspecified", "light", "medium", "heavy", "none"})
 
+# ── State of mind (2026-10-04, GitHub #13) ────────────────────────────────────
+#
+# One kind, two payload shapes, told apart by `entryID` exactly as symptom's are:
+#   · the phone's Apple Health import — one blob per (device, day) carrying
+#     `dayID` + `samples`, every HKStateOfMind the person logged on their Watch,
+#     in the Health app or in any other app;
+#   · recorded entries — one blob per entry carrying `entryID`, written by
+#     `log_state_of_mind`. The phone pulls them back, shows them, and writes them
+#     into Apple Health only while "Allow AI to update Apple Health" is on; the
+#     ones it writes are left out of its import, so nothing is counted twice.
+#
+# The three vocabularies are Apple's own (HKStateOfMind.Kind / .Label /
+# .Association, iOS 18), spelled as the Swift case names. The app maps each token
+# to the HealthKit enum when it writes a sample, so a token outside these sets
+# could never reach Apple Health — refused at the door rather than dropped later.
+STATE_OF_MIND_KINDS = ("momentaryEmotion", "dailyMood")
+STATE_OF_MIND_LABELS = (
+    "amazed", "amused", "angry", "anxious", "ashamed", "brave", "calm", "content",
+    "disappointed", "discouraged", "disgusted", "embarrassed", "excited",
+    "frustrated", "grateful", "guilty", "happy", "hopeless", "irritated",
+    "jealous", "joyful", "lonely", "passionate", "peaceful", "proud", "relieved",
+    "sad", "scared", "stressed", "surprised", "worried", "annoyed", "confident",
+    "drained", "hopeful", "indifferent", "overwhelmed", "satisfied",
+)
+STATE_OF_MIND_ASSOCIATIONS = (
+    "community", "currentEvents", "dating", "education", "family", "fitness",
+    "friends", "health", "hobbies", "identity", "money", "partner", "selfCare",
+    "spirituality", "tasks", "travel", "work", "weather",
+)
+# Apple's seven valence regions, lowest first. HealthKit splits -1…+1 into seven
+# EQUAL bands (measured with HKStateOfMind.ValenceClassification(valence:) on
+# macOS 27, 2026-10-04: the class changes at -0.7142, -0.4285, -0.1428, 0.1429,
+# 0.4286, 0.7143), which `valence_classification` reproduces so the agent and
+# the app name the same region for the same number.
+STATE_OF_MIND_CLASSIFICATIONS = (
+    "veryUnpleasant", "unpleasant", "slightlyUnpleasant", "neutral",
+    "slightlyPleasant", "pleasant", "veryPleasant",
+)
+_STATE_OF_MIND_LABEL_BY_KEY = {name.lower(): name for name in STATE_OF_MIND_LABELS}
+_STATE_OF_MIND_ASSOCIATION_BY_KEY = {name.lower(): name for name in STATE_OF_MIND_ASSOCIATIONS}
+_STATE_OF_MIND_KIND_BY_KEY = {
+    "momentaryemotion": "momentaryEmotion",
+    "momentary": "momentaryEmotion",
+    "emotion": "momentaryEmotion",
+    "dailymood": "dailyMood",
+    "daily": "dailyMood",
+    "mood": "dailyMood",
+}
+_STATE_OF_MIND_NOTE_MAX = 2_000
+
 class CloudClientProtocol(Protocol):
     async def poll_binding(self, poll_id: str) -> PollBindingResult: ...
 
@@ -249,7 +337,15 @@ class CloudClientProtocol(Protocol):
         self, server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]
     ) -> dict[str, Any]: ...
 
+    async def write_state_of_mind_blob(
+        self, server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]
+    ) -> dict[str, Any]: ...
+
     async def report_decrypt_failures(self, server_token: str, *, items: list[dict[str, str]]) -> None: ...
+
+    async def report_bind_started(
+        self, setup_code: str, *, os_name: str | None, client_version: str | None
+    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -922,6 +1018,85 @@ class SymptomEntry:
         }
 
 
+def valence_classification(valence: float) -> str | None:
+    """Apple's name for the region a valence falls in, or None outside -1…+1.
+
+    Seven equal bands — see STATE_OF_MIND_CLASSIFICATIONS for how that was
+    measured rather than assumed.
+    """
+
+    if isinstance(valence, bool) or not isinstance(valence, (int, float)):
+        return None
+    if not -1.0 <= valence <= 1.0:
+        return None
+    index = min(int((float(valence) + 1.0) * 3.5), len(STATE_OF_MIND_CLASSIFICATIONS) - 1)
+    return STATE_OF_MIND_CLASSIFICATIONS[index]
+
+
+@dataclass(frozen=True)
+class StateOfMindRecord:
+    """One state of mind, from either source, in one row shape (GitHub #13).
+
+    `source` is "apple_health" for a sample the phone imported (logged on the
+    Watch, in the Health app or another app) and "ai" for an entry recorded
+    through `log_state_of_mind`. The two shapes share every field Apple Health
+    defines; only an entry has `entry_id` and `note`, only a sample has
+    `sample_id` and `app`. `logged_at` is None only for a daily mood an agent
+    filed under a day without a moment — never a fabricated time.
+    """
+
+    source: str
+    kind: str
+    valence: float
+    labels: tuple[str, ...]
+    associations: tuple[str, ...]
+    local_date: str
+    logged_at: str | None
+    owner_user_id: str | None
+    entry_id: str | None = None
+    sample_id: str | None = None
+    app: str | None = None
+    note: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    deleted: bool = False
+
+    def sort_key(self) -> str:
+        """Business order for Invariant 38's cut: the day, then the moment.
+
+        A day-only daily mood sorts at that day's local noon — the instant the app
+        writes it into Apple Health at — so "the newest daily mood of the day" is
+        the same record here and in the app's calendar.
+        """
+
+        return f"{self.local_date}|{self.logged_at or _local_noon_wire(self.local_date)}"
+
+    def to_dict(self) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "source": self.source,
+            "kind": self.kind,
+            "valence": self.valence,
+            "valence_classification": valence_classification(self.valence),
+            "labels": list(self.labels),
+            "associations": list(self.associations),
+            "local_date": self.local_date,
+            "logged_at": self.logged_at,
+            "local_time": _local_date_fields(self.logged_at, with_time=True).get("local_time"),
+        }
+        # Deliberately lean: the owner id is on the row's owner group, and the
+        # Apple Health sample id only deduplicates (read side). With the
+        # per-day and per-word tallies a result carries about 450 bytes a record,
+        # so the 60 KB cap (`MAX_RESULT_BYTES`) holds ~130 records — three months
+        # of daily logging, not a year; older moods are read by `since`/`until`.
+        if self.source == "ai":
+            row["entry_id"] = self.entry_id
+            row["note"] = self.note
+            row["updated_at"] = self.updated_at
+        else:
+            row["app"] = self.app
+        return row
+
+
 def _require_mapping(payload: Any, metric: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise VaultbeatCryptoError(f"{metric} payload must be a JSON object")
@@ -1363,16 +1538,16 @@ def normalize_symptom_type(raw: Any) -> str:
     """
 
     if not isinstance(raw, str) or not raw.strip():
-        raise ValueError("symptom_type must be a non-empty string")
+        raise VaultbeatArgumentRefusedError("symptom_type must be a non-empty string")
     text = raw.strip()
     if not text.isascii():
-        raise ValueError(
+        raise VaultbeatArgumentRefusedError(
             f"symptom_type must be an English token such as 'rectal_bleeding' or "
             f"'headache', not {text!r}; put the person's own words in display_name"
         )
     key = re.sub(r"[^a-z0-9]", "", text.lower())
     if not key:
-        raise ValueError(f"symptom_type {text!r} has no letters or digits")
+        raise VaultbeatArgumentRefusedError(f"symptom_type {text!r} has no letters or digits")
     if key in _HEALTHKIT_SYMPTOM_BY_KEY:
         return _HEALTHKIT_SYMPTOM_BY_KEY[key]
     # Split on separators AND on existing camelCase humps, then re-join as camelCase.
@@ -1382,9 +1557,9 @@ def normalize_symptom_type(raw: Any) -> str:
         for w in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+", chunk)
     ]
     if not words:
-        raise ValueError(f"symptom_type {text!r} has no letters or digits")
+        raise VaultbeatArgumentRefusedError(f"symptom_type {text!r} has no letters or digits")
     if len(key) > 64:
-        raise ValueError("symptom_type is too long for a type token (max 64 letters)")
+        raise VaultbeatArgumentRefusedError("symptom_type is too long for a type token (max 64 letters)")
     return words[0] + "".join(w.capitalize() for w in words[1:])
 
 
@@ -1393,6 +1568,66 @@ def _symptom_wire_instant(value: datetime) -> str:
     an entry the app re-saves reads back byte-for-byte in the same shape."""
 
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _wire_instant_or_none(value: Any) -> datetime | None:
+    """A stored `createdAt` / `updatedAt` as an aware instant, or None.
+
+    Tolerates every form the writers have used: the app's whole-second `…Z`,
+    this package's microsecond `…Z` before 0.9.3, and `+00:00` offsets. A naive
+    value is read as UTC — these fields are always written in UTC.
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _entry_stamps(
+    created_at: Any, updated_at: Any, *, now: datetime | None = None
+) -> tuple[str, str]:
+    """`(createdAt, updatedAt)` for writing a note / food day / strength session (GitHub #93).
+
+    Both in the app's own form — UTC, whole seconds, trailing `Z` — because the
+    phone re-uploads what it pulled through an encoder that drops fractions, and
+    it deletes a superseded version row only when the entry's own row holds the
+    same version (Invariant 96 (version-rows-go-on-the-pulls-evidence)): a
+    `createdAt` or `updatedAt` that differs below the second never compares equal
+    after that round trip, and the row would stay forever.
+
+    `updatedAt` is strictly after the version being replaced. A rewrite inside
+    the same second as a pre-0.9.3 write (`…:04.5Z`) would otherwise truncate to
+    an instant BEFORE it (`…:04Z`) and lose to it in every reader that compares
+    instants — the app does — while string comparison here said the opposite.
+    """
+
+    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(microsecond=0)
+    previous = _wire_instant_or_none(updated_at)
+    if previous is not None and previous >= stamp:
+        stamp = previous.astimezone(timezone.utc).replace(microsecond=0) + timedelta(seconds=1)
+    created = _wire_instant_or_none(created_at)
+    return (_symptom_wire_instant(created) if created else _symptom_wire_instant(stamp)), _symptom_wire_instant(stamp)
+
+
+def _version_key(updated_at: str | None, created_at: str | None) -> tuple[int, float, str]:
+    """How readers order two versions of one entry: by instant, not by string.
+
+    String order put a whole-second `…:04Z` after `…:04.5Z` ('Z' sorts after '.'),
+    the opposite of the instants, and `+00:00` after `Z`. A value that does not
+    parse sorts before every one that does (and among its kind by its text), so
+    a garbled stamp never beats a real one. Missing `updatedAt` falls back to
+    `createdAt`, as before.
+    """
+
+    raw = updated_at or created_at
+    parsed = _wire_instant_or_none(raw)
+    if parsed is not None:
+        return (1, parsed.timestamp(), "")
+    return (0, 0.0, raw or "")
 
 
 def _parse_symptom_time(value: str, field: str) -> tuple[datetime | None, date | None]:
@@ -1407,11 +1642,11 @@ def _parse_symptom_time(value: str, field: str) -> tuple[datetime | None, date |
         try:
             return None, date.fromisoformat(text)
         except ValueError as error:
-            raise ValueError(f"{field} {value!r} is not a real calendar day") from error
+            raise VaultbeatArgumentRefusedError(f"{field} {value!r} is not a real calendar day") from error
     try:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00").replace("z", "+00:00"))
     except ValueError as error:
-        raise ValueError(
+        raise VaultbeatArgumentRefusedError(
             f"{field} must be ISO 8601 such as '2026-09-30T10:49+08:00' (or a bare "
             f"'2026-09-30' when only the day is known), got {value!r}"
         ) from error
@@ -1425,10 +1660,10 @@ def _bounded_text(value: Any, field: str, limit: int) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ValueError(f"{field} must be a string")
+        raise VaultbeatArgumentRefusedError(f"{field} must be a string")
     text = value.strip()
     if len(text) > limit:
-        raise ValueError(f"{field} is longer than {limit} characters")
+        raise VaultbeatArgumentRefusedError(f"{field} is longer than {limit} characters")
     return text or None
 
 
@@ -1454,7 +1689,7 @@ def _validate_symptom_fields(
     kind = normalize_symptom_type(symptom_type)
     level = severity.strip().lower() if isinstance(severity, str) else ""
     if level not in SYMPTOM_ENTRY_SEVERITIES:
-        raise ValueError(
+        raise VaultbeatArgumentRefusedError(
             f"severity must be one of {sorted(SYMPTOM_ENTRY_SEVERITIES)}, got {severity!r} "
             "(use 'unspecified' when the person did not say how bad it is)"
         )
@@ -1464,23 +1699,27 @@ def _validate_symptom_fields(
     if isinstance(onset_at, str) and onset_at.strip():
         onset_instant, onset_day = _parse_symptom_time(onset_at, "onset_at")
     elif onset_at is not None and not isinstance(onset_at, str):
-        raise ValueError("onset_at must be a string")
+        raise VaultbeatArgumentRefusedError("onset_at must be a string")
     elif default_onset is not None:
-        onset_instant = default_onset
+        # "Now" arrives as a UTC instant, whose `.date()` below would be the UTC
+        # day — at 07:00 in Beijing still yesterday. Read it in this machine's
+        # zone, the person's, like a naive time is (found 2026-10-04 writing the
+        # same rule for log_state_of_mind).
+        onset_instant = default_onset.astimezone()
 
     end_instant: datetime | None = None
     if isinstance(end_at, str) and end_at.strip():
         end_instant, _end_day = _parse_symptom_time(end_at, "end_at")
         if end_instant is None:
-            raise ValueError("end_at needs a time of day, not just a date")
+            raise VaultbeatArgumentRefusedError("end_at needs a time of day, not just a date")
     elif end_at is not None and not isinstance(end_at, str):
-        raise ValueError("end_at must be a string")
+        raise VaultbeatArgumentRefusedError("end_at must be a string")
 
     if isinstance(day, str) and day.strip():
         try:
             local_day = date.fromisoformat(day.strip())
         except ValueError as error:
-            raise ValueError(f"date must be 'YYYY-MM-DD', got {day!r}") from error
+            raise VaultbeatArgumentRefusedError(f"date must be 'YYYY-MM-DD', got {day!r}") from error
     elif onset_instant is not None:
         # The wall-clock day in the offset the caller wrote (or this machine's,
         # for a naive time) — the person's day, not UTC's.
@@ -1488,15 +1727,15 @@ def _validate_symptom_fields(
     elif onset_day is not None:
         local_day = onset_day
     else:
-        raise ValueError("give onset_at (when it began) or date (the day it happened)")
+        raise VaultbeatArgumentRefusedError("give onset_at (when it began) or date (the day it happened)")
 
     now = datetime.now(timezone.utc)
     if onset_instant is not None and onset_instant > now + timedelta(minutes=5):
-        raise ValueError("onset_at is in the future")
+        raise VaultbeatArgumentRefusedError("onset_at is in the future")
     if end_instant is not None and end_instant > now + timedelta(minutes=5):
-        raise ValueError("end_at is in the future")
+        raise VaultbeatArgumentRefusedError("end_at is in the future")
     if onset_instant is not None and end_instant is not None and end_instant < onset_instant:
-        raise ValueError("end_at is before onset_at")
+        raise VaultbeatArgumentRefusedError("end_at is before onset_at")
 
     if triggers is None:
         raw_triggers: list[Any] = []
@@ -1505,7 +1744,7 @@ def _validate_symptom_fields(
     elif isinstance(triggers, (list, tuple)):
         raw_triggers = list(triggers)
     else:
-        raise ValueError("triggers must be a list of short strings")
+        raise VaultbeatArgumentRefusedError("triggers must be a list of short strings")
     cleaned: list[str] = []
     seen: set[str] = set()
     for item in raw_triggers:
@@ -1514,7 +1753,7 @@ def _validate_symptom_fields(
             seen.add(text.casefold())
             cleaned.append(text)
     if len(cleaned) > _SYMPTOM_TRIGGERS_MAX:
-        raise ValueError(f"at most {_SYMPTOM_TRIGGERS_MAX} triggers per entry")
+        raise VaultbeatArgumentRefusedError(f"at most {_SYMPTOM_TRIGGERS_MAX} triggers per entry")
 
     return {
         "symptomType": kind,
@@ -1538,6 +1777,257 @@ def _symptom_entry_payload(
     return {
         "entryID": entry_id,
         **{key: value for key, value in fields.items() if value not in (None, [])},
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+    }
+
+
+def _local_noon_wire(local_date: str) -> str:
+    """Local noon of a "YYYY-MM-DD" day as a UTC wire instant, "" if unparseable."""
+
+    try:
+        day = date.fromisoformat(local_date)
+    except ValueError:
+        return ""
+    noon = datetime(day.year, day.month, day.day, 12).astimezone()
+    return _symptom_wire_instant(noon)
+
+
+def is_state_of_mind_entry_payload(payload: Any) -> bool:
+    """True for a recorded entry, False for an Apple Health import day.
+
+    `entryID` is the one discriminator, as for symptom — never the blob id.
+    """
+
+    return isinstance(payload, dict) and "entryID" in payload
+
+
+def _state_of_mind_valence(raw: Any, where: str) -> float:
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise VaultbeatCryptoError(f"{where} valence must be a number")
+    value = float(raw)
+    if not -1.0 <= value <= 1.0:
+        raise VaultbeatCryptoError(f"{where} valence {value} is outside -1…+1")
+    return value
+
+
+def _state_of_mind_tokens(raw: Any) -> tuple[str, ...]:
+    """A decoded token list. Unknown tokens are kept as written: a newer app may
+    know a label this server does not, and dropping it would rewrite what the
+    person picked."""
+
+    if not isinstance(raw, list):
+        return ()
+    return tuple(t for t in raw if isinstance(t, str) and t)
+
+
+def parse_state_of_mind_day(
+    payload: Any, *, owner_user_id: str | None = None
+) -> list[StateOfMindRecord]:
+    """Decode one Apple Health import day into its samples.
+
+    Wire contract mirrors iOS `VaultbeatStateOfMindSharedCloudPayload`:
+    {dayID, dayStartDate, samples: [{sampleID, startDate, kind, valence,
+    labels, associations, sourceName?}]}. A valence outside -1…+1 is a contract
+    violation (HealthKit cannot store one); unknown kinds and labels pass.
+    """
+
+    data = _require_mapping(payload, METRIC_STATE_OF_MIND)
+    raw_samples = data.get("samples")
+    if not isinstance(raw_samples, list):
+        raise VaultbeatCryptoError("state_of_mind payload is missing samples list")
+    records: list[StateOfMindRecord] = []
+    for raw in raw_samples:
+        if not isinstance(raw, dict):
+            raise VaultbeatCryptoError("state_of_mind sample must be a JSON object")
+        start = raw.get("startDate")
+        if not isinstance(start, str) or not start:
+            raise VaultbeatCryptoError("state_of_mind sample is missing startDate")
+        local_date = _local_date_fields(start).get("local_date")
+        if not local_date:
+            raise VaultbeatCryptoError(f"state_of_mind sample has an unreadable startDate {start!r}")
+        kind = raw.get("kind")
+        records.append(
+            StateOfMindRecord(
+                source="apple_health",
+                kind=kind if isinstance(kind, str) and kind else "momentaryEmotion",
+                valence=_state_of_mind_valence(raw.get("valence"), "state_of_mind sample"),
+                labels=_state_of_mind_tokens(raw.get("labels")),
+                associations=_state_of_mind_tokens(raw.get("associations")),
+                local_date=local_date,
+                logged_at=start,
+                owner_user_id=owner_user_id,
+                sample_id=_optional_text(raw.get("sampleID")),
+                app=_optional_text(raw.get("sourceName")),
+            )
+        )
+    return records
+
+
+def parse_state_of_mind_entry(
+    payload: Any, *, owner_user_id: str | None = None
+) -> StateOfMindRecord:
+    """Decode one recorded entry; a tombstone comes back with `deleted=True`.
+
+    Wire contract (camelCase, shared with iOS `VaultbeatStateOfMindEntryPayload`):
+    {entryID, kind, valence, labels?, associations?, loggedAt?, localDate, note?,
+    createdAt?, updatedAt?}; a tombstone is {entryID, deleted: true, updatedAt}.
+    """
+
+    data = _require_mapping(payload, METRIC_STATE_OF_MIND)
+    entry_id = data.get("entryID")
+    if not isinstance(entry_id, str) or not entry_id:
+        raise VaultbeatCryptoError("state_of_mind entry is missing entryID")
+    created_at = _optional_text(data.get("createdAt"))
+    updated_at = _optional_text(data.get("updatedAt"))
+    if data.get("deleted") is True:
+        return StateOfMindRecord(
+            source="ai", kind="", valence=0.0, labels=(), associations=(), local_date="",
+            logged_at=None, owner_user_id=owner_user_id, entry_id=entry_id,
+            created_at=created_at, updated_at=updated_at, deleted=True,
+        )
+    logged_at = _optional_text(data.get("loggedAt"))
+    local_date = _optional_text(data.get("localDate")) or _local_date_fields(logged_at).get("local_date")
+    if not local_date:
+        raise VaultbeatCryptoError("state_of_mind entry has neither localDate nor loggedAt")
+    kind = data.get("kind")
+    return StateOfMindRecord(
+        source="ai",
+        kind=kind if isinstance(kind, str) and kind else "momentaryEmotion",
+        valence=_state_of_mind_valence(data.get("valence"), "state_of_mind entry"),
+        labels=_state_of_mind_tokens(data.get("labels")),
+        associations=_state_of_mind_tokens(data.get("associations")),
+        local_date=local_date,
+        logged_at=logged_at,
+        owner_user_id=owner_user_id,
+        entry_id=entry_id,
+        note=_optional_text(data.get("note")),
+        created_at=created_at,
+        updated_at=updated_at,
+    )
+
+
+def _state_of_mind_vocabulary(
+    raw: Any, by_key: dict[str, str], field: str, allowed: tuple[str, ...]
+) -> list[str]:
+    """Fold each token to Apple's spelling ("self_care" → "selfCare"), or raise."""
+
+    if raw is None:
+        return []
+    items = [raw] if isinstance(raw, str) else raw
+    if not isinstance(items, (list, tuple)):
+        raise VaultbeatArgumentRefusedError(f"{field} must be a list of strings")
+    cleaned: list[str] = []
+    for item in items:
+        if not isinstance(item, str) or not item.strip():
+            raise VaultbeatArgumentRefusedError(f"each of {field} must be a non-empty string")
+        key = re.sub(r"[^a-z0-9]", "", item.strip().lower())
+        token = by_key.get(key)
+        if token is None:
+            raise VaultbeatArgumentRefusedError(
+                f"{item!r} is not one of Apple Health's {field}; use one of: {', '.join(allowed)}"
+            )
+        if token not in cleaned:
+            cleaned.append(token)
+    return cleaned
+
+
+def _validate_state_of_mind_fields(
+    *,
+    valence: Any,
+    labels: Any,
+    associations: Any,
+    kind: Any,
+    logged_at: Any,
+    day: Any,
+    note: Any,
+    now: datetime,
+) -> dict[str, Any]:
+    """Normalise one entry's fields into the camelCase wire shape, or raise."""
+
+    if isinstance(valence, bool) or not isinstance(valence, (int, float)):
+        raise VaultbeatArgumentRefusedError("valence must be a number from -1 (very unpleasant) to 1 (very pleasant)")
+    level = float(valence)
+    if not -1.0 <= level <= 1.0:
+        raise VaultbeatArgumentRefusedError(f"valence must be between -1 and 1, got {valence}")
+
+    kind_key = re.sub(r"[^a-z]", "", kind.lower()) if isinstance(kind, str) else ""
+    feeling_kind = _STATE_OF_MIND_KIND_BY_KEY.get(kind_key)
+    if feeling_kind is None:
+        raise VaultbeatArgumentRefusedError(
+            f"kind must be 'momentaryEmotion' (how they feel right now) or 'dailyMood' "
+            f"(how the day has been overall), got {kind!r}"
+        )
+
+    instant: datetime | None = None
+    bare_day: date | None = None
+    if isinstance(logged_at, str) and logged_at.strip():
+        instant, bare_day = _parse_symptom_time(logged_at, "logged_at")
+    elif logged_at is not None and not isinstance(logged_at, str):
+        raise VaultbeatArgumentRefusedError("logged_at must be a string")
+    if bare_day is not None and feeling_kind != "dailyMood":
+        raise VaultbeatArgumentRefusedError(
+            "a momentary emotion needs a moment: give logged_at with a time of day "
+            "(or leave it out for right now); only a dailyMood may name just a day"
+        )
+
+    if isinstance(day, str) and day.strip():
+        try:
+            local_day = date.fromisoformat(day.strip())
+        except ValueError as error:
+            raise VaultbeatArgumentRefusedError(f"date must be 'YYYY-MM-DD', got {day!r}") from error
+        if instant is None and bare_day is None and feeling_kind != "dailyMood":
+            raise VaultbeatArgumentRefusedError(
+                "a momentary emotion on another day needs logged_at with its time; "
+                "`date` alone fits only a dailyMood"
+            )
+    elif bare_day is not None:
+        local_day = bare_day
+    elif instant is not None:
+        # The wall-clock day in the offset the caller wrote (or this machine's,
+        # for a naive time — `_parse_symptom_time` already applied it).
+        local_day = instant.date()
+    else:
+        # Right now. `now` is UTC, and its `.date()` is the UTC day — at 07:00 in
+        # Beijing that is still yesterday — so the day comes from this machine's
+        # clock instead.
+        instant = now
+        local_day = now.astimezone().date()
+
+    if instant is not None and instant > now + timedelta(minutes=5):
+        raise VaultbeatArgumentRefusedError("logged_at is in the future")
+    if local_day > (now + timedelta(days=1)).date():
+        raise VaultbeatArgumentRefusedError("date is in the future")
+
+    return {
+        "kind": feeling_kind,
+        "valence": round(level, 4),
+        "labels": _state_of_mind_vocabulary(
+            labels, _STATE_OF_MIND_LABEL_BY_KEY, "labels", STATE_OF_MIND_LABELS
+        ),
+        "associations": _state_of_mind_vocabulary(
+            associations, _STATE_OF_MIND_ASSOCIATION_BY_KEY, "associations", STATE_OF_MIND_ASSOCIATIONS
+        ),
+        "loggedAt": _symptom_wire_instant(instant) if instant else None,
+        "localDate": local_day.isoformat(),
+        "note": _bounded_text(note, "note", _STATE_OF_MIND_NOTE_MAX),
+    }
+
+
+def _state_of_mind_entry_payload(
+    entry_id: str, fields: dict[str, Any], *, created_at: str, updated_at: str
+) -> dict[str, Any]:
+    """The plaintext of one entry. `labels` / `associations` stay even when empty
+    (Apple Health has both lists on every sample); other empty optionals are left
+    out so the wire carries only what was said."""
+
+    return {
+        "entryID": entry_id,
+        **{
+            key: value
+            for key, value in fields.items()
+            if value is not None or key in ("labels", "associations")
+        },
         "createdAt": created_at,
         "updatedAt": updated_at,
     }
@@ -1690,7 +2180,9 @@ def _split_same_day_copies(
 def summarize_strength(entries: list[StrengthRecord], *, limit_days: int | None = None) -> dict[str, Any]:
     """Recent strength sessions, newest day first, with per-session volume.
 
-    Dedup by entry_id (newest updated_at wins — edits upsert the same blob id),
+    Dedup by entry_id (newest updated_at wins — an edit upserts the same blob id,
+    or, when that row is sealed for a server this one cannot seal for, a version
+    row of its own: GitHub #93),
     then set aside any session that only repeats another one logged the same
     day (`_split_same_day_copies`): it is listed under `duplicate_sessions` and
     kept out of `sessions` and `session_count`.
@@ -1700,9 +2192,10 @@ def summarize_strength(entries: list[StrengthRecord], *, limit_days: int | None 
     by_id: dict[str, StrengthRecord] = {}
     for entry in entries:
         existing = by_id.get(entry.entry_id)
-        new_key = entry.updated_at or entry.created_at or ""
-        old_key = existing.updated_at or existing.created_at or "" if existing else ""
-        if existing is None or new_key >= old_key:
+        # By instant (`_version_key`): one session can have version rows (GitHub #93).
+        if existing is None or _version_key(entry.updated_at, entry.created_at) >= _version_key(
+            existing.updated_at, existing.created_at
+        ):
             by_id[entry.entry_id] = entry
 
     kept, copies = _split_same_day_copies(list(by_id.values()))
@@ -1778,16 +2271,18 @@ def parse_food(payload: Any, *, owner_user_id: str | None = None) -> FoodRecord:
 def summarize_food(entries: list[FoodRecord], *, limit_days: int | None = None) -> dict[str, Any]:
     """Recent food-intake logs, newest day first.
 
-    Dedup by entry_id (newest updated_at wins — edits upsert the same blob id).
+    Dedup by entry_id (newest updated_at wins — an edit upserts the same blob id,
+    or writes a version row of its own: GitHub #93).
     Pass `limit_days` to keep only the most recent N days after dedup.
     """
 
     by_id: dict[str, FoodRecord] = {}
     for entry in entries:
         existing = by_id.get(entry.entry_id)
-        new_key = entry.updated_at or entry.created_at or ""
-        old_key = existing.updated_at or existing.created_at or "" if existing else ""
-        if existing is None or new_key >= old_key:
+        # By instant (`_version_key`): one day can have version rows (GitHub #93).
+        if existing is None or _version_key(entry.updated_at, entry.created_at) >= _version_key(
+            existing.updated_at, existing.created_at
+        ):
             by_id[entry.entry_id] = entry
 
     ordered = sorted(by_id.values(), key=lambda e: e.date, reverse=True)
@@ -1803,7 +2298,8 @@ def summarize_food(entries: list[FoodRecord], *, limit_days: int | None = None) 
 def summarize_notes(notes: list[NoteRecord], *, target_kind: str | None = None) -> dict[str, Any]:
     """Recent notes grouped by target kind, each carrying its writer.
 
-    Dedup by note_id (newest updated_at wins — edits upsert the same blob id)
+    Dedup by note_id (newest updated_at wins — an edit upserts the same blob id,
+    or writes a version row of its own: GitHub #93)
     and sort newest target day first. Pass `target_kind` to keep only one kind
     (e.g. just cycle notes when analysing a period).
     """
@@ -1815,10 +2311,11 @@ def summarize_notes(notes: list[NoteRecord], *, target_kind: str | None = None) 
         existing = by_id.get(note.note_id)
         # Missing updatedAt falls back to createdAt so a timestampless edit from
         # a newer/older writer still competes on SOME recency signal instead of
-        # always losing to any timestamped copy.
-        new_key = note.updated_at or note.created_at or ""
-        old_key = existing.updated_at or existing.created_at or "" if existing else ""
-        if existing is None or new_key >= old_key:
+        # always losing to any timestamped copy. By instant (`_version_key`): a
+        # note can have version rows (GitHub #93).
+        if existing is None or _version_key(note.updated_at, note.created_at) >= _version_key(
+            existing.updated_at, existing.created_at
+        ):
             by_id[note.note_id] = note
 
     kinds: dict[str, list[NoteRecord]] = {}
@@ -1851,7 +2348,9 @@ def _parse_iso8601(value: str) -> datetime:
 
 #: A blob id `mcp-write-{kind}` accepts — the ids this server mints itself
 #: (`new_entry_blob_id`, `body_day_blob_id`; `BLOB_ID_SHAPES` in mcpWrite.ts).
-_WRITTEN_BLOB_ID = re.compile(r"(?:strength|food|note|symptom)-[0-9a-f]{32}|body-[0-9]{1,12}(?:-u[0-9a-f]{8})?")
+_WRITTEN_BLOB_ID = re.compile(
+    r"(?:strength|food|note|symptom|state_of_mind)-[0-9a-f]{32}|body-[0-9]{1,12}(?:-u[0-9a-f]{8})?"
+)
 
 
 def _is_count(value: Any) -> bool:
@@ -2441,8 +2940,8 @@ PARTNER_EMPTY_HINT = (
     "Nothing of your partner's came back for this. Partner data reaches this "
     "server only for the types they share, and only on a paired account: sleep, "
     "water and weight (including body composition) are shared by default; cycle, "
-    "Apple Health symptoms and notes only if your partner turned on sharing them "
-    "with your AI in their own Vaultbeat app; everything else — including "
+    "Apple Health symptoms, states of mind (moods) and notes only if your partner "
+    "turned on sharing them with your AI in their own Vaultbeat app; everything else — including "
     "symptoms they reported themselves — is never shared. Treat this as "
     "'not shared', never as 'they did not do it'."
 )
@@ -3104,34 +3603,34 @@ def _normalize_strength_exercises(exercises: Any) -> list[dict[str, Any]]:
     """
 
     if not isinstance(exercises, list) or not exercises:
-        raise ValueError("exercises must be a non-empty list")
+        raise VaultbeatArgumentRefusedError("exercises must be a non-empty list")
 
     normalized: list[dict[str, Any]] = []
     for exercise in exercises:
         if not isinstance(exercise, dict):
-            raise ValueError("each exercise must be an object")
+            raise VaultbeatArgumentRefusedError("each exercise must be an object")
         name = exercise.get("name")
         if not isinstance(name, str) or not name.strip():
-            raise ValueError("each exercise needs a non-empty name")
+            raise VaultbeatArgumentRefusedError("each exercise needs a non-empty name")
         sets_in = exercise.get("sets")
         if not isinstance(sets_in, list) or not sets_in:
-            raise ValueError(f"exercise {name!r} needs a non-empty sets list")
+            raise VaultbeatArgumentRefusedError(f"exercise {name!r} needs a non-empty sets list")
 
         sets_out: list[dict[str, Any]] = []
         for one_set in sets_in:
             if not isinstance(one_set, dict):
-                raise ValueError(f"exercise {name!r} has a non-object set")
+                raise VaultbeatArgumentRefusedError(f"exercise {name!r} has a non-object set")
             weight = one_set.get("weightKg", one_set.get("weight_kg"))
             reps = one_set.get("reps")
             if weight is None or reps is None:
-                raise ValueError(f"exercise {name!r} has a set missing weight/reps")
+                raise VaultbeatArgumentRefusedError(f"exercise {name!r} has a set missing weight/reps")
             try:
                 weight_kg = float(weight)
                 rep_count = int(reps)
             except (TypeError, ValueError) as error:
-                raise ValueError(f"exercise {name!r} has a non-numeric weight/reps") from error
+                raise VaultbeatArgumentRefusedError(f"exercise {name!r} has a non-numeric weight/reps") from error
             if weight_kg < 0 or rep_count <= 0:
-                raise ValueError(f"exercise {name!r} has an invalid weight/reps")
+                raise VaultbeatArgumentRefusedError(f"exercise {name!r} has an invalid weight/reps")
             sets_out.append({"weightKg": weight_kg, "reps": rep_count})
 
         normalized.append({"name": name.strip(), "sets": sets_out})
@@ -3169,23 +3668,23 @@ def _normalize_food_meals(meals: Any) -> list[dict[str, Any]]:
     """
 
     if not isinstance(meals, list) or not meals:
-        raise ValueError("meals must be a non-empty list")
+        raise VaultbeatArgumentRefusedError("meals must be a non-empty list")
 
     normalized: list[dict[str, Any]] = []
     for meal in meals:
         if not isinstance(meal, dict):
-            raise ValueError("each meal must be an object")
+            raise VaultbeatArgumentRefusedError("each meal must be an object")
         items_in = meal.get("items")
         if not isinstance(items_in, list) or not items_in:
-            raise ValueError("each meal needs a non-empty items list")
+            raise VaultbeatArgumentRefusedError("each meal needs a non-empty items list")
 
         items_out: list[dict[str, Any]] = []
         for item in items_in:
             if not isinstance(item, dict):
-                raise ValueError("each meal item must be an object")
+                raise VaultbeatArgumentRefusedError("each meal item must be an object")
             food = item.get("food")
             if not isinstance(food, str) or not food.strip():
-                raise ValueError("each meal item needs a non-empty food name")
+                raise VaultbeatArgumentRefusedError("each meal item needs a non-empty food name")
             out_item: dict[str, Any] = {"food": food.strip()}
             portion = item.get("portion")
             if isinstance(portion, str) and portion.strip():
@@ -3201,11 +3700,11 @@ def _normalize_food_meals(meals: Any) -> list[dict[str, Any]]:
                     try:
                         number = float(value)
                     except (TypeError, ValueError) as error:
-                        raise ValueError(
+                        raise VaultbeatArgumentRefusedError(
                             f"item {food!r} has a non-numeric {alias}: {value!r}"
                         ) from error
                     if number < 0:
-                        raise ValueError(f"item {food!r} has a negative {alias}")
+                        raise VaultbeatArgumentRefusedError(f"item {food!r} has a negative {alias}")
                     out_item[out_key] = number
                     break
             items_out.append(out_item)
@@ -3868,6 +4367,81 @@ def summarize_symptoms(
     }
 
 
+def summarize_state_of_mind(records: list[StateOfMindRecord]) -> dict[str, Any]:
+    """States of mind grouped by owner: the records, newest first, and what they add up to.
+
+    Both sources land in one `records` list per owner (`source` says which).
+    Counts and per-day figures DESCRIBE what was logged and never grade it: a
+    day with one record and a day with ten both get a `mean_valence`, and
+    `count` beside it is what keeps the two from being read as equally sure.
+    `classification_counts` uses Apple's seven regions, so a reader can say
+    "mostly pleasant" in the words the Health app would use.
+    """
+
+    by_owner: dict[str, list[StateOfMindRecord]] = {}
+    for record in records:
+        by_owner.setdefault(record.owner_user_id or "unknown", []).append(record)
+
+    owner_summaries: list[dict[str, Any]] = []
+    for owner_key in sorted(by_owner):
+        ordered = sorted(by_owner[owner_key], key=lambda r: r.sort_key(), reverse=True)
+        classification_counts: dict[str, int] = {}
+        label_counts: dict[str, int] = {}
+        association_counts: dict[str, int] = {}
+        days: dict[str, list[StateOfMindRecord]] = {}
+        for record in ordered:
+            region = valence_classification(record.valence)
+            if region:
+                classification_counts[region] = classification_counts.get(region, 0) + 1
+            for label in record.labels:
+                label_counts[label] = label_counts.get(label, 0) + 1
+            for association in record.associations:
+                association_counts[association] = association_counts.get(association, 0) + 1
+            days.setdefault(record.local_date, []).append(record)
+        daily: list[dict[str, Any]] = []
+        for local_date in sorted(days, reverse=True):
+            day_records = days[local_date]
+            valences = [r.valence for r in day_records]
+            # The newest daily mood that day, if anyone logged one (records are
+            # already newest first). A momentary average is a different thing.
+            daily_mood = next((r.valence for r in day_records if r.kind == "dailyMood"), None)
+            daily.append(
+                {
+                    "local_date": local_date,
+                    "count": len(day_records),
+                    "mean_valence": round(sum(valences) / len(valences), 3),
+                    "lowest_valence": min(valences),
+                    "highest_valence": max(valences),
+                    "daily_mood_valence": daily_mood,
+                }
+            )
+        owner_summaries.append(
+            {
+                "owner_user_id": None if owner_key == "unknown" else owner_key,
+                "record_count": len(ordered),
+                "day_count": len(days),
+                "from_apple_health": sum(1 for r in ordered if r.source == "apple_health"),
+                "from_ai": sum(1 for r in ordered if r.source == "ai"),
+                "classification_counts": {
+                    name: classification_counts[name]
+                    for name in STATE_OF_MIND_CLASSIFICATIONS
+                    if name in classification_counts
+                },
+                "label_counts": dict(sorted(label_counts.items(), key=lambda kv: -kv[1])),
+                "association_counts": dict(sorted(association_counts.items(), key=lambda kv: -kv[1])),
+                "daily": daily,
+                "records": [record.to_dict() for record in ordered],
+            }
+        )
+
+    return {
+        "sensitive": True,
+        "owners": owner_summaries,
+        "owner_count": len(owner_summaries),
+        "total_record_count": sum(o["record_count"] for o in owner_summaries),
+    }
+
+
 def _demo_write_refusal(tool: str) -> dict[str, Any]:
     """The answer every `log_*` gives while demo mode is on.
 
@@ -4132,6 +4706,45 @@ class VaultbeatLocalService:
             config=config,
         )
 
+    async def report_bind_started(self, setup_code: str, *, timeout_sec: float = 3.0) -> bool:
+        """Best-effort "bind has started" for the phone that minted `setup_code`
+        (GitHub #106). Returns whether the cloud took the report.
+
+        Bounded by `timeout_sec` (the client's own budget is 90 s with retries,
+        sized for reads, far too long to stand between a user and their QR code)
+        and silent on every failure: the bind goes on exactly as it would without
+        a code. A code that is not the shape the phone mints is not sent at all.
+        """
+
+        from vaultbeat_mcp_local import __version__
+
+        code = setup_code.strip().upper()
+        if not _SETUP_CODE.fullmatch(code):
+            _LOG.debug("bind setup code ignored: not the minted shape")
+            return False
+        # Opted out of telemetry (VAULTBEAT_TELEMETRY=0 / DO_NOT_TRACK): the code
+        # still goes, because the phone's "computer is ready" step waits on it, but
+        # nothing about this machine rides along.
+        opted_out = telemetry_opt_out_reason() is not None
+        try:
+            # Inside the try: a config the keyring cannot open must not stop the
+            # bind before its QR code is drawn.
+            config = self.store.load()
+            if config is None:
+                return False
+            await asyncio.wait_for(
+                self._client(config).report_bind_started(
+                    code,
+                    os_name=None if opted_out else f"{platform.system()} {platform.machine()}".strip(),
+                    client_version=None if opted_out else __version__,
+                ),
+                timeout=timeout_sec,
+            )
+        except Exception as error:  # noqa: BLE001 - a report must never fail the bind
+            _LOG.debug("bind setup code report failed: %s", type(error).__name__)
+            return False
+        return True
+
     async def poll_once(self) -> PollBindingResult:
         config = self.store.load()
         if not config or not config.poll_id:
@@ -4319,7 +4932,7 @@ class VaultbeatLocalService:
             # Fail fast locally: an unknown value would (a) 400 on the new edge,
             # and (b) poison a cache key — e.g. "all" maps to the same file as
             # the unfiltered set. Membership check beats both.
-            raise ValueError(
+            raise VaultbeatArgumentRefusedError(
                 f"unknown metric_type {metric_type!r}; expected one of "
                 f"{', '.join(sorted(KNOWN_METRIC_TYPES))}"
             )
@@ -4634,6 +5247,45 @@ class VaultbeatLocalService:
         # hand the deleted entry back until that download finished.
         self._inflight_syncs.pop(metric_type, None)
         return response
+
+    async def _confirm_write(
+        self, read: Awaitable[_T], *, read_with: str, as_written: dict[str, Any]
+    ) -> tuple[_T | None, dict[str, Any] | None]:
+        """Run the confirming re-read of a write the cloud ALREADY accepted (GitHub #84).
+
+        Every write tool reads its kind back `fresh=True` after `_committed`, and
+        until 0.9.3 nothing guarded that read: when it failed (a catalog 500, a
+        dropped connection — seen 2026-10-05 on `log_symptom`, write 200 then a
+        dead re-read 14 s later) the exception became the tool's result. The
+        agent was told the write failed, and an agent told that retries — which,
+        for every tool that mints a new id per call (`log_symptom`,
+        `log_state_of_mind`, the note and `_append` paths), records the same
+        thing twice. `_committed` already fixed the cache half of that failure;
+        this is the half the agent sees.
+
+        Returns the read's result, or `(None, read_back)` where `read_back` says
+        the write landed, why it could not be confirmed, and what was written.
+        Any exception counts: the write's fate is already known, so whatever
+        broke the confirmation — a bug included — must not be reported as the
+        write failing. The sentence is written here (Anti-pattern 23); the class
+        name is ours or a library's, never server text. Only call this AFTER the
+        write returned: a write the cloud refused must still raise.
+        """
+        try:
+            return await read, None
+        except Exception as error:  # noqa: BLE001 — see the docstring
+            _LOG.warning("write landed; confirming re-read failed (%s)", type(error).__name__)
+            return None, {
+                "ok": False,
+                "error_class": type(error).__name__,
+                "note": (
+                    "The cloud accepted this write; only the confirming re-read failed. "
+                    "Do not repeat the write — calling the tool again would record it a "
+                    f"second time. Read it back later with `{read_with}`. "
+                    "`as_written` is what this call sent."
+                ),
+                "as_written": as_written,
+            }
 
     def _is_newest_fetch(self, metric_type: str | None, generation: int | None) -> bool:
         """Whether a fetch may still write the cache: no newer fetch of its kind began."""
@@ -5872,8 +6524,18 @@ class VaultbeatLocalService:
                     days.append(parse_symptom_day(record.payload, owner_user_id=record.owner_user_id))
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
                 errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
-        # A deleted entry is a tombstone blob; it is nobody's symptom.
-        entries = [e for e in entries if not e.deleted]
+        # One entry can have SEVERAL blobs (GitHub #79): `update_symptom` and
+        # `delete_symptom` write each new version into a blob of its own, because
+        # the app's re-seal makes the entry's own row unwritable for any single
+        # server. Keep the newest version per entry FIRST, then drop tombstones —
+        # in the other order a deleted entry's older live version would come back.
+        newest: dict[tuple[str, str], SymptomEntry] = {}
+        for entry in entries:
+            key = ((entry.owner_user_id or "").lower(), entry.entry_id)
+            prior = newest.get(key)
+            if prior is None or (entry.updated_at or "") >= (prior.updated_at or ""):
+                newest[key] = entry
+        entries = [e for e in newest.values() if not e.deleted]
         # Same owner filter as every other reader (`me` or `!me` for the partner).
         days = _select_owner(days, owner)
         entries = _select_owner(entries, owner)
@@ -5905,7 +6567,9 @@ class VaultbeatLocalService:
             summary,
             rows=day_rows + entry_rows,
             requested=limit,
-            unit="days",
+            # Not "days": `limit` cuts the imported days AND the reported entries,
+            # each on its own, so `limit=1` returns one entry even on a day with three.
+            unit="days and entries (each list)",
             # Each list was cut to `limit` on its own, so the binding count is the
             # larger of the two — summing them would call two half-full lists a
             # satisfied window.
@@ -5913,6 +6577,77 @@ class VaultbeatLocalService:
             total_available=_avail + _e_avail,
             oldest_raw=min(oldest_days) if oldest_days else None,
         )
+        return _attach_errors(summary, errors)
+
+    async def state_of_mind_summary(
+        self,
+        *,
+        limit: int | None = None,
+        fresh: bool = False,
+        owner: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> dict[str, Any]:
+        """Return recent states of mind — Apple Health's and the AI's — by owner.
+
+        Sensitive — decoded locally, never re-exported. Deduplicated before the
+        cut, so `limit` counts real records: an Apple Health sample uploaded by
+        two of the person's devices is one sample (same `sampleID`), and an
+        entry whose newest version is a tombstone is gone.
+
+        `since` / `until` ("YYYY-MM-DD", local days, both inclusive) select a
+        window by `local_date` (GitHub #82). They are the only way to older
+        moods: about 130 records is all one result can carry, so a daily
+        logger's second quarter back was out of reach of any `limit`.
+        """
+
+        since, until, bad = _parse_day_range(since, until)
+        if bad:
+            return bad
+        records, errors = await self._records_for_metric(METRIC_STATE_OF_MIND, limit=None, fresh=fresh)
+        samples: dict[tuple[str, str], StateOfMindRecord] = {}
+        unidentified: list[StateOfMindRecord] = []
+        entries: dict[tuple[str, str], StateOfMindRecord] = {}
+        for record in records:
+            try:
+                if is_state_of_mind_entry_payload(record.payload):
+                    entry = parse_state_of_mind_entry(record.payload, owner_user_id=record.owner_user_id)
+                    key = ((entry.owner_user_id or "").lower(), entry.entry_id or "")
+                    prior = entries.get(key)
+                    if prior is None or (entry.updated_at or "") >= (prior.updated_at or ""):
+                        entries[key] = entry
+                else:
+                    for sample in parse_state_of_mind_day(record.payload, owner_user_id=record.owner_user_id):
+                        if sample.sample_id:
+                            samples[((sample.owner_user_id or "").lower(), sample.sample_id)] = sample
+                        else:
+                            unidentified.append(sample)
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError) as error:
+                errors.append(f"{record.envelope_id}: parse_failed ({type(error).__name__}: {error})")
+        merged = [e for e in entries.values() if not e.deleted] + list(samples.values()) + unidentified
+        merged = _select_owner(merged, owner)
+        # The span facts come from every record, before the window narrows the
+        # list, so `more_available` can say that older moods exist beyond `since`.
+        _, available, oldest = _cut_newest_by_with_span(merged, None, key=lambda r: r.sort_key())
+        if since or until:
+            # By the `local_date` each row shows, so the window selects exactly the
+            # rows whose day the caller sees inside it.
+            merged = [
+                r for r in merged
+                if (since is None or r.local_date >= since) and (until is None or r.local_date <= until)
+            ]
+        kept, _, _ = _cut_newest_by_with_span(merged, limit, key=lambda r: r.sort_key())
+        summary = summarize_state_of_mind(kept)
+        rows = [row for o in summary["owners"] for row in o["records"]]
+        _attach_coverage(
+            summary,
+            rows=rows,
+            requested=limit,
+            unit="records",
+            total_available=available,
+            oldest_raw=oldest.split("|", 1)[0] if oldest else None,
+        )
+        _apply_range_coverage(summary, since, until)
         return _attach_errors(summary, errors)
 
     async def notes_summary(
@@ -5926,7 +6661,8 @@ class VaultbeatLocalService:
         """Return recent free-text notes grouped by target kind.
 
         Kinds: "sleep"/"menstrual" are written manually in Vaultbeat by either
-        partner; "mood"/"general" are agent-authored via `log_note`. Each note
+        partner; "general" is agent-authored via `log_note`, and "mood" is what
+        agents wrote before 0.9.3 (GitHub #92 — read only now). Each note
         carries its writer (owner_user_id). Sensitive free text — decoded
         locally, never re-exported.
         """
@@ -6136,58 +6872,31 @@ class VaultbeatLocalService:
             note, existing_session.get("note") if existing_session else None
         )
 
-        now_iso_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        created_at, updated_at = _entry_stamps(
+            existing_created_at, existing_session.get("updated_at") if existing_session else None
+        )
         entry_id = existing_entry_id or new_entry_blob_id(METRIC_STRENGTH)
         plaintext_obj = {
             "entryID": entry_id,
             "date": _local_midnight_iso(requested_day),
             "exercises": normalized_exercises,
             "note": cleaned_note,
-            "createdAt": existing_created_at or now_iso_utc,
-            "updatedAt": now_iso_utc,
+            "createdAt": created_at,
+            "updatedAt": updated_at,
         }
-        plaintext_bytes = json.dumps(plaintext_obj, ensure_ascii=False).encode("utf-8")
-
-        recipients = [
-            RecipientKey(
-                recipient_kind="owner_user",
-                recipient_id=config.owner_user_id,
-                public_key_base64=config.owner_public_key_base64,
-            ),
-            RecipientKey(
-                recipient_kind="mcp_server",
-                recipient_id=config.server_id,
-                public_key_base64=config.public_key_base64,
-            ),
-        ]
-        ciphertext_base64, sealed_envelopes = encrypt_blob_payload(
-            plaintext=plaintext_bytes, recipients=recipients
+        server_response = await self._write_entry_in_place_or_as_version(
+            config,
+            plaintext_obj,
+            metric_type=METRIC_STRENGTH,
+            write=self._client(config).write_strength_blob,
+            entry_id=entry_id,
         )
 
-        blob = {
-            "id": entry_id,
-            "owner_user_id": config.owner_user_id,
-            "source_device_id": config.owner_device_id,
-            "metric_type": METRIC_STRENGTH,
-            "encryption_version": "v1",
-            "ciphertext": ciphertext_base64,
-        }
-        envelope_rows = [
-            {
-                "recipient_kind": envelope.recipient_kind,
-                "recipient_id": envelope.recipient_id,
-                "encrypted_data_key": envelope.encrypted_data_key_base64,
-            }
-            for envelope in sealed_envelopes
-        ]
-
-        server_response = await self._committed(METRIC_STRENGTH, self._client(config).write_strength_blob(
-            server_token, blob=blob, envelopes=envelope_rows
-        ))
-
-        refreshed = await self.strength_summary(fresh=True)
+        refreshed, read_back = await self._confirm_write(
+            self.strength_summary(fresh=True), read_with="get_strength_log", as_written=plaintext_obj
+        )
         session = next(
-            (s for s in refreshed.get("sessions", []) if s.get("entry_id") == entry_id), None
+            (s for s in (refreshed or {}).get("sessions", []) if s.get("entry_id") == entry_id), None
         )
         return {
             "entry_id": entry_id,
@@ -6200,6 +6909,7 @@ class VaultbeatLocalService:
             "replaced_exercises": replaced_exercises,
             "server_response": _server_facts(server_response),
             "session": session,
+            **({"read_back": read_back} if read_back else {}),
         }
 
     async def food_summary(
@@ -6364,58 +7074,31 @@ class VaultbeatLocalService:
         # replace mode used to erase it too, which is the same silent-loss bug.
         cleaned_note = _resolve_note(note, existing_day.get("note") if existing_day else None)
 
-        now_iso_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        created_at, updated_at = _entry_stamps(
+            existing_created_at, existing_day.get("updated_at") if existing_day else None
+        )
         entry_id = existing_entry_id or new_entry_blob_id(METRIC_FOOD)
         plaintext_obj = {
             "entryID": entry_id,
             "date": _local_midnight_iso(requested_day),
             "meals": normalized_meals,
             "note": cleaned_note,
-            "createdAt": existing_created_at or now_iso_utc,
-            "updatedAt": now_iso_utc,
+            "createdAt": created_at,
+            "updatedAt": updated_at,
         }
-        plaintext_bytes = json.dumps(plaintext_obj, ensure_ascii=False).encode("utf-8")
-
-        recipients = [
-            RecipientKey(
-                recipient_kind="owner_user",
-                recipient_id=config.owner_user_id,
-                public_key_base64=config.owner_public_key_base64,
-            ),
-            RecipientKey(
-                recipient_kind="mcp_server",
-                recipient_id=config.server_id,
-                public_key_base64=config.public_key_base64,
-            ),
-        ]
-        ciphertext_base64, sealed_envelopes = encrypt_blob_payload(
-            plaintext=plaintext_bytes, recipients=recipients
+        server_response = await self._write_entry_in_place_or_as_version(
+            config,
+            plaintext_obj,
+            metric_type=METRIC_FOOD,
+            write=self._client(config).write_food_blob,
+            entry_id=entry_id,
         )
 
-        blob = {
-            "id": entry_id,
-            "owner_user_id": config.owner_user_id,
-            "source_device_id": config.owner_device_id,
-            "metric_type": METRIC_FOOD,
-            "encryption_version": "v1",
-            "ciphertext": ciphertext_base64,
-        }
-        envelope_rows = [
-            {
-                "recipient_kind": envelope.recipient_kind,
-                "recipient_id": envelope.recipient_id,
-                "encrypted_data_key": envelope.encrypted_data_key_base64,
-            }
-            for envelope in sealed_envelopes
-        ]
-
-        server_response = await self._committed(METRIC_FOOD, self._client(config).write_food_blob(
-            server_token, blob=blob, envelopes=envelope_rows
-        ))
-
-        refreshed = await self.food_summary(fresh=True)
+        refreshed, read_back = await self._confirm_write(
+            self.food_summary(fresh=True), read_with="get_food_log", as_written=plaintext_obj
+        )
         day = next(
-            (d for d in refreshed.get("days", []) if d.get("entry_id") == entry_id), None
+            (d for d in (refreshed or {}).get("days", []) if d.get("entry_id") == entry_id), None
         )
         return {
             "entry_id": entry_id,
@@ -6427,6 +7110,7 @@ class VaultbeatLocalService:
             "replaced_meals": replaced_meals,
             "server_response": _server_facts(server_response),
             "day": day,
+            **({"read_back": read_back} if read_back else {}),
         }
 
     async def log_weight_entry(
@@ -6442,13 +7126,14 @@ class VaultbeatLocalService:
         re-recording the same day upserts in place — same convention as the iOS
         weight card. Sealed for owner + this MCP server (own AI only).
 
-        ⚠️ CAVEAT: agent-written weight ONLY lands in Vaultbeat cloud + MCP
-        (visible to `get_metric` series "weight_kg"). It does NOT write to Apple Health
-        (HealthKit is iOS-only). If the owner also wants the number in the
-        iPhone Health app, they need to record it manually in the Vaultbeat
-        weight card (which does the HealthKit write). Design decision:
-        keeping this MCP tool light + read-only wrt HealthKit avoids the
-        entire "server-triggered HealthKit push" complexity.
+        This machine never touches HealthKit; the PHONE carries the weight into
+        Apple Health on its next sync ("Allow AI to update Apple Health", added
+        2026-07-22 — the caveat that stood here until 2026-10-06 said the weight
+        never got there and told owners to re-enter it by hand, which makes two
+        entries for one day). Since GitHub #46 `mcp-write-body` refuses the write
+        when no phone of the account will do that, raising
+        `VaultbeatWeightNeedsAppleHealthError`: a weight may not live only in the
+        cloud.
 
         Requires a bind that carried owner identity through the handshake
         (owner_user_id / owner_public_key_base64 / owner_device_id).
@@ -6485,7 +7170,7 @@ class VaultbeatLocalService:
             )
 
         if weight_kg <= 0 or weight_kg > 500:
-            raise ValueError(f"weight_kg out of realistic range: {weight_kg}")
+            raise VaultbeatArgumentRefusedError(f"weight_kg out of realistic range: {weight_kg}")
 
         # Match iOS: dayID = "body-{dayStart.epoch}", dayStart = local midnight
         # with that day's offset — a summer day written in winter must land on
@@ -6608,8 +7293,13 @@ class VaultbeatLocalService:
             ))
 
         # Verify by re-reading (cache-bypass)
-        refreshed = await self.weight_trend_summary(fresh=True, limit=30)
-        latest = refreshed.get("days", [{}])[0] if refreshed.get("days") else {}
+        refreshed, read_back = await self._confirm_write(
+            self.weight_trend_summary(fresh=True, limit=30),
+            read_with='get_metric(series="weight_kg")',
+            as_written=plaintext_obj,
+        )
+        days = (refreshed or {}).get("days")
+        latest = days[0] if days else {}
         return {
             "day_id": day_id,
             "date": requested_day.isoformat(),
@@ -6619,6 +7309,7 @@ class VaultbeatLocalService:
             "preserved_composition": preserved,
             "server_response": _server_facts(server_response),
             "latest_after_write": latest,
+            **({"read_back": read_back} if read_back else {}),
         }
 
     async def log_note(
@@ -6634,23 +7325,30 @@ class VaultbeatLocalService:
 
         `partner=True` (2026-09-23): the note is ABOUT the partner — "she had
         diarrhoea twice this morning". It is still written into the USER's own
-        account and sealed to the user + this server only; the partner's account
-        is never touched and the partner never receives it. It carries
-        `about: "partner"`, which is what keeps it out of the user's own reads
-        and puts it into `partner=True` reads. Notes only, deliberately: iOS
-        never pulls notes back, so an extra field cannot surface in the app as
-        the user's own data — food, strength and body ARE pulled and merged per
-        day, and a partner row there would overwrite the user's.
+        account and sealed for the user + this server; the partner's account is
+        never touched and the partner never receives it. From app 1.3.0 the phone
+        pulls the note (GitHub #46) and re-seals it for the user's OTHER servers
+        too, still never for the partner: `NoteSyncExecutor` keeps an AI's notes
+        `.ownDevicesOnly` whatever the notes partner-AI switch says, and carries
+        `about` through the round trip. It carries `about: "partner"`, which is
+        what keeps it out of the user's own reads and puts it into `partner=True`
+        reads. Notes only, deliberately (Invariant 89
+        (partner-writes-are-notes-only)): food, strength and body are merged per
+        DAY on the phone, and a partner row there would overwrite the user's;
+        notes are keyed by `noteID`, so one about the partner sits beside the
+        user's own.
 
-        Fills the gap the 2026-07-23 roadmap entry describes: "今天为什么情绪
-        低落 / 发生了什么" narratives had nowhere to live in Vaultbeat (the
-        `note` kind's targetKind was only ever written as sleep/menstrual by
-        iOS), so they piled up in local markdown where no metric join can see
-        them. `kind` is "mood" or "general" — agent-only kinds; iOS's
-        VaultbeatNoteTargetKind stores the raw string on the wire and has no
-        note pull path, so a new kind is wire-safe by construction. sleep and
-        menstrual stay iOS-authored (writing them here would silently coexist
-        with an app-authored note for the same day and confuse dedup).
+        Fills the gap the 2026-07-23 roadmap entry describes: "发生了什么"
+        narratives had nowhere to live in Vaultbeat (the `note` kind's
+        targetKind was only ever written as sleep/menstrual by iOS), so they
+        piled up in local markdown where no metric join can see them. `kind` is
+        "general", the one agent-only kind; iOS's VaultbeatNoteTargetKind stores
+        the raw string on the wire, so a new kind is wire-safe by construction.
+        sleep, menstrual and day stay iOS-authored (writing them here would silently
+        coexist with an app-authored note for the same day and confuse dedup).
+        "mood" was the second agent kind until 0.9.3 and is now refused with a
+        pointer to `log_state_of_mind` (`RETIRED_NOTE_KINDS`, GitHub #92); the
+        mood notes already written stay readable.
 
         `date` = LOCAL calendar day "YYYY-MM-DD" (default today). One
         agent-authored note per (kind, local day), so the same kind+day reuses
@@ -6671,19 +7369,31 @@ class VaultbeatLocalService:
         `merge=True` from the food/strength tools would reasonably assume the
         same here and silently erase the morning's symptoms.
 
-        Sealed for owner + this MCP server (own AI only, no partner fan-out).
+        Sealed for owner + this MCP server (own AI only, no partner fan-out). A
+        rewrite goes over the note's own row, or into a version row when the phone
+        has sealed that row for another of the owner's servers
+        (`_write_entry_in_place_or_as_version`, GitHub #93).
         """
 
         from datetime import date as _date_type
 
+        if kind in RETIRED_NOTE_KINDS:
+            raise VaultbeatArgumentRefusedError(
+                "Nothing was saved: moods are no longer notes. Record the feeling with "
+                "`log_state_of_mind` — a valence from -1 to 1, Apple Health's feeling words "
+                "the person's own words support, and its `note` for the story behind it. "
+                "Use `log_note_append` (kind \"general\") only for events around the day. "
+                "Mood notes written before stay readable through `get_notes`."
+            )
         if kind not in AGENT_NOTE_KINDS:
-            raise ValueError(
+            raise VaultbeatArgumentRefusedError(
                 f"unsupported note kind {kind!r}; expected one of {sorted(AGENT_NOTE_KINDS)} "
-                "(sleep/menstrual notes are iOS-authored)"
+                "(sleep, menstrual and day notes are written in the iOS app; a feeling goes to "
+                "`log_state_of_mind`)"
             )
         cleaned_text = text.strip() if isinstance(text, str) else ""
         if not cleaned_text:
-            raise ValueError("note text must be a non-empty string")
+            raise VaultbeatArgumentRefusedError("note text must be a non-empty string")
         requested_day = _date_type.fromisoformat(date) if date else _date_type.today()
 
         # Demo mode has no account to write to — see `_demo_write_refusal`.
@@ -6715,6 +7425,7 @@ class VaultbeatLocalService:
         # Upsert key: an existing agent-authored note for the same (kind, day).
         existing_note_id: str | None = None
         existing_created_at: str | None = None
+        existing_updated_at: str | None = None
         existing_text: str | None = None
         # One note per (kind, day, ABOUT WHOM), and only among notes this account
         # wrote: a note about the partner must never overwrite the user's own
@@ -6737,6 +7448,7 @@ class VaultbeatLocalService:
                 if parsed_day == requested_day:
                     existing_note_id = note_row.get("note_id")
                     existing_created_at = note_row.get("created_at")
+                    existing_updated_at = note_row.get("updated_at")
                     row_text = note_row.get("text")
                     existing_text = (
                         row_text if isinstance(row_text, str) and row_text.strip() else None
@@ -6757,61 +7469,34 @@ class VaultbeatLocalService:
             # invisible for weeks (see log_strength_entry's `replaced_exercises`).
             replaced_text = existing_text
 
-        now_iso_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        created_at, updated_at = _entry_stamps(existing_created_at, existing_updated_at)
         note_id = existing_note_id or new_entry_blob_id(METRIC_NOTE)
         plaintext_obj = {
             "noteID": note_id,
             "targetKind": kind,
             "targetDate": _local_midnight_iso(requested_day),
             "text": cleaned_text,
-            "createdAt": existing_created_at or now_iso_utc,
-            "updatedAt": now_iso_utc,
+            "createdAt": created_at,
+            "updatedAt": updated_at,
             # Only when true: a note about oneself stays byte-identical to what
             # every earlier version wrote.
             **({"about": "partner"} if partner else {}),
         }
-        plaintext_bytes = json.dumps(plaintext_obj, ensure_ascii=False).encode("utf-8")
-
-        recipients = [
-            RecipientKey(
-                recipient_kind="owner_user",
-                recipient_id=config.owner_user_id,
-                public_key_base64=config.owner_public_key_base64,
-            ),
-            RecipientKey(
-                recipient_kind="mcp_server",
-                recipient_id=config.server_id,
-                public_key_base64=config.public_key_base64,
-            ),
-        ]
-        ciphertext_base64, sealed_envelopes = encrypt_blob_payload(
-            plaintext=plaintext_bytes, recipients=recipients
+        server_response = await self._write_entry_in_place_or_as_version(
+            config,
+            plaintext_obj,
+            metric_type=METRIC_NOTE,
+            write=self._client(config).write_note_blob,
+            entry_id=note_id,
         )
 
-        blob = {
-            "id": note_id,
-            "owner_user_id": config.owner_user_id,
-            "source_device_id": config.owner_device_id,
-            "metric_type": METRIC_NOTE,
-            "encryption_version": "v1",
-            "ciphertext": ciphertext_base64,
-        }
-        envelope_rows = [
-            {
-                "recipient_kind": envelope.recipient_kind,
-                "recipient_id": envelope.recipient_id,
-                "encrypted_data_key": envelope.encrypted_data_key_base64,
-            }
-            for envelope in sealed_envelopes
-        ]
-
-        server_response = await self._committed(METRIC_NOTE, self._client(config).write_note_blob(
-            server_token, blob=blob, envelopes=envelope_rows
-        ))
-
-        refreshed = await self.notes_summary(target_kind=kind, fresh=True)
+        refreshed, read_back = await self._confirm_write(
+            self.notes_summary(target_kind=kind, fresh=True),
+            read_with="get_notes(partner=true)" if partner else "get_notes",
+            as_written=plaintext_obj,
+        )
         written = None
-        for kind_group in refreshed.get("kinds", []):
+        for kind_group in (refreshed or {}).get("kinds", []):
             for note_row in kind_group.get("notes", []):
                 if note_row.get("note_id") == note_id:
                     written = note_row
@@ -6829,6 +7514,7 @@ class VaultbeatLocalService:
             "replaced_text": replaced_text,
             "server_response": _server_facts(server_response),
             "note": written,
+            **({"read_back": read_back} if read_back else {}),
         }
 
     # ── Self-reported symptoms (GitHub #3, 2026-09-30) ──────────────────────
@@ -6851,13 +7537,45 @@ class VaultbeatLocalService:
         return config
 
     async def _seal_and_write_symptom(
-        self, config: LocalServerConfig, plaintext_obj: dict[str, Any]
+        self, config: LocalServerConfig, plaintext_obj: dict[str, Any], *, new_version: bool = False
     ) -> dict[str, Any]:
         """Seal one symptom entry for owner + this server and POST it.
 
+        `new_version`: write it into a FRESH blob instead of the entry's own row
+        (GitHub #79). The app re-seals every entry it holds for ALL the owner's
+        servers, and `mcp_write_blob` then refuses any single server's rewrite of
+        that row (`envelope_recipients_not_coverable`, Invariant 49
+        (envelope-only-for-readers)) — so an update or delete in place worked
+        only until the app's first sync, and never on an account with two
+        servers. Every reader keeps the newest version per `entryID`; the app's
+        next re-seal overwrites the entry's own row with it.
+        """
+
+        client = self._client(config)
+        return await self._seal_and_write_entry(
+            config,
+            plaintext_obj,
+            metric_type=METRIC_SYMPTOM,
+            write=client.write_symptom_blob,
+            blob_id=new_entry_blob_id(METRIC_SYMPTOM) if new_version else None,
+        )
+
+    async def _seal_and_write_entry(
+        self,
+        config: LocalServerConfig,
+        plaintext_obj: dict[str, Any],
+        *,
+        metric_type: str,
+        write: Callable[..., Awaitable[dict[str, Any]]],
+        blob_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Seal one entry-shaped record for owner + this server and POST it.
+
         Same recipients as every agent write (owner_user + this mcp_server, no
-        partner). The blob id IS the entry id, so rewriting an entry is an
-        upsert of the same row.
+        partner). The blob id is the entry id unless `blob_id` says otherwise,
+        so rewriting an entry is an upsert of the same row; a state-of-mind
+        tombstone passes its own fresh id (see `delete_state_of_mind`). `write`
+        is the kind's own endpoint (Invariant 21: one function per writable kind).
         """
 
         plaintext_bytes = json.dumps(plaintext_obj, ensure_ascii=False).encode("utf-8")
@@ -6877,10 +7595,10 @@ class VaultbeatLocalService:
             plaintext=plaintext_bytes, recipients=recipients
         )
         blob = {
-            "id": plaintext_obj["entryID"],
+            "id": blob_id or plaintext_obj["entryID"],
             "owner_user_id": config.owner_user_id,
             "source_device_id": config.owner_device_id,
-            "metric_type": METRIC_SYMPTOM,
+            "metric_type": metric_type,
             "encryption_version": "v1",
             "ciphertext": ciphertext_base64,
         }
@@ -6892,9 +7610,54 @@ class VaultbeatLocalService:
             }
             for envelope in sealed_envelopes
         ]
-        return await self._committed(METRIC_SYMPTOM, self._client(config).write_symptom_blob(
-            config.server_token or "", blob=blob, envelopes=envelope_rows
-        ))
+        return await self._committed(
+            metric_type, write(config.server_token or "", blob=blob, envelopes=envelope_rows)
+        )
+
+    async def _write_entry_in_place_or_as_version(
+        self,
+        config: LocalServerConfig,
+        plaintext_obj: dict[str, Any],
+        *,
+        metric_type: str,
+        write: Callable[..., Awaitable[dict[str, Any]]],
+        entry_id: str,
+    ) -> dict[str, Any]:
+        """Write a note / food day / strength session over its own row, or — when
+        the cloud refuses that — into a version row of its own (GitHub #93).
+
+        The phone re-seals every entry it holds for ALL the owner's servers
+        (`.ownDevicesOnly`), and `mcp_write_blob` refuses a rewrite whose envelopes
+        do not cover every recipient the row already has
+        (`envelope_recipients_not_coverable`, Invariant 49
+        (envelope-only-for-readers)). On an account with two or more servers that
+        made every rewrite of an entry the phone had re-sealed fail for good — for
+        notes from 1.3.0 (the note pull), for food and strength since their pulls
+        shipped. So the refusal is answered the way symptoms and moods are always
+        written (GitHub #79): the same plaintext in a fresh `{kind}-{32 hex}` blob.
+        Every reader keeps the newest version per entry id, the phone's next
+        upload carries it into the entry's own row for every recipient, and its
+        pull after that deletes the version row (Invariant 96
+        (version-rows-go-on-the-pulls-evidence)).
+
+        The own row first, not always a version: on an account with one server the
+        rewrite is accepted exactly as before, and no row is added per edit — food
+        and notes are appended to several times a day.
+        """
+
+        try:
+            return await self._seal_and_write_entry(
+                config, plaintext_obj, metric_type=metric_type, write=write, blob_id=entry_id
+            )
+        except VaultbeatRecordNotAgentWritableError:
+            _LOG.info("%s entry is sealed for another server; writing a version row (GitHub #93)", metric_type)
+            return await self._seal_and_write_entry(
+                config,
+                plaintext_obj,
+                metric_type=metric_type,
+                write=write,
+                blob_id=new_entry_blob_id(metric_type),
+            )
 
     async def _find_own_symptom_entry(
         self, entry_id: str, config: LocalServerConfig
@@ -6902,25 +7665,30 @@ class VaultbeatLocalService:
         """The live (not deleted) reported entry `entry_id`, written by this account."""
 
         if not isinstance(entry_id, str) or not entry_id.strip():
-            raise ValueError("entry_id must be a non-empty string")
+            raise VaultbeatArgumentRefusedError("entry_id must be a non-empty string")
         wanted = entry_id.strip()
         records, _errors = await self._records_for_metric(METRIC_SYMPTOM, limit=None, fresh=True)
         me = (config.owner_user_id or "").lower()
+        # The NEWEST version: an entry can have several blobs (GitHub #79).
+        newest: SymptomEntry | None = None
         for record in records:
             if not is_symptom_entry_payload(record.payload):
                 continue
             try:
-                entry = parse_symptom_entry(record.payload, owner_user_id=record.owner_user_id)
+                version = parse_symptom_entry(record.payload, owner_user_id=record.owner_user_id)
             except (KeyError, TypeError, VaultbeatCryptoError, ValueError):
                 continue
-            if entry.entry_id != wanted:
-                continue
-            if entry.deleted:
-                raise ValueError(f"symptom entry {wanted!r} was already deleted")
-            if (entry.owner_user_id or "").lower() != me:
-                raise ValueError(f"symptom entry {wanted!r} belongs to another account")
-            return entry
-        raise ValueError(
+            if version.entry_id == wanted and (
+                newest is None or (version.updated_at or "") >= (newest.updated_at or "")
+            ):
+                newest = version
+        if newest is not None:
+            if newest.deleted:
+                raise VaultbeatArgumentRefusedError(f"symptom entry {wanted!r} was already deleted")
+            if (newest.owner_user_id or "").lower() != me:
+                raise VaultbeatArgumentRefusedError(f"symptom entry {wanted!r} belongs to another account")
+            return newest
+        raise VaultbeatArgumentRefusedError(
             f"no symptom entry {wanted!r} readable by this server — read `entry_id` "
             "from get_symptoms' `reported` list (HealthKit-imported days cannot be edited here)"
         )
@@ -6977,10 +7745,16 @@ class VaultbeatLocalService:
         stamp = _symptom_wire_instant(now)
         payload = _symptom_entry_payload(entry_id, fields, created_at=stamp, updated_at=stamp)
         server_response = await self._seal_and_write_symptom(config, payload)
+        entry, read_back = await self._confirm_write(
+            self._read_back_symptom_entry(entry_id, config.owner_user_id),
+            read_with="get_symptoms",
+            as_written=payload,
+        )
         return {
             "entry_id": entry_id,
             "server_response": _server_facts(server_response),
-            "entry": await self._read_back_symptom_entry(entry_id, config.owner_user_id),
+            "entry": entry,
+            **({"read_back": read_back} if read_back else {}),
         }
 
     async def update_symptom(
@@ -7033,8 +7807,17 @@ class VaultbeatLocalService:
             existing.entry_id, fields, created_at=existing.created_at or stamp, updated_at=stamp
         )
         before = existing.to_dict()
-        server_response = await self._seal_and_write_symptom(config, payload)
-        after = await self._read_back_symptom_entry(existing.entry_id, config.owner_user_id)
+        server_response = await self._seal_and_write_symptom(config, payload, new_version=True)
+        after, read_back = await self._confirm_write(
+            self._read_back_symptom_entry(existing.entry_id, config.owner_user_id),
+            read_with="get_symptoms",
+            as_written=payload,
+        )
+        basis = after
+        if basis is None and read_back is not None:
+            # The re-read failed, not the write: say what changed against what
+            # this call sent, or `changed_fields` would claim nothing did.
+            basis = parse_symptom_entry(payload, owner_user_id=config.owner_user_id).to_dict()
         compared = (
             "symptom_type", "severity", "local_date", "onset_at", "end_at",
             "display_name", "body_location", "triggers", "note",
@@ -7042,7 +7825,7 @@ class VaultbeatLocalService:
         previous = {
             key: before.get(key)
             for key in compared
-            if after is not None and after.get(key) != before.get(key)
+            if basis is not None and basis.get(key) != before.get(key)
         }
         return {
             "entry_id": existing.entry_id,
@@ -7050,17 +7833,19 @@ class VaultbeatLocalService:
             "previous": previous,
             "server_response": _server_facts(server_response),
             "entry": after,
+            **({"read_back": read_back} if read_back else {}),
         }
 
     async def delete_symptom(self, *, entry_id: str) -> dict[str, Any]:
-        """Erase one reported entry by overwriting its blob with a tombstone.
+        """Erase one reported entry with a tombstone version.
 
         There is no delete endpoint on the agent write path, and adding one
-        would widen what a server token can do. Overwriting instead removes the
-        content itself — the ciphertext that held the symptom is replaced by one
-        holding only the id — and tells every reader, the app included, that
-        the entry is gone. `deleted_entry` hands back what was erased so a
-        mistaken delete can be re-logged.
+        would widen what a server token can do. The tombstone — the entry's id,
+        `deleted`, a timestamp — goes into a blob of its own (GitHub #79, see
+        `_seal_and_write_symptom`), every reader keeps the newest version, and
+        the app's next sync overwrites the entry's own row with it, removing the
+        content for every recipient. `deleted_entry` hands back what was erased
+        so a mistaken delete can be re-logged.
         """
 
         if self._demo:
@@ -7072,11 +7857,148 @@ class VaultbeatLocalService:
             "deleted": True,
             "updatedAt": _symptom_wire_instant(datetime.now(timezone.utc)),
         }
-        server_response = await self._seal_and_write_symptom(config, tombstone)
+        server_response = await self._seal_and_write_symptom(config, tombstone, new_version=True)
         return {
             "entry_id": existing.entry_id,
             "deleted": True,
             "deleted_entry": existing.to_dict(),
+            "server_response": _server_facts(server_response),
+        }
+
+    # ── State of mind (GitHub #13, 2026-10-04) ───────────────────────────────
+
+    async def _read_back_state_of_mind_entry(
+        self, entry_id: str, owner: str | None
+    ) -> dict[str, Any] | None:
+        refreshed = await self.state_of_mind_summary(fresh=True, owner=owner)
+        for owner_group in refreshed.get("owners", []):
+            for row in owner_group.get("records", []):
+                if row.get("entry_id") == entry_id:
+                    found: dict[str, Any] = row
+                    return found
+        return None
+
+    async def log_state_of_mind(
+        self,
+        *,
+        valence: float,
+        labels: list[str] | str | None = None,
+        associations: list[str] | str | None = None,
+        kind: str = "momentaryEmotion",
+        logged_at: str | None = None,
+        date: str | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Encrypt and write one state of mind the person described (agent write).
+
+        One blob per entry (`state_of_mind-` + 16 random bytes, opaque —
+        Invariant 53), sealed for owner + this MCP server. Never touches a day
+        the phone imported from Apple Health. Validation runs before the demo
+        and bind checks so a malformed call reports its real error everywhere.
+        """
+
+        now = datetime.now(timezone.utc)
+        fields = _validate_state_of_mind_fields(
+            valence=valence,
+            labels=labels,
+            associations=associations,
+            kind=kind,
+            logged_at=logged_at,
+            day=date,
+            note=note,
+            now=now,
+        )
+
+        if self._demo:
+            return _demo_write_refusal("log_state_of_mind")
+        config = self._require_agent_write_config()
+
+        entry_id = new_entry_blob_id(METRIC_STATE_OF_MIND)
+        stamp = _symptom_wire_instant(now)
+        payload = _state_of_mind_entry_payload(entry_id, fields, created_at=stamp, updated_at=stamp)
+        client = self._client(config)
+        server_response = await self._seal_and_write_entry(
+            config, payload, metric_type=METRIC_STATE_OF_MIND, write=client.write_state_of_mind_blob
+        )
+        entry, read_back = await self._confirm_write(
+            self._read_back_state_of_mind_entry(entry_id, config.owner_user_id),
+            read_with="get_state_of_mind",
+            as_written=payload,
+        )
+        return {
+            "entry_id": entry_id,
+            "server_response": _server_facts(server_response),
+            "entry": entry,
+            **({"read_back": read_back} if read_back else {}),
+            "apple_health": (
+                "Recorded in Vaultbeat. The person's iPhone shows it once the app syncs "
+                "(app 1.3.0 or later; an older app keeps it without showing it), "
+                "and writes it into Apple Health (State of Mind) only if they turned on "
+                "\"Allow AI to update Apple Health\" in the app — it is off by default. "
+                "The `note` never goes to Apple Health, which has no place for it."
+            ),
+        }
+
+    async def delete_state_of_mind(self, *, entry_id: str) -> dict[str, Any]:
+        """Erase one recorded entry with a tombstone in a NEW blob.
+
+        🔴 Not by rewriting the entry's own row (`delete_symptom` did that until
+        GitHub #79 and now versions the same way): the phone re-seals every entry it pulls (the owner's other servers,
+        and the partner's AI when shared), and `mcp_write_blob` refuses to rewrite
+        a row carrying an envelope this server cannot reproduce
+        (`envelope_recipients_not_coverable`, Invariant 49 (envelope-only-for-readers)) — so after the phone's
+        first sync a rewrite-style delete would fail for good. A tombstone blob of
+        its own (`{entryID: <target>, deleted, updatedAt}`) needs no rewrite;
+        every reader keeps the NEWEST version per `entryID`, and the phone, on its
+        next sync, overwrites the entry's own row with the tombstone for every
+        recipient. No delete endpoint, so the server token's powers do not grow.
+        """
+
+        if self._demo:
+            return _demo_write_refusal("delete_state_of_mind")
+        config = self._require_agent_write_config()
+        if not isinstance(entry_id, str) or not entry_id.strip():
+            raise VaultbeatArgumentRefusedError("entry_id must be a non-empty string")
+        wanted = entry_id.strip()
+        records, _errors = await self._records_for_metric(METRIC_STATE_OF_MIND, limit=None, fresh=True)
+        newest: StateOfMindRecord | None = None
+        for record in records:
+            if not is_state_of_mind_entry_payload(record.payload):
+                continue
+            try:
+                version = parse_state_of_mind_entry(record.payload, owner_user_id=record.owner_user_id)
+            except (KeyError, TypeError, VaultbeatCryptoError, ValueError):
+                continue
+            if version.entry_id == wanted and (
+                newest is None or (version.updated_at or "") >= (newest.updated_at or "")
+            ):
+                newest = version
+        if newest is None:
+            raise VaultbeatArgumentRefusedError(
+                f"no state of mind entry {wanted!r} readable by this server — read `entry_id` "
+                "from get_state_of_mind (records with source \"apple_health\" are edited in Apple Health)"
+            )
+        if newest.deleted:
+            raise VaultbeatArgumentRefusedError(f"state of mind entry {wanted!r} was already deleted")
+        if (newest.owner_user_id or "").lower() != (config.owner_user_id or "").lower():
+            raise VaultbeatArgumentRefusedError(f"state of mind entry {wanted!r} belongs to another account")
+        tombstone = {
+            "entryID": wanted,
+            "deleted": True,
+            "updatedAt": _symptom_wire_instant(datetime.now(timezone.utc)),
+        }
+        client = self._client(config)
+        server_response = await self._seal_and_write_entry(
+            config,
+            tombstone,
+            metric_type=METRIC_STATE_OF_MIND,
+            write=client.write_state_of_mind_blob,
+            blob_id=new_entry_blob_id(METRIC_STATE_OF_MIND),
+        )
+        return {
+            "entry_id": wanted,
+            "deleted": True,
+            "deleted_entry": newest.to_dict(),
             "server_response": _server_facts(server_response),
         }
 
@@ -7352,7 +8274,8 @@ class VaultbeatLocalService:
                 f"No series named {name!r}. Pick one of `available_series` below "
                 "(`list_metric_series` also says how much data backs each). Kinds that "
                 "are not one number per day — workouts, strength, food, notes, symptoms, "
-                "cycle, the sex/age/height profile — have their own tools; sleep nights as a table are "
+                "states of mind (`get_state_of_mind`), cycle, the sex/age/height profile — "
+                "have their own tools; sleep nights as a table are "
                 "`get_sleep_nights`."
             ),
             "available_series": series_catalog(),
@@ -8340,6 +9263,13 @@ class VaultbeatLocalService:
         "vo2max": "2026-07-20",
         "basal_energy": "2026-07-21",
         "hrv_hourly": "2026-07-22",
+        # The sex / age / height profile (GitHub #14): first uploaded by 1.2.9,
+        # live on the App Store 2026-10-05. A release, for the reason below.
+        "profile": "1.2.9",
+        # A release, not a date: the first app that reads Apple Health's State of
+        # Mind and uploads it (GitHub #13). Moods an agent logs exist from the
+        # moment the server is deployed, whatever the app.
+        "state_of_mind": "1.3.0",
     }
 
     #: Records the doctor's round trip decrypts. More than one so that a single

@@ -134,6 +134,11 @@ class FakeCloudClient:
     ) -> dict[str, Any]:
         return await self._record_write(server_token, blob=blob, envelopes=envelopes)
 
+    async def write_state_of_mind_blob(
+        self, server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return await self._record_write(server_token, blob=blob, envelopes=envelopes)
+
     async def report_decrypt_failures(self, server_token: str, *, items: list[dict[str, str]]) -> None:
         if self.report_raises is not None:
             raise self.report_raises
@@ -1051,6 +1056,8 @@ def test_symptom_summary_groups_by_owner_and_skips_not_present(tmp_path: Path) -
     assert summary["errors"] == []
     assert summary["sensitive"] is True
     assert summary["owner_count"] == 2
+    # `limit` cuts two lists, so the unit must not claim it counts days alone.
+    assert summary["coverage"]["requested_unit"] == "days and entries (each list)"
     by_owner = {o["owner_user_id"]: o for o in summary["owners"]}
     her = by_owner["b2b2b2b2-0000-0000-0000-000000000000"]
     # notPresent entries must not inflate the per-type tally.
@@ -2400,12 +2407,12 @@ def test_log_note_creates_and_round_trips(tmp_path: Path) -> None:
     service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
 
     result = asyncio.run(
-        service.log_note(text="今天有点低落，Matt 的合同还没回音", kind="mood", date="2026-07-24")
+        service.log_note(text="Matt 的合同还没回音", kind="general", date="2026-07-24")
     )
 
     assert result["note_id"].startswith("note-")
     assert result["updated_existing_note"] is False
-    assert result["kind"] == "mood"
+    assert result["kind"] == "general"
 
     written_blob = cloud.write_calls[-1]["blob"]
     assert written_blob["metric_type"] == "note"
@@ -2415,8 +2422,8 @@ def test_log_note_creates_and_round_trips(tmp_path: Path) -> None:
 
     note = result["note"]
     assert note is not None
-    assert note["text"].startswith("今天有点低落")
-    assert note["target_kind"] == "mood"
+    assert note["text"].startswith("Matt 的合同")
+    assert note["target_kind"] == "general"
     assert _local_calendar_day(_parse_iso8601(note["target_date"])) == date(2026, 7, 24)
 
 
@@ -2430,15 +2437,17 @@ def test_log_note_same_kind_day_upserts_in_place(tmp_path: Path) -> None:
     assert second["updated_existing_note"] is True
     assert second["note"]["text"] == "v2 修订"
 
-    # A different kind on the same day is a separate note.
-    other = asyncio.run(service.log_note(text="mood note", kind="mood", date="2026-07-24"))
+    # A note about the partner on the same day is a separate note.
+    other = asyncio.run(
+        service.log_note(text="about her", kind="general", date="2026-07-24", partner=True)
+    )
     assert other["note_id"] != first["note_id"]
 
 
 def test_log_note_rejects_ios_kinds_and_empty_text(tmp_path: Path) -> None:
     service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
 
-    for bad_kind in ("sleep", "menstrual", "diary"):
+    for bad_kind in ("sleep", "menstrual", "day", "diary"):
         try:
             asyncio.run(service.log_note(text="x", kind=bad_kind))
             raise AssertionError(f"kind {bad_kind!r} should raise")
@@ -2446,10 +2455,98 @@ def test_log_note_rejects_ios_kinds_and_empty_text(tmp_path: Path) -> None:
             assert "unsupported note kind" in str(error)
 
     try:
-        asyncio.run(service.log_note(text="   ", kind="mood"))
+        asyncio.run(service.log_note(text="   ", kind="general"))
         raise AssertionError("blank text should raise")
     except ValueError as error:
         assert "non-empty" in str(error)
+
+
+def test_log_note_refuses_mood_and_names_log_state_of_mind(tmp_path: Path) -> None:
+    """GitHub #92: with State of Mind live, a mood note recorded one feeling twice
+    (a structured entry plus free text beside it). 0.9.3 refuses the kind and
+    says where the feeling goes instead — for both write tools' shared path,
+    whatever `partner` and `merge` say — and writes nothing."""
+    from vaultbeat_mcp_local.service import VaultbeatArgumentRefusedError
+
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    for kwargs in ({}, {"merge": True}, {"partner": True}):
+        with pytest.raises(VaultbeatArgumentRefusedError) as raised:
+            asyncio.run(service.log_note(text="困和精神累", kind="mood", **kwargs))
+        assert "log_state_of_mind" in str(raised.value)
+        assert "Nothing was saved" in str(raised.value)
+    assert cloud.write_calls == []
+
+
+def test_mood_notes_written_before_0_9_3_stay_readable(tmp_path: Path) -> None:
+    """Retiring the kind is a write-side change only: what earlier versions wrote
+    is still the person's record and still comes back, filter included."""
+    service, cloud, public_key = _bound_service_with_owner_identity(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            json.dumps(
+                {
+                    "noteID": "note-0123456789abcdef0123456789abcdef",
+                    "targetKind": "mood",
+                    "targetDate": "2026-07-23T16:00:00Z",
+                    "text": "今天有点低落",
+                    "createdAt": "2026-07-24T01:00:00Z",
+                    "updatedAt": "2026-07-24T01:00:00Z",
+                }
+            ).encode(),
+            metric_type="note",
+            envelope_id="env-mood",
+            blob_id="note-0123456789abcdef0123456789abcdef",
+            owner_user_id=cloud.owner_user_id,
+        )
+    ]
+
+    summary = asyncio.run(service.notes_summary(target_kind="mood", fresh=True))
+
+    texts = [n["text"] for group in summary["kinds"] for n in group["notes"]]
+    assert texts == ["今天有点低落"]
+
+
+def test_day_notes_from_the_app_are_readable_and_filterable(tmp_path: Path) -> None:
+    """GitHub #71: app 1.3.0 writes what the person says about the day under its
+    own kind, `day` — never the agent's `general`, which `log_note` replaces
+    wholesale. It reads like any other note, the filter included, and sits
+    beside the agent's note for the same day instead of replacing it."""
+    from vaultbeat_mcp_local.service import NOTE_TARGET_KINDS, READABLE_NOTE_KINDS
+
+    assert "day" in NOTE_TARGET_KINDS and "day" in READABLE_NOTE_KINDS
+    service, cloud, public_key = _bound_service_with_owner_identity(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            json.dumps(
+                {
+                    "noteID": note_id,
+                    "targetKind": kind,
+                    "targetDate": "2026-10-11T16:00:00Z",
+                    "text": text,
+                    "createdAt": "2026-10-12T01:00:00Z",
+                    "updatedAt": "2026-10-12T01:00:00Z",
+                }
+            ).encode(),
+            metric_type="note",
+            envelope_id=f"env-{kind}",
+            blob_id=note_id,
+            owner_user_id=cloud.owner_user_id,
+        )
+        for note_id, kind, text in (
+            ("note-0123456789abcdef0123456789abcd01", "day", "视频聊到十一点"),
+            ("note-0123456789abcdef0123456789abcd02", "general", "午饭没吃"),
+        )
+    ]
+
+    everything = asyncio.run(service.notes_summary(fresh=True))
+    assert {group["target_kind"] for group in everything["kinds"]} == {"day", "general"}
+
+    only_day = asyncio.run(service.notes_summary(target_kind="day", fresh=True))
+    texts = [n["text"] for group in only_day["kinds"] for n in group["notes"]]
+    assert texts == ["视频聊到十一点"]
 
 
 # ── 2026-07-24 full-tool sweep fixes ─────────────────────────────────────────
@@ -2919,8 +3016,14 @@ def test_doctor_reports_capability_gap_for_an_older_app(tmp_path: Path) -> None:
 
     assert caps["available"] is True
     gated = caps["possibly_needs_newer_app"]
-    assert set(gated) == {"strength", "food", "vo2max", "basal_energy", "hrv_hourly"}
+    assert set(gated) == {
+        "strength", "food", "vo2max", "basal_energy", "hrv_hourly", "profile", "state_of_mind",
+    }
     assert gated["basal_energy"] == "2026-07-21"
+    assert gated["profile"] == "1.2.9"
+    # A release rather than a date for the newest kind (GitHub #13) — the hint
+    # reads "a build from 1.3.0 or later" either way.
+    assert gated["state_of_mind"] == "1.3.0"
     # It must not claim to know the app version — only that a newer one is needed.
     # (The previous form of this line asserted `"possibly" in "possibly_needs_newer_app"`,
     # a substring check against a literal — always true, testing nothing.)
@@ -3612,7 +3715,7 @@ def test_log_note_replace_mode_reports_what_it_deleted(tmp_path: Path) -> None:
 def test_log_note_fresh_day_reports_nothing_replaced(tmp_path: Path) -> None:
     service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
 
-    result = asyncio.run(service.log_note(text="第一条", kind="mood", date="2026-07-24"))
+    result = asyncio.run(service.log_note(text="第一条", kind="general", date="2026-07-24"))
 
     assert result["replaced_text"] is None
     assert result["updated_existing_note"] is False
@@ -3620,17 +3723,36 @@ def test_log_note_fresh_day_reports_nothing_replaced(tmp_path: Path) -> None:
     # merge=True on a day with no note yet is a plain create, not a leading
     # newline glued onto empty text.
     other = asyncio.run(
-        service.log_note(text="第一条", kind="general", date="2026-07-24", merge=True)
+        service.log_note(text="第一条", kind="general", date="2026-07-25", merge=True)
     )
     assert other["note"]["text"] == "第一条"
     assert other["replaced_text"] is None
 
 
 def test_log_note_merge_is_scoped_to_same_kind_and_day(tmp_path: Path) -> None:
-    """Merging must not vacuum up a different kind's or day's note."""
-    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+    """Merging must not vacuum up a different kind's or day's note — including a
+    mood note an earlier version wrote for the same day (GitHub #92)."""
+    service, cloud, public_key = _bound_service_with_owner_identity(tmp_path)
+    cloud.envelopes = [
+        _make_envelope(
+            public_key,
+            json.dumps(
+                {
+                    "noteID": "note-fedcba9876543210fedcba9876543210",
+                    "targetKind": "mood",
+                    "targetDate": _local_midnight_iso(date(2026, 7, 24)),
+                    "text": "mood 的",
+                    "createdAt": "2026-07-24T01:00:00Z",
+                    "updatedAt": "2026-07-24T01:00:00Z",
+                }
+            ).encode(),
+            metric_type="note",
+            envelope_id="env-old-mood",
+            blob_id="note-fedcba9876543210fedcba9876543210",
+            owner_user_id=cloud.owner_user_id,
+        )
+    ]
 
-    asyncio.run(service.log_note(text="mood 的", kind="mood", date="2026-07-24"))
     asyncio.run(service.log_note(text="前一天的", kind="general", date="2026-07-23"))
     merged = asyncio.run(
         service.log_note(text="今天的", kind="general", date="2026-07-24", merge=True)
@@ -4635,14 +4757,17 @@ def test_attach_coverage_materialises_a_generator_before_counting() -> None:
 _NON_READ_SERVICE_COROUTINES = frozenset(
     {
         "doctor",  # a self-diagnosis report; owns no health rows
+        "delete_state_of_mind",
         "delete_symptom",
         "log_food_entry",
         "log_note",
+        "log_state_of_mind",
         "log_strength_entry",
         "log_symptom",
         "log_weight_entry",
         "poll_once",  # binding lifecycle
         "poll_until_bound",
+        "report_bind_started",  # binding lifecycle: tells the phone bind started (#106)
         "sync_decrypted_records",  # the layer every reader is built ON
         "update_symptom",
         # A catalog, not a reading. One `coverage` block would have to speak for
@@ -5147,6 +5272,7 @@ def test_every_series_method_exists_and_every_readable_kind_has_a_home() -> None
     served_by_own_tool = {
         "menstrual", "symptom", "note", "strength", "food", "workout",
         "profile",  # get_user_profile (GitHub #14)
+        "state_of_mind",  # get_state_of_mind (GitHub #13)
     }
     retired = {"fact"}
     unhomed = set(KNOWN_METRIC_TYPES) - served_by_series - served_by_own_tool - retired
@@ -5758,6 +5884,33 @@ def test_log_symptom_refuses_what_it_cannot_store_honestly(tmp_path: Path) -> No
     assert cloud.write_calls == []
 
 
+def test_a_symptom_logged_now_is_filed_under_the_local_day_not_the_utc_day() -> None:
+    """07:30 in Beijing is 23:30 UTC the day before — "我肚子疼" belongs to today."""
+    import os
+    import time
+    from datetime import datetime, timezone
+
+    from vaultbeat_mcp_local.service import _validate_symptom_fields
+
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "Asia/Shanghai"
+    time.tzset()
+    try:
+        fields = _validate_symptom_fields(
+            symptom_type="abdominal_cramps", severity="mild", onset_at=None, end_at=None,
+            day=None, display_name=None, body_location=None, triggers=None, note=None,
+            default_onset=datetime(2026, 10, 3, 23, 30, tzinfo=timezone.utc),
+        )
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+    assert fields["localDate"] == "2026-10-04"
+    assert fields["onsetAt"] == "2026-10-03T23:30:00Z"
+
+
 def test_update_symptom_changes_only_what_it_is_given(tmp_path: Path) -> None:
     service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
     logged = asyncio.run(
@@ -5794,7 +5947,7 @@ def test_update_symptom_changes_only_what_it_is_given(tmp_path: Path) -> None:
     assert cleared["previous"]["end_at"] is not None
 
 
-def test_delete_symptom_leaves_nothing_but_a_tombstone(tmp_path: Path) -> None:
+def test_delete_symptom_tombstones_into_a_new_blob(tmp_path: Path) -> None:
     service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
     logged = asyncio.run(
         service.log_symptom(symptom_type="nausea", note="written to the wrong person")
@@ -5804,16 +5957,186 @@ def test_delete_symptom_leaves_nothing_but_a_tombstone(tmp_path: Path) -> None:
 
     assert deleted["deleted"] is True
     assert deleted["deleted_entry"]["note"] == "written to the wrong person"
-    # The ciphertext that held the symptom now holds only the id.
-    payload = _symptom_payloads(service)[logged["entry_id"]]
-    assert set(payload) == {"entryID", "deleted", "updatedAt"}
-    assert cloud.write_calls[-1]["blob"]["id"] == logged["entry_id"]
+    # A version of its own (GitHub #79), never a rewrite of the entry's row.
+    assert cloud.write_calls[-1]["blob"]["id"] != logged["entry_id"]
+    records, _errors = asyncio.run(service._records_for_metric("symptom", limit=None, fresh=True))
+    tombstones = [r.payload for r in records if r.payload.get("deleted") is True]
+    assert [set(t) for t in tombstones] == [{"entryID", "deleted", "updatedAt"}]
+    assert tombstones[0]["entryID"] == logged["entry_id"]
+    # The live version is still in the cloud until the app re-seals; every read
+    # keeps the newest, so the entry is gone.
     assert _reported(asyncio.run(service.symptom_summary(fresh=True))) == []
     # A deleted entry cannot be edited or deleted again.
     with pytest.raises(ValueError, match="already deleted"):
         asyncio.run(service.delete_symptom(entry_id=logged["entry_id"]))
+    with pytest.raises(ValueError, match="already deleted"):
+        asyncio.run(service.update_symptom(entry_id=logged["entry_id"], severity="mild"))
     with pytest.raises(ValueError, match="no symptom entry"):
         asyncio.run(service.update_symptom(entry_id="symptom-missing", severity="mild"))
+
+
+def test_update_and_delete_still_work_after_the_app_re_sealed_the_entry(tmp_path: Path) -> None:
+    """GitHub #79: once the app re-seals an entry for the owner's other servers,
+    `mcp_write_blob` refuses any rewrite of that row from one server
+    (`envelope_recipients_not_coverable`). Updates and deletes must not need one."""
+    from vaultbeat_mcp_local.client import VaultbeatRecordNotAgentWritableError
+
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+    logged = asyncio.run(
+        service.log_symptom(symptom_type="headache", onset_at="2026-10-04T08:00:00+08:00")
+    )
+    resealed = {logged["entry_id"]}
+    original_write = cloud.write_symptom_blob
+
+    async def refuse_rewrites(server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]) -> dict[str, Any]:
+        if blob["id"] in resealed:
+            raise VaultbeatRecordNotAgentWritableError(["mcp_server"])
+        return await original_write(server_token, blob=blob, envelopes=envelopes)
+
+    cloud.write_symptom_blob = refuse_rewrites  # type: ignore[method-assign]
+
+    updated = asyncio.run(
+        service.update_symptom(entry_id=logged["entry_id"], end_at="2026-10-04T09:00:00+08:00")
+    )
+    assert updated["entry"]["end_recorded"] is True
+    assert _reported(asyncio.run(service.symptom_summary(fresh=True)))[0]["end_recorded"] is True
+
+    asyncio.run(service.delete_symptom(entry_id=logged["entry_id"]))
+    assert _reported(asyncio.run(service.symptom_summary(fresh=True))) == []
+
+
+def _refuse_rewrites_of(cloud: FakeCloudClient, method: str, resealed: set[str]) -> list[str]:
+    """Make `method` answer like `mcp_write_blob` does for a row the phone has
+    re-sealed for another of the owner's servers (`envelope_recipients_not_coverable`).
+    Returns the list of blob ids it refused, in order."""
+    from vaultbeat_mcp_local.client import VaultbeatRecordNotAgentWritableError
+
+    original = getattr(cloud, method)
+    refused: list[str] = []
+
+    async def write(server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]) -> dict[str, Any]:
+        if blob["id"] in resealed:
+            refused.append(blob["id"])
+            raise VaultbeatRecordNotAgentWritableError(["mcp_server"])
+        result: dict[str, Any] = await original(server_token, blob=blob, envelopes=envelopes)
+        return result
+
+    setattr(cloud, method, write)
+    return refused
+
+
+def _payloads(service: VaultbeatLocalService, metric: str) -> list[tuple[str, dict[str, Any]]]:
+    records, _errors = asyncio.run(service._records_for_metric(metric, limit=None, fresh=True))
+    return [(r.blob_id, r.payload) for r in records]
+
+
+def test_a_note_the_phone_resealed_for_two_servers_takes_a_version_row(tmp_path: Path) -> None:
+    """GitHub #93: from 1.3.0 the phone pulls an AI's note and re-seals it for every
+    server of the owner, after which `mcp_write_blob` refuses a rewrite from any one
+    of them. `log_note_append` on that day must still land — as a version row."""
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+    first = asyncio.run(service.log_note(text="left the office at nine", date="2026-10-08", merge=True))
+    note_id = first["note_id"]
+    refused = _refuse_rewrites_of(cloud, "write_note_blob", {note_id})
+
+    second = asyncio.run(service.log_note(text="slept badly after", date="2026-10-08", merge=True))
+
+    assert refused == [note_id]
+    assert second["note_id"] == note_id
+    assert second["updated_existing_note"] is True
+    version_blob = cloud.write_calls[-1]["blob"]
+    assert version_blob["id"] != note_id and version_blob["id"].startswith("note-")
+    assert {e["recipient_kind"] for e in cloud.write_calls[-1]["envelopes"]} == {"owner_user", "mcp_server"}
+    # Every read keeps the newest version: one note, holding both lines.
+    notes = asyncio.run(service.notes_summary(target_kind="general", fresh=True))["kinds"][0]["notes"]
+    assert [n["text"] for n in notes] == ["left the office at nine\nslept badly after"]
+
+    # A third line builds on the version row (the newest), not on the stale own row.
+    asyncio.run(service.log_note(text="woke at six", date="2026-10-08", merge=True))
+    notes = asyncio.run(service.notes_summary(target_kind="general", fresh=True))["kinds"][0]["notes"]
+    assert [n["text"] for n in notes] == ["left the office at nine\nslept badly after\nwoke at six"]
+    rows = [(blob_id, payload) for blob_id, payload in _payloads(service, "note") if payload["noteID"] == note_id]
+    assert len(rows) == 3  # the own row and two version rows, each a different blob
+
+
+def test_a_note_rewrite_on_a_one_server_account_stays_in_place(tmp_path: Path) -> None:
+    """The fallback is for refusals only: with one server the rewrite is accepted
+    over the note's own row exactly as before, and no row is added per edit."""
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+    first = asyncio.run(service.log_note(text="one", date="2026-10-08", merge=True))
+    asyncio.run(service.log_note(text="two", date="2026-10-08", merge=True))
+
+    assert [call["blob"]["id"] for call in cloud.write_calls] == [first["note_id"], first["note_id"]]
+    assert len(_payloads(service, "note")) == 1
+
+
+def test_food_and_strength_days_the_phone_resealed_take_a_version_row(tmp_path: Path) -> None:
+    """GitHub #93, same shape: the food and strength pulls have re-sealed agent days
+    for every server since July (2 food rows of a two-server account on
+    2026-10-09). A merge into such a day must land instead of answering 409."""
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+    food = asyncio.run(service.log_food_entry(
+        date="2026-10-08", meals=[{"name": "breakfast", "items": [{"food": "oats"}]}]
+    ))
+    lift = asyncio.run(service.log_strength_entry(
+        date="2026-10-08", exercises=[{"name": "squat", "sets": [{"weightKg": 60, "reps": 5}]}]
+    ))
+    refused_food = _refuse_rewrites_of(cloud, "write_food_blob", {food["entry_id"]})
+    refused_lift = _refuse_rewrites_of(cloud, "write_strength_blob", {lift["entry_id"]})
+
+    food_again = asyncio.run(service.log_food_entry(
+        date="2026-10-08", meals=[{"name": "lunch", "items": [{"food": "rice"}]}], merge=True
+    ))
+    lift_again = asyncio.run(service.log_strength_entry(
+        date="2026-10-08", exercises=[{"name": "row", "sets": [{"weightKg": 40, "reps": 8}]}], merge=True
+    ))
+
+    assert refused_food == [food["entry_id"]] and refused_lift == [lift["entry_id"]]
+    assert food_again["entry_id"] == food["entry_id"]
+    assert lift_again["entry_id"] == lift["entry_id"]
+    days = asyncio.run(service.food_summary(fresh=True))["days"]
+    assert [[m["name"] for m in d["meals"]] for d in days] == [["breakfast", "lunch"]]
+    sessions = asyncio.run(service.strength_summary(fresh=True))["sessions"]
+    assert [[x["name"] for x in s["exercises"]] for s in sessions] == [["squat", "row"]]
+    assert "duplicate_sessions" not in asyncio.run(service.strength_summary(fresh=True))
+
+
+def test_entry_stamps_are_whole_seconds_and_always_move_forward() -> None:
+    """Invariant 96's tie needs the phone's re-upload to say the same instant as the
+    version row, and the phone's encoder drops fractions (GitHub #93)."""
+    from datetime import timezone
+
+    from vaultbeat_mcp_local.service import _entry_stamps
+
+    now = datetime(2026, 10, 9, 3, 0, 4, 900000, tzinfo=timezone.utc)
+    assert _entry_stamps(None, None, now=now) == ("2026-10-09T03:00:04Z", "2026-10-09T03:00:04Z")
+    # A pre-0.9.3 version in the same second would otherwise beat its own rewrite.
+    assert _entry_stamps("2026-10-01T01:02:03.456789Z", "2026-10-09T03:00:04.500000Z", now=now) == (
+        "2026-10-01T01:02:03Z",
+        "2026-10-09T03:00:05Z",
+    )
+    # A previous version stamped in the future (another machine's clock) is still passed.
+    assert _entry_stamps(None, "2026-10-09T05:00:00+00:00", now=now)[1] == "2026-10-09T05:00:01Z"
+    assert _entry_stamps("not a date", "2026-10-08T00:00:00Z", now=now) == (
+        "2026-10-09T03:00:04Z",
+        "2026-10-09T03:00:04Z",
+    )
+
+
+def test_versions_are_ordered_by_instant_not_by_string() -> None:
+    from vaultbeat_mcp_local.service import NoteRecord, summarize_notes
+
+    def note(updated: str, text: str) -> NoteRecord:
+        return NoteRecord(
+            note_id="note-" + "a" * 32, target_kind="general", target_date="2026-10-08T16:00:00Z",
+            text=text, created_at="2026-10-08T16:00:00Z", updated_at=updated, owner_user_id="u",
+        )
+
+    # As strings "…04Z" sorts after "…04.5Z"; as instants it is earlier.
+    kept = summarize_notes([note("2026-10-09T03:00:04.500000Z", "newer"), note("2026-10-09T03:00:04Z", "older")])
+    assert [n["text"] for n in kept["kinds"][0]["notes"]] == ["newer"]
+    kept = summarize_notes([note("2026-10-09T03:00:05Z", "newer"), note("2026-10-09T03:00:04.999999+00:00", "older")])
+    assert [n["text"] for n in kept["kinds"][0]["notes"]] == ["newer"]
 
 
 def test_reported_entries_sit_beside_healthkit_days_without_changing_them(tmp_path: Path) -> None:
@@ -6045,3 +6368,413 @@ def test_a_cached_error_line_has_its_row_id_checked_again() -> None:
         "<invalid-id>: decrypt_failed (KeyError)",
         "a line written here whole",
     ]
+
+
+# ── State of mind (GitHub #13, 2026-10-04) ───────────────────────────────────
+
+
+def _state_of_mind_payloads(service: VaultbeatLocalService) -> dict[str, dict[str, Any]]:
+    """Every decrypted state_of_mind plaintext this server can read, by blob id."""
+
+    records, _errors = asyncio.run(service._records_for_metric("state_of_mind", limit=None, fresh=True))
+    return {record.payload.get("entryID") or record.payload.get("dayID"): record.payload for record in records}
+
+
+def _state_of_mind_records(result: dict[str, Any]) -> list[dict[str, Any]]:
+    return [row for owner in result["owners"] for row in owner["records"]]
+
+
+def _apple_health_mood_day(day_id: str, *samples: dict[str, Any]) -> dict[str, Any]:
+    return {"dayID": day_id, "dayStartDate": "2026-10-02T16:00:00Z", "samples": list(samples)}
+
+
+def test_log_state_of_mind_writes_one_sealed_entry_in_apples_vocabulary(tmp_path: Path) -> None:
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    result = asyncio.run(
+        service.log_state_of_mind(
+            valence=-0.55,
+            labels=["Drained", "stressed", "drained"],
+            associations=["work", "self_care"],
+            logged_at="2026-10-03T19:20:00+08:00",
+            note="  deadline week  ",
+        )
+    )
+
+    entry_id = result["entry_id"]
+    assert entry_id.startswith("state_of_mind-") and len(entry_id) == len("state_of_mind-") + 32
+    write = cloud.write_calls[-1]
+    assert write["blob"]["id"] == entry_id
+    assert write["blob"]["metric_type"] == "state_of_mind"
+    assert {e["recipient_kind"] for e in write["envelopes"]} == {"owner_user", "mcp_server"}
+
+    # The wire shape the app decodes and maps onto HKStateOfMind: Apple's own
+    # token spellings, whole-second UTC instants, the writer's own day.
+    payload = _state_of_mind_payloads(service)[entry_id]
+    assert payload["kind"] == "momentaryEmotion"
+    assert payload["valence"] == -0.55
+    assert payload["labels"] == ["drained", "stressed"]
+    assert payload["associations"] == ["work", "selfCare"]
+    assert payload["loggedAt"] == "2026-10-03T11:20:00Z"
+    assert payload["localDate"] == "2026-10-03"
+    assert payload["note"] == "deadline week"
+    assert "." not in payload["createdAt"] and payload["createdAt"].endswith("Z")
+
+    entry = result["entry"]
+    assert entry is not None
+    assert entry["source"] == "ai"
+    assert entry["valence_classification"] == "unpleasant"
+    assert "Allow AI to update Apple Health" in result["apple_health"]
+
+
+def test_log_state_of_mind_never_invents_a_moment_or_a_feeling(tmp_path: Path) -> None:
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    # A daily mood about yesterday may name only the day — no fabricated hour.
+    daily = asyncio.run(service.log_state_of_mind(valence=0.3, kind="daily", logged_at="2026-10-02"))
+    payload = _state_of_mind_payloads(service)[daily["entry_id"]]
+    assert payload["kind"] == "dailyMood"
+    assert "loggedAt" not in payload
+    assert payload["localDate"] == "2026-10-02"
+    # No labels given → an empty list, not a guessed word.
+    assert payload["labels"] == [] and payload["associations"] == []
+    assert "note" not in payload
+
+    writes_before = len(cloud.write_calls)
+    with pytest.raises(ValueError, match="needs a moment"):
+        asyncio.run(service.log_state_of_mind(valence=0.3, logged_at="2026-10-02"))
+    with pytest.raises(ValueError, match="between -1 and 1"):
+        asyncio.run(service.log_state_of_mind(valence=1.5))
+    with pytest.raises(ValueError, match="a number"):
+        asyncio.run(service.log_state_of_mind(valence=True))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="not one of Apple Health's labels"):
+        asyncio.run(service.log_state_of_mind(valence=-0.2, labels=["sleepy"]))
+    with pytest.raises(ValueError, match="not one of Apple Health's associations"):
+        asyncio.run(service.log_state_of_mind(valence=-0.2, associations=["school"]))
+    with pytest.raises(ValueError, match="momentaryEmotion"):
+        asyncio.run(service.log_state_of_mind(valence=-0.2, kind="weekly"))
+    with pytest.raises(ValueError, match="future"):
+        asyncio.run(service.log_state_of_mind(valence=-0.2, logged_at="2099-01-01T10:00+08:00"))
+    assert len(cloud.write_calls) == writes_before
+
+
+def test_a_mood_logged_now_is_filed_under_the_local_day_not_the_utc_day() -> None:
+    """07:30 in Beijing is 23:30 UTC the day before — the person's day wins."""
+    import os
+    import time
+    from datetime import datetime, timezone
+
+    from vaultbeat_mcp_local.service import _validate_state_of_mind_fields
+
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "Asia/Shanghai"
+    time.tzset()
+    try:
+        fields = _validate_state_of_mind_fields(
+            valence=0.1, labels=None, associations=None, kind="momentaryEmotion",
+            logged_at=None, day=None, note=None,
+            now=datetime(2026, 10, 3, 23, 30, tzinfo=timezone.utc),
+        )
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+    assert fields["localDate"] == "2026-10-04"
+    assert fields["loggedAt"] == "2026-10-03T23:30:00Z"
+
+
+def test_valence_classification_matches_apples_seven_equal_bands() -> None:
+    from vaultbeat_mcp_local.service import valence_classification
+
+    # The boundaries measured from HealthKit itself (see STATE_OF_MIND_CLASSIFICATIONS).
+    assert valence_classification(-1.0) == "veryUnpleasant"
+    assert valence_classification(-0.7143) == "veryUnpleasant"
+    assert valence_classification(-0.7142) == "unpleasant"
+    assert valence_classification(-0.4285) == "slightlyUnpleasant"
+    assert valence_classification(-0.1428) == "neutral"
+    assert valence_classification(0.0) == "neutral"
+    assert valence_classification(0.1428) == "neutral"
+    assert valence_classification(0.1429) == "slightlyPleasant"
+    assert valence_classification(0.4286) == "pleasant"
+    assert valence_classification(0.7143) == "veryPleasant"
+    assert valence_classification(1.0) == "veryPleasant"
+    assert valence_classification(1.01) is None
+    assert valence_classification(True) is None  # type: ignore[arg-type]
+
+
+def test_delete_state_of_mind_tombstones_into_a_new_blob(tmp_path: Path) -> None:
+    """Never a rewrite of the entry's own row: once the phone has re-sealed it for
+    more recipients, `mcp_write_blob` refuses that rewrite for good (Invariant 49)."""
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+    logged = asyncio.run(service.log_state_of_mind(valence=-0.8, labels=["sad"], note="wrong person"))
+
+    deleted = asyncio.run(service.delete_state_of_mind(entry_id=logged["entry_id"]))
+
+    assert deleted["deleted"] is True
+    assert deleted["deleted_entry"]["note"] == "wrong person"
+    tombstone_write = cloud.write_calls[-1]
+    assert tombstone_write["blob"]["id"] != logged["entry_id"]
+    assert tombstone_write["blob"]["id"].startswith("state_of_mind-")
+    records, _errors = asyncio.run(service._records_for_metric("state_of_mind", limit=None, fresh=True))
+    tombstones = [r.payload for r in records if r.payload.get("deleted") is True]
+    assert tombstones == [
+        {"entryID": logged["entry_id"], "deleted": True, "updatedAt": tombstones[0]["updatedAt"]}
+    ]
+    # Both versions are in the cloud; every read keeps the newest.
+    assert _state_of_mind_records(asyncio.run(service.state_of_mind_summary(fresh=True))) == []
+    with pytest.raises(ValueError, match="already deleted"):
+        asyncio.run(service.delete_state_of_mind(entry_id=logged["entry_id"]))
+    with pytest.raises(ValueError, match="no state of mind entry"):
+        asyncio.run(service.delete_state_of_mind(entry_id="state_of_mind-missing"))
+
+
+def test_state_of_mind_reads_both_sources_and_counts_a_sample_once(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service_with_owner_identity(tmp_path)
+    sample = {
+        "sampleID": "6B1E7C1A-0000-4000-8000-000000000001",
+        "startDate": "2026-10-03T13:00:00Z",
+        "kind": "dailyMood",
+        "valence": 0.6,
+        "labels": ["content", "grateful"],
+        "associations": ["partner"],
+        "sourceName": "Health",
+    }
+    # The same Apple Health sample, uploaded by two of the person's devices.
+    for device, envelope_id in (("abcd1234", "env-a"), ("ef015678", "env-b")):
+        day = _apple_health_mood_day(f"state_of_mind-{device}-1790000000", sample)
+        cloud.envelopes.append(
+            _make_envelope(
+                public_key, json.dumps(day).encode(), metric_type="state_of_mind",
+                envelope_id=envelope_id, blob_id=day["dayID"], owner_user_id=cloud.owner_user_id,
+            )
+        )
+    asyncio.run(
+        service.log_state_of_mind(
+            valence=-0.3, labels=["stressed"], logged_at="2026-10-04T09:00:00+08:00"
+        )
+    )
+
+    result = asyncio.run(service.state_of_mind_summary(fresh=True, owner=cloud.owner_user_id, limit=50))
+
+    assert result["sensitive"] is True
+    owner = result["owners"][0]
+    assert owner["record_count"] == 2
+    assert owner["from_apple_health"] == 1 and owner["from_ai"] == 1
+    records = owner["records"]
+    # Newest first, across sources.
+    assert [r["source"] for r in records] == ["ai", "apple_health"]
+    assert records[1]["app"] == "Health"
+    assert records[1]["valence_classification"] == "pleasant"
+    assert "entry_id" not in records[1] and "note" not in records[1]
+    # Lean rows: the owner is on the group, the sample id only deduplicates.
+    assert "owner_user_id" not in records[1] and "sample_id" not in records[1]
+    assert owner["classification_counts"] == {"slightlyUnpleasant": 1, "pleasant": 1}
+    assert owner["label_counts"] == {"stressed": 1, "content": 1, "grateful": 1}
+    daily = {row["local_date"]: row for row in owner["daily"]}
+    assert daily["2026-10-04"]["count"] == 1
+    assert daily["2026-10-04"]["daily_mood_valence"] is None
+    assert result["coverage"]["requested_unit"] == "records"
+    assert result["coverage"]["total_available"] == 2
+    assert result["coverage"]["more_available"] is False
+
+    # `limit` counts records after the duplicate is gone, and says what it left.
+    cut = asyncio.run(service.state_of_mind_summary(fresh=True, owner=cloud.owner_user_id, limit=1))
+    assert [r["source"] for r in _state_of_mind_records(cut)] == ["ai"]
+    assert cut["coverage"]["more_available"] is True
+
+
+def test_an_apple_health_mood_cannot_be_deleted_from_here(tmp_path: Path) -> None:
+    service, cloud, public_key = _bound_service_with_owner_identity(tmp_path)
+    day = _apple_health_mood_day(
+        "state_of_mind-abcd1234-1790000000",
+        {"sampleID": "S1", "startDate": "2026-10-03T13:00:00Z", "kind": "momentaryEmotion",
+         "valence": 0.2, "labels": [], "associations": []},
+    )
+    cloud.envelopes.append(
+        _make_envelope(
+            public_key, json.dumps(day).encode(), metric_type="state_of_mind",
+            envelope_id="env-hk", blob_id=day["dayID"], owner_user_id=cloud.owner_user_id,
+        )
+    )
+    with pytest.raises(ValueError, match="edited in Apple Health"):
+        asyncio.run(service.delete_state_of_mind(entry_id=day["dayID"]))
+    assert cloud.write_calls == []
+
+
+def _a_year_of_daily_moods(tmp_path: Path) -> tuple[Any, Any]:
+    """A daily logger's year: one Apple Health daily mood a day, 2025-10-04 on."""
+    from datetime import timezone
+
+    service, cloud, public_key = _bound_service_with_owner_identity(tmp_path)
+    for index in range(365):
+        day = datetime(2025, 10, 4, tzinfo=timezone.utc) + timedelta(days=index)
+        payload = _apple_health_mood_day(
+            f"state_of_mind-abcd1234-{int(day.timestamp())}",
+            {
+                "sampleID": f"6B1E7C1A-0000-4000-8000-{index:012d}",
+                "startDate": (day + timedelta(hours=13)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "kind": "dailyMood",
+                "valence": 0.4123456789,
+                "labels": ["content", "grateful"],
+                "associations": ["partner", "work"],
+                "sourceName": "Health",
+            },
+        )
+        cloud.envelopes.append(
+            _make_envelope(
+                public_key, json.dumps(payload).encode(), metric_type="state_of_mind",
+                envelope_id=f"env-{index}", blob_id=payload["dayID"], owner_user_id=cloud.owner_user_id,
+            )
+        )
+    return service, cloud
+
+
+def _result_bytes(result: dict[str, Any]) -> int:
+    return len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode())
+
+
+def test_the_default_mood_page_fits_the_result_cap_for_a_daily_logger(tmp_path: Path) -> None:
+    """`get_state_of_mind`'s default must not answer `result_too_large` for an
+    ordinary user — 200 rows did, at about four months of daily logging. The
+    page is ~three months, not the year: the year itself does NOT fit, which is
+    why older moods are read by window (GitHub #82)."""
+    from vaultbeat_mcp_local.mcp_server import MAX_RESULT_BYTES, STATE_OF_MIND_DEFAULT_LIMIT
+
+    service, _cloud = _a_year_of_daily_moods(tmp_path)
+    default_limit = STATE_OF_MIND_DEFAULT_LIMIT
+    result = asyncio.run(service.state_of_mind_summary(fresh=True, limit=default_limit))
+    assert result["coverage"]["more_available"] is True
+    assert _result_bytes(result) < MAX_RESULT_BYTES, f"{_result_bytes(result)} bytes at limit={default_limit}"
+    whole_year = asyncio.run(service.state_of_mind_summary(fresh=True, limit=None))
+    assert _result_bytes(whole_year) > MAX_RESULT_BYTES
+
+
+def test_a_window_reaches_the_moods_the_default_page_leaves_behind(tmp_path: Path) -> None:
+    """GitHub #82: with only `limit`, a daily logger's moods older than ~130
+    records were unreachable — a larger limit answered `result_too_large`."""
+    from vaultbeat_mcp_local.mcp_server import MAX_RESULT_BYTES
+
+    service, _cloud = _a_year_of_daily_moods(tmp_path)
+    first_quarter = asyncio.run(
+        service.state_of_mind_summary(fresh=True, since="2025-10-01", until="2025-12-31")
+    )
+    days = sorted(r["local_date"] for r in _state_of_mind_records(first_quarter))
+    assert days[0] == "2025-10-04" and days[-1] == "2025-12-31" and len(days) == 89
+    assert _result_bytes(first_quarter) < MAX_RESULT_BYTES
+    assert first_quarter["range"] == {"since": "2025-10-01", "until": "2025-12-31"}
+    # Nothing is older than a window that starts before the history does.
+    assert first_quarter["coverage"]["more_available"] is False
+    assert first_quarter["coverage"]["oldest_available"] == "2025-10-04"
+
+    later = asyncio.run(service.state_of_mind_summary(fresh=True, since="2026-03-01", until="2026-03-31"))
+    assert {r["local_date"][:7] for r in _state_of_mind_records(later)} == {"2026-03"}
+    assert later["coverage"]["more_available"] is True
+
+    # A window narrows; `limit` still cuts inside it when passed.
+    cut = asyncio.run(service.state_of_mind_summary(fresh=True, since="2026-03-01", limit=5))
+    assert len(_state_of_mind_records(cut)) == 5
+
+    refused = asyncio.run(service.state_of_mind_summary(fresh=True, since="2026-3-1"))
+    assert refused["error"] == "invalid_since"
+    backwards = asyncio.run(service.state_of_mind_summary(fresh=True, since="2026-04-01", until="2026-03-01"))
+    assert backwards["error"] == "invalid_range"
+
+
+# ── GitHub #84: a write that landed must not be reported as failed ───────────
+
+
+def _fail_reads_after_writes(cloud: FakeCloudClient, writes: int) -> None:
+    """From the `writes`-th write on, every read raises — the 2026-10-05 shape:
+    the write returned 200, the confirming re-read died."""
+    from vaultbeat_mcp_local.client import VaultbeatCloudError
+
+    real_sync = cloud.sync
+
+    async def _sync(server_token: str, *, metric_type: str | None = None) -> list[dict[str, Any]]:
+        if len(cloud.write_calls) >= writes:
+            raise VaultbeatCloudError("mcp-sync 500 stage=catalog", status_code=500)
+        return await real_sync(server_token, metric_type=metric_type)
+
+    cloud.sync = _sync  # type: ignore[method-assign]
+
+
+_WRITE_TOOLS: tuple[tuple[str, dict[str, Any], str], ...] = (
+    ("log_symptom", {"symptom_type": "headache", "severity": "mild"}, "entry"),
+    ("log_state_of_mind", {"valence": -0.4, "labels": ["drained"]}, "entry"),
+    ("log_note", {"text": "一件事", "date": "2026-10-05"}, "note"),
+    ("log_note", {"text": "下午又一件", "date": "2026-10-05", "merge": True}, "note"),
+    ("log_food_entry", {"date": "2026-10-05", "meals": [{"name": "lunch", "items": [{"food": "面"}]}]}, "day"),
+    (
+        "log_strength_entry",
+        {"date": "2026-10-05", "exercises": [{"name": "深蹲", "sets": [{"weightKg": 60, "reps": 5}]}]},
+        "session",
+    ),
+    ("log_weight_entry", {"weight_kg": 70.2, "date": "2026-10-05"}, "latest_after_write"),
+)
+
+
+@pytest.mark.parametrize(("tool", "kwargs", "entry_key"), _WRITE_TOOLS)
+def test_a_landed_write_whose_re_read_fails_still_reports_success(
+    tmp_path: Path, tool: str, kwargs: dict[str, Any], entry_key: str
+) -> None:
+    """GitHub #84: `log_symptom` answered "Error executing tool" for a write the
+    cloud had accepted, because the confirming re-read died. An agent told the
+    write failed retries, and every id-minting tool then records it twice. The
+    result must carry the write's identity and say plainly not to repeat it."""
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+    _fail_reads_after_writes(cloud, writes=1)
+
+    result = asyncio.run(getattr(service, tool)(**kwargs))
+
+    assert len(cloud.write_calls) == 1, "exactly one write, and it landed"
+    assert result["server_response"]["upserted_blobs"] == 1
+    assert result.get("entry_id") or result.get("note_id") or result.get("day_id")
+    assert not result[entry_key], "nothing was re-read, so nothing may be shown as re-read"
+    read_back = result["read_back"]
+    assert read_back["ok"] is False
+    assert read_back["error_class"] == "VaultbeatCloudError"
+    assert "Do not repeat the write" in read_back["note"]
+    assert read_back["as_written"], "what was sent is the agent's only view of the write"
+    assert "mcp-sync 500" not in read_back["note"], "the cloud's text stays out (Anti-pattern 23)"
+
+
+def test_a_confirmed_write_carries_no_read_back_block(tmp_path: Path) -> None:
+    """The success shape is unchanged when the re-read works."""
+    service, _cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+    result = asyncio.run(service.log_symptom(symptom_type="nausea"))
+    assert "read_back" not in result
+    assert result["entry"] and result["entry"]["entry_id"] == result["entry_id"]
+
+
+def test_update_symptom_with_a_failed_re_read_still_names_what_changed(tmp_path: Path) -> None:
+    """Without the re-read, `changed_fields` used to come out empty — a claim
+    that the update changed nothing. It is computed from what was sent."""
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+    logged = asyncio.run(
+        service.log_symptom(symptom_type="headache", severity="mild", onset_at="2026-09-30T08:00:00+08:00")
+    )
+    _fail_reads_after_writes(cloud, writes=2)
+
+    updated = asyncio.run(service.update_symptom(entry_id=logged["entry_id"], severity="severe"))
+
+    assert updated["read_back"]["ok"] is False
+    assert updated["changed_fields"] == ["severity"]
+    assert updated["previous"] == {"severity": "mild"}
+    assert updated["entry"] is None
+
+
+def test_a_write_the_cloud_refused_still_raises(tmp_path: Path) -> None:
+    """Only the CONFIRMATION is forgiven. A write that did not land must still
+    fail loudly, or the agent believes something was saved that was not."""
+    from vaultbeat_mcp_local.client import VaultbeatCloudError
+
+    service, cloud, _public_key = _bound_service_with_owner_identity(tmp_path)
+
+    async def _refuse(server_token: str, *, blob: dict[str, Any], envelopes: list[dict[str, Any]]) -> dict[str, Any]:
+        raise VaultbeatCloudError("refused", status_code=500)
+
+    cloud.write_symptom_blob = _refuse  # type: ignore[method-assign]
+    with pytest.raises(VaultbeatCloudError):
+        asyncio.run(service.log_symptom(symptom_type="headache"))

@@ -1,8 +1,12 @@
 # Vaultbeat Apple Health MCP Server
 
-**Your Apple Health data — sleep stages, cycle, HRV, resting heart rate, workouts, weight, VO₂ max, meals, lifts, notes, symptoms — readable and writable by your own AI agent (Claude Code, Claude Desktop, Codex, Hermes, OpenClaw, anything that speaks MCP), end-to-end encrypted so that only your machine ever sees plaintext.**
+[![Vaultbeat MCP server on Glama](https://glama.ai/mcp/servers/Fino-wind/vaultbeat-apple-health/badges/score.svg)](https://glama.ai/mcp/servers/Fino-wind/vaultbeat-apple-health)
+[![mcp.market grade](https://mcp.market/badge/fino-wind-vaultbeat-apple-health.svg)](https://mcp.market/server/fino-wind-vaultbeat-apple-health)
+[![Listed on mcpservers.org](https://mcpservers.org/badge.svg)](https://mcpservers.org/servers/fino-wind/vaultbeat-apple-health)
 
-The [Vaultbeat](https://vaultbeat.app) iPhone app reads HealthKit and encrypts every record on the phone. This package is the local server your agent talks to: it downloads the ciphertext, decrypts it on your machine, and serves it over MCP.
+**Your Apple Health data — sleep stages, cycle, HRV, resting heart rate, workouts, weight, VO₂ max, meals, lifts, notes, symptoms, moods (State of Mind) — readable and writable by your own AI agent (Claude Code, Claude Desktop, Codex, Hermes, OpenClaw, anything that speaks MCP), end-to-end encrypted so that only your machine ever sees plaintext.**
+
+The [Vaultbeat](https://vaultbeat.app/?utm_source=ai_agent_pypi) iPhone app reads HealthKit and encrypts every record on the phone. This package is the local server your agent talks to: it downloads the ciphertext, decrypts it on your machine, and serves it over MCP.
 
 ```
 iPhone (HealthKit → Vaultbeat app, encrypts) ──► cloud (ciphertext only) ──► this server (decrypts locally) ──MCP──► your agent
@@ -12,7 +16,7 @@ The cloud stores ciphertext it cannot read. The key that opens it is generated o
 
 ## Requirements
 
-- **The Vaultbeat iOS app**, 1.2.3 or newer, signed in — [App Store](https://apps.apple.com/app/id6759241985)
+- **The Vaultbeat iOS app**, 1.2.3 or newer, signed in — [App Store](https://apps.apple.com/app/id6759241985?pt=128558141&ct=dev&mt=8)
 - **[uv](https://docs.astral.sh/uv/)** (for `uvx`). The server needs Python 3.11+, and `uvx` downloads a suitable interpreter by itself if your system Python is older.
 - **Vaultbeat Pro for agent access.** Pairing a machine starts a 3-day trial of the AI interface; after that, reads and writes need Pro, bought in the iOS app (Settings → Membership). When access lapses nothing is deleted, and buying Pro resumes this machine without re-pairing.
 
@@ -72,7 +76,7 @@ uvx vaultbeat-apple-health@latest --demo serve --transport stdio   # wire this i
 
 ## MCP tools
 
-26 tools. **Reads return your own data** — the account that paired this machine. Tools marked *partner* also take `partner=true` to read what your partner chose to share with you in their app — sleep, water and weight, and cycle, symptoms and notes only if they turned that on. The two people are never mixed in one result. Every read tool takes `fresh=true` to skip the local cache.
+29 tools. **Reads return your own data** — the account that paired this machine. Tools marked *partner* also take `partner=true` to read what your partner chose to share with you in their app — sleep, water and weight, and cycle, symptoms, moods and notes only if they turned that on. The two people are never mixed in one result. Every read tool takes `fresh=true` to skip the local cache.
 
 **Diagnostics**
 
@@ -88,6 +92,7 @@ uvx vaultbeat-apple-health@latest --demo serve --transport stdio   # wire this i
 | `get_sleep_detail` *partner* | One or two nights in depth: stage intervals with per-stage heart and breathing rate. The newest nights, or any night by date (`since` / `until`). |
 | `get_menstrual_cycle` *partner* | Cycle samples and a next-period prediction. Sensitive. |
 | `get_symptoms` *partner* | Symptoms from Apple Health, and beside them the episodes a person reported (type, severity, onset and end, place, suspected triggers). Sensitive. |
+| `get_state_of_mind` *partner* | Moods — Apple Health's State of Mind: how pleasant each feeling was (valence and Apple's seven regions), Apple's feeling words and life areas, from the Watch, the Health app or other apps, and the ones an AI recorded; per-day count and average. The 100 newest by default, or a `since` / `until` window for older ones. Sensitive. |
 | `get_notes` *partner* | Free-text notes on days, with who wrote them. Sensitive. |
 | `get_strength_log` | Strength sessions: exercises, sets × reps, volume per session. |
 | `get_food_log` | Meals and items per day, with optional kcal / protein / fat / carbs. The 14 newest days that have a log by default (not a calendar fortnight), or a `since` / `until` window. |
@@ -116,6 +121,8 @@ The analysis tools return numbers only — no scores, grades or verdicts — and
 | `log_weight_entry` | Record a weigh-in, keeping that day's body composition. |
 | `log_symptom` | Record one symptom the person reports, as structured fields a later read can match against sleep, food and heart rate. |
 | `update_symptom` / `delete_symptom` | Change a reported symptom (usually its end time), or erase one logged by mistake. |
+| `log_state_of_mind` | Record how the person says they feel, in Apple Health's State of Mind vocabulary (valence, feeling words, life areas). Their iPhone writes it into Apple Health only if they turned on "Allow AI to update Apple Health" (iOS app 1.3.0 or later). |
+| `delete_state_of_mind` | Erase a mood an AI recorded by mistake; the iPhone also removes the copy it wrote into Apple Health. |
 
 `log_note` and `log_note_append` take `partner=true` to record a note *about* your partner. It stays in your own account, is never sent to them, and is kept apart from your own notes.
 
@@ -133,7 +140,7 @@ The server also serves eight prompts over `prompts/list` — `daily_brief`, `sle
 
 - **Decryption happens only on this machine.** The cloud holds ciphertext and per-recipient wrapped keys; the private key that opens them is generated here when you pair.
 - **Health data leaves this package only through MCP.** The command-line subcommands pair a machine, report on that pairing and start the server; none of them prints health data.
-- **Sensitive categories.** Your cycle and the symptoms Apple Health records reach this server only after you turn them on, per category, in the iOS app — they are off by default. Your notes and the symptoms you report yourself (in the app, or through `log_symptom`) are always readable by your own agent. None of these reaches your partner's agent unless you turn on sharing it with them.
+- **Sensitive categories.** Your cycle and the symptoms Apple Health records reach this server only after you turn them on, per category, in the iOS app — they are off by default. Your notes, your moods (State of Mind, from Apple Health and from `log_state_of_mind`) and the symptoms you report yourself (in the app, or through `log_symptom`) are always readable by your own agent. None of these reaches your partner's agent unless you turn on sharing it with them.
 - **Unpair at any time** from the app's MCP tab (app 1.2.8 and earlier: Settings → Data & AI); the machine can then decrypt nothing new.
 - Tool results never contain the private key or the server token.
 

@@ -534,6 +534,35 @@ def test_a_since_is_not_cut_by_the_default_limit(monkeypatch: Any, tmp_path: Pat
     assert [c["limit"] for c in calls["detail"]] == [2, None, 3]
 
 
+def test_get_state_of_mind_pages_by_window_not_by_limit(monkeypatch: Any, tmp_path: Path) -> None:
+    """GitHub #82: older moods are reached by `since` / `until`. The default page
+    applies only when no window is given, an empty string is no bound, and the
+    window reaches the service intact."""
+    from vaultbeat_mcp_local.mcp_server import STATE_OF_MIND_DEFAULT_LIMIT
+
+    tools = _capture_tools(monkeypatch)
+    calls: list[dict[str, Any]] = []
+
+    async def moods(**kw: Any) -> dict[str, Any]:
+        calls.append(kw)
+        return {"owners": [], "errors": []}
+
+    monkeypatch.setattr("vaultbeat_mcp_local.service.VaultbeatLocalService.state_of_mind_summary",
+                        lambda self, **kw: moods(**kw))
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+
+    asyncio.run(tools["get_state_of_mind"]())
+    asyncio.run(tools["get_state_of_mind"](since="2026-03-01", until="2026-03-31"))
+    asyncio.run(tools["get_state_of_mind"](until="2026-06-30", limit=20))
+    asyncio.run(tools["get_state_of_mind"](since="", until=""))
+    assert [(c["limit"], c["since"], c["until"]) for c in calls] == [
+        (STATE_OF_MIND_DEFAULT_LIMIT, None, None),
+        (None, "2026-03-01", "2026-03-31"),
+        (20, None, "2026-06-30"),
+        (STATE_OF_MIND_DEFAULT_LIMIT, None, None),
+    ]
+
+
 def test_narrow_hints_name_only_real_parameters_and_values(monkeypatch: Any, tmp_path: Path) -> None:
     """A `result_too_large` hint is followed to the letter, so every parameter it
     names must exist on that tool and every value it suggests must be accepted.
@@ -1336,3 +1365,116 @@ def test_get_food_log_drops_its_default_limit_when_given_a_window(monkeypatch: A
         (None, "2026-07-01", "2026-08-31"),
         (5, "2026-07-01", None),
     ]
+
+
+def _real_server(monkeypatch: Any, tmp_path: Path) -> Any:
+    """The MCPServer `run_mcp_server` builds, with every real tool registered, not run."""
+    from mcp.server.mcpserver import MCPServer
+
+    built: dict[str, Any] = {}
+
+    class CapturingServer(MCPServer):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            built["server"] = self
+
+        def run(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+            return None
+
+    monkeypatch.setattr("mcp.server.mcpserver.MCPServer", CapturingServer)
+    run_mcp_server(ConfigStore(tmp_path / "config.json"), transport="stdio")
+    return built["server"]
+
+
+def _agent_sees(server: Any, tool: str, arguments: dict[str, Any]) -> tuple[bool, str]:
+    """What an MCP client receives, through the SDK's own tools/call path.
+
+    `server.call_tool` would bypass the conversion that matters here: it is the
+    request handler, not the tool, that turns an exception into a result.
+    """
+    from mcp.client import Client
+
+    async def call() -> Any:
+        async with Client(server) as client:
+            return await client.call_tool(tool, arguments)
+
+    result = asyncio.run(call())
+    return bool(result.is_error), " ".join(getattr(c, "text", "") for c in result.content)
+
+
+def test_our_own_failures_reach_the_agent_with_their_reason(monkeypatch: Any, tmp_path: Path) -> None:
+    """GitHub #88: the SDK drops the message of any exception that is not a
+    ToolError, so the trial-expired sentence — the one moment the person must
+    hear "subscribe", not "error" — reached agents as "Error executing tool X"."""
+    from vaultbeat_mcp_local.client import VaultbeatTrialExpiredError, VaultbeatUnsupportedMetricError
+    from vaultbeat_mcp_local.service import VaultbeatLocalService
+
+    for raised in (VaultbeatTrialExpiredError("2026-10-01T00:00:00Z"), VaultbeatUnsupportedMetricError("state_of_mind")):
+
+        async def failing(self: Any, *args: Any, _raised: Exception = raised, **kwargs: Any) -> Any:
+            raise _raised
+
+        monkeypatch.setattr(VaultbeatLocalService, "notes_summary", failing)
+        is_error, text = _agent_sees(_real_server(monkeypatch, tmp_path), "get_notes", {})
+        assert is_error
+        assert str(raised) and str(raised) in text, (type(raised).__name__, text)
+
+
+def test_a_bug_still_reaches_the_agent_as_the_sdks_opaque_line(monkeypatch: Any, tmp_path: Path) -> None:
+    """Only OUR exceptions carry text written for a person; a stray one (a bug,
+    a library error) may hold anything, so it keeps the SDK's opaque line."""
+    from vaultbeat_mcp_local.service import VaultbeatLocalService
+
+    async def failing(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise KeyError("internal-detail-that-must-not-leak")
+
+    monkeypatch.setattr(VaultbeatLocalService, "notes_summary", failing)
+    is_error, text = _agent_sees(_real_server(monkeypatch, tmp_path), "get_notes", {})
+    assert is_error
+    assert "internal-detail-that-must-not-leak" not in text
+
+
+def test_a_refused_mood_note_reaches_the_agent_with_the_tool_to_call(monkeypatch: Any, tmp_path: Path) -> None:
+    """GitHub #92: the refusal exists to redirect the agent to `log_state_of_mind`.
+    As a plain ValueError it arrived as "Error executing tool log_note" (measured
+    2026-10-07), so the agent learned nothing and would likely retry. The real
+    tool runs here: validation precedes every bind check, so an unbound server
+    sees exactly what a bound one does."""
+
+    server = _real_server(monkeypatch, tmp_path)
+    for tool in ("log_note", "log_note_append"):
+        is_error, text = _agent_sees(server, tool, {"text": "困和精神累", "kind": "mood"})
+        assert is_error
+        assert "log_state_of_mind" in text and "Nothing was saved" in text, (tool, text)
+
+
+def test_an_argument_refusal_reaches_the_agent_with_what_was_wrong(monkeypatch: Any, tmp_path: Path) -> None:
+    """GitHub #88 (2026-10-09): the argument checks in service.py raised plain
+    ValueErrors, so a wrong date or an unknown severity reached the agent as
+    "Error executing tool X" and it could only guess. They now raise
+    `VaultbeatArgumentRefusedError`, whose sentence quotes nothing but the caller's
+    own argument. Validation runs before any bind check, so an unbound server sees
+    what a bound one does."""
+
+    server = _real_server(monkeypatch, tmp_path)
+    is_error, text = _agent_sees(server, "log_symptom", {"symptom_type": "headache", "severity": "awful"})
+    assert is_error
+    assert "severity must be one of" in text and "'awful'" in text, text
+
+    is_error, text = _agent_sees(server, "log_strength_entry", {"date": "2026-10-09", "exercises": []})
+    assert is_error
+    assert "exercises must be a non-empty list" in text, text
+
+
+def test_a_refused_weight_reaches_the_agent_with_what_to_turn_on(monkeypatch: Any, tmp_path: Path) -> None:
+    """GitHub #46 + #88: the refusal is useless unless the agent can relay it."""
+    from vaultbeat_mcp_local.client import VaultbeatWeightNeedsAppleHealthError
+    from vaultbeat_mcp_local.service import VaultbeatLocalService
+
+    async def refused(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise VaultbeatWeightNeedsAppleHealthError()
+
+    monkeypatch.setattr(VaultbeatLocalService, "log_weight_entry", refused)
+    is_error, text = _agent_sees(_real_server(monkeypatch, tmp_path), "log_weight_entry", {"weight_kg": 70.0})
+    assert is_error
+    assert "Allow AI to update Apple Health" in text and "Nothing was saved" in text

@@ -1085,22 +1085,127 @@ def _build_reported_symptoms() -> list[DecryptedRecord]:
     return out
 
 
+def _build_state_of_mind(rng: random.Random) -> list[DecryptedRecord]:
+    """Both shapes of `state_of_mind` (GitHub #13).
+
+    · Apple Health import days — `{dayID, dayStartDate, samples: [{sampleID,
+      startDate, kind, valence, labels, associations, sourceName}]}`, one blob per
+      (device, day). The app's id is `state_of_mind-{device8}-{16-hex HMAC of the
+      day}`; the demo keeps the bare epoch (the app's fallback without an identity
+      key) — no reader looks inside an import id. Most days
+      carry one evening daily mood; some a momentary emotion too. Valence drifts
+      a little lower on short-sleep days (`_cycle_day` is reused only as a
+      deterministic rhythm, not as a claim about the cycle).
+    · Two AI entries (`log_state_of_mind`) from `_build_ai_moods`.
+    Labels and associations come from Apple's vocabularies
+    (STATE_OF_MIND_LABELS / STATE_OF_MIND_ASSOCIATIONS).
+    """
+
+    pleasant = ("calm", "content", "grateful", "happy", "peaceful", "satisfied")
+    unpleasant = ("drained", "stressed", "anxious", "frustrated", "worried")
+    areas = ("work", "partner", "fitness", "family", "health", "selfCare")
+    out: list[DecryptedRecord] = []
+    for back in range(DEMO_DAYS):
+        if rng.random() < 0.3:
+            continue
+        day = _day(back)
+        low_day = _cycle_day(back) in (0, 1, 26, 27)
+        valence = round(rng.uniform(-0.6, 0.1) if low_day else rng.uniform(0.0, 0.8), 2)
+        labels = [rng.choice(unpleasant if valence < 0 else pleasant)]
+        samples: list[dict[str, Any]] = [
+            {
+                "sampleID": f"5a3d0000-0000-4000-8000-{back:012d}",
+                "startDate": _iso(_local_dt(day, 21.5)),
+                "kind": "dailyMood",
+                "valence": valence,
+                "labels": labels,
+                "associations": [rng.choice(areas)],
+                "sourceName": "Health",
+            }
+        ]
+        if rng.random() < 0.35:
+            moment = round(rng.uniform(-0.8, 0.9), 2)
+            samples.insert(
+                0,
+                {
+                    "sampleID": f"5a3d0000-0000-4000-9000-{back:012d}",
+                    "startDate": _iso(_local_dt(day, 13.0)),
+                    "kind": "momentaryEmotion",
+                    "valence": moment,
+                    "labels": [rng.choice(unpleasant if moment < 0 else pleasant)],
+                    "associations": [rng.choice(areas)],
+                    "sourceName": "Mindfulness",
+                },
+            )
+        out.append(
+            _record(
+                "state_of_mind",
+                f"{day.isoformat()}-o",
+                owner=DEMO_OWNER_ID,
+                payload={
+                    "dayID": f"state_of_mind-demo0001-{_epoch(day)}",
+                    "dayStartDate": _noon(day),
+                    "samples": samples,
+                },
+                created_at=_uploaded(day),
+            )
+        )
+    out.extend(_build_ai_moods())
+    return out
+
+
+def _build_ai_moods() -> list[DecryptedRecord]:
+    """Two entries an AI recorded (`log_state_of_mind`), keyed by `entryID`, so
+    `source: "ai"` and `note` are demonstrable. Local wall-clock times, for the
+    reason `_local_dt` gives."""
+
+    out: list[DecryptedRecord] = []
+    for back, valence, labels, associations, hour, note in (
+        (3, -0.55, ["drained", "stressed"], ["work"], 19.0, "Deadline week, felt emptied out."),
+        (0, 0.6, ["peaceful"], ["partner"], 20.5, "Long walk together after dinner."),
+    ):
+        day = _day(back)
+        out.append(
+            _record(
+                "state_of_mind",
+                f"{day.isoformat()}-r",
+                owner=DEMO_OWNER_ID,
+                payload={
+                    "entryID": f"state_of_mind-demo{back:028d}",
+                    "kind": "momentaryEmotion",
+                    "valence": valence,
+                    "labels": labels,
+                    "associations": associations,
+                    "loggedAt": _iso(_local_dt(day, hour)),
+                    "localDate": day.isoformat(),
+                    "note": note,
+                    "createdAt": _iso(_local_dt(day, hour)),
+                    "updatedAt": _iso(_local_dt(day, hour)),
+                },
+                created_at=_uploaded(day),
+            )
+        )
+    return out
+
+
 #: (back, targetKind, owner, text). `sleep` and `menstrual` are the iOS-authored
-#: kinds; `mood` and `general` are the two an agent may write via `log_note`
-#: (AGENT_NOTE_KINDS). All four appear so `get_notes(target_kind=...)` has
-#: something to filter in every case.
+#: kinds; `general` is the one an agent may write via `log_note`
+#: (AGENT_NOTE_KINDS). No `mood` note: since 0.9.3 a feeling is a State of Mind
+#: entry (`_build_ai_moods`), and a demo that showed mood notes would teach the
+#: retired kind (GitHub #92). All three appear so `get_notes(target_kind=...)`
+#: has something to filter in every case.
 _NOTES: tuple[tuple[int, str, str, str], ...] = (
     (2, "sleep", DEMO_OWNER_ID, "Slept with the window open. Woke up before the alarm."),
     (3, "general", DEMO_OWNER_ID, "Started walking home from the station instead of taking the bus."),
-    (5, "mood", DEMO_OWNER_ID, "Good week. Finished the chapter I had been stuck on."),
+    (5, "general", DEMO_OWNER_ID, "Finished the chapter I had been stuck on."),
     (9, "sleep", DEMO_PARTNER_ID, "Left the watch on the charger, so no sleep stages for tonight."),
     (12, "menstrual", DEMO_OWNER_ID, "Day one. Kept the session light and skipped the last set."),
     (18, "general", DEMO_OWNER_ID, "Swapped the afternoon coffee for tea. Falling asleep faster."),
-    (24, "mood", DEMO_OWNER_ID, "Quiet weekend at home. Wanted exactly that."),
+    (24, "general", DEMO_OWNER_ID, "Quiet weekend at home."),
     (31, "sleep", DEMO_OWNER_ID, "Late dinner, took a while to settle."),
     (40, "menstrual", DEMO_OWNER_ID, "Cramps eased by the afternoon without anything for it."),
     (47, "general", DEMO_OWNER_ID, "Added a fourth set to the squats. Felt fine the next day."),
-    (58, "mood", DEMO_OWNER_ID, "Long call with family. Worth staying up for."),
+    (58, "general", DEMO_OWNER_ID, "Long call with family, went to bed late."),
     (73, "sleep", DEMO_OWNER_ID, "Hotel bed, unfamiliar pillow. Still got seven hours."),
 )
 
@@ -1361,6 +1466,7 @@ _BUILDERS: dict[str, Callable[[random.Random], list[DecryptedRecord]]] = {
     "strength": _build_strength,
     "food": _build_food,
     "profile": _build_profile,
+    "state_of_mind": _build_state_of_mind,
 }
 
 
