@@ -1,0 +1,17 @@
+{
+  "name": "vaultbeat-apple-health",
+  "version": "0.9.3",
+  "description": "Your AI agent reads your own Apple Health data — sleep, HRV, cycle, workouts, weight, meals, moods — from a local MCP server. The data is end-to-end encrypted and decrypted only on your machine.",
+  "mcpServers": {
+    "vaultbeat-health": {
+      "command": "uvx",
+      "args": [
+        "vaultbeat-apple-health@latest",
+        "serve",
+        "--transport",
+        "stdio"
+      ],
+      "description": "Local Vaultbeat MCP server: decrypts your Apple Health data on this machine only."
+    }
+  }
+}

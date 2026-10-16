@@ -1,0 +1,21 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "vaultbeat",
+  "description": "Vaultbeat: your Apple Health data, end-to-end encrypted, readable by your own AI agent.",
+  "owner": {
+    "name": "Fino-wind",
+    "url": "https://vaultbeat.app"
+  },
+  "plugins": [
+    {
+      "name": "vaultbeat-apple-health",
+      "description": "Your AI agent reads your own Apple Health data — sleep, HRV, cycle, workouts, weight, meals, moods — from a local MCP server. The data is end-to-end encrypted and decrypted only on your machine.",
+      "author": {
+        "name": "Fino-wind"
+      },
+      "category": "productivity",
+      "homepage": "https://vaultbeat.app/mcp",
+      "source": "./"
+    }
+  ]
+}

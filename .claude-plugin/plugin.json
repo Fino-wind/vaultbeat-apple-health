@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "vaultbeat-apple-health",
+  "displayName": "Vaultbeat — Apple Health for your agent",
+  "version": "0.9.3",
+  "description": "Your AI agent reads your own Apple Health data — sleep, HRV, cycle, workouts, weight, meals, moods — from a local MCP server. The data is end-to-end encrypted and decrypted only on your machine.",
+  "author": {
+    "name": "Fino-wind",
+    "url": "https://vaultbeat.app",
+    "email": "support@vaultbeat.app"
+  },
+  "homepage": "https://vaultbeat.app/mcp",
+  "repository": "https://github.com/Fino-wind/vaultbeat-apple-health",
+  "license": "MIT",
+  "keywords": [
+    "health",
+    "apple-health",
+    "healthkit",
+    "sleep",
+    "hrv",
+    "cycle",
+    "workouts",
+    "mcp",
+    "e2ee",
+    "privacy"
+  ],
+  "icon": "./logo-400.png",
+  "privacyPolicyUrl": "https://vaultbeat.app/privacy",
+  "documentationUrl": "https://vaultbeat.app/mcp",
+  "supportUrl": "https://vaultbeat.app/support"
+}

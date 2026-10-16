@@ -34,7 +34,14 @@ It prints a QR code and waits. In the Vaultbeat app open **MCP tab → Connect a
 
 **2. Add the server to your MCP client.**
 
-Claude Code:
+Claude Code, as a plugin (adds the server and a setup guide that walks Claude through pairing):
+
+```
+/plugin marketplace add Fino-wind/vaultbeat-apple-health
+/plugin install vaultbeat-apple-health@vaultbeat
+```
+
+Then run `/vaultbeat-apple-health:setup`. Or add only the server:
 
 ```bash
 claude mcp add vaultbeat-health -- uvx vaultbeat-apple-health@latest serve --transport stdio

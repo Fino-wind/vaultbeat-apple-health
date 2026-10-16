@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "vaultbeat-health": {
+      "command": "uvx",
+      "args": [
+        "vaultbeat-apple-health@latest",
+        "serve",
+        "--transport",
+        "stdio"
+      ]
+    }
+  }
+}

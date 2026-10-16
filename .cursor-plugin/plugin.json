@@ -1,0 +1,24 @@
+{
+  "name": "vaultbeat-apple-health",
+  "description": "Your AI agent reads your own Apple Health data — sleep, HRV, cycle, workouts, weight, meals, moods — from a local MCP server. The data is end-to-end encrypted and decrypted only on your machine.",
+  "author": {
+    "name": "Fino-wind"
+  },
+  "homepage": "https://vaultbeat.app/mcp",
+  "repository": "https://github.com/Fino-wind/vaultbeat-apple-health",
+  "license": "MIT",
+  "keywords": [
+    "health",
+    "apple-health",
+    "healthkit",
+    "sleep",
+    "hrv",
+    "cycle",
+    "workouts",
+    "mcp",
+    "e2ee",
+    "privacy"
+  ],
+  "logo": "https://raw.githubusercontent.com/Fino-wind/vaultbeat-apple-health/main/logo-400.png",
+  "mcpServers": "mcp.json"
+}
