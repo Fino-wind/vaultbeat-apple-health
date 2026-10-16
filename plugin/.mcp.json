@@ -3,7 +3,7 @@
     "vaultbeat-health": {
       "command": "uvx",
       "args": [
-        "vaultbeat-apple-health@latest",
+        "vaultbeat-apple-health==0.9.3",
         "serve",
         "--transport",
         "stdio"

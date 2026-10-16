@@ -15,7 +15,7 @@
       },
       "category": "productivity",
       "homepage": "https://vaultbeat.app/mcp",
-      "source": "./"
+      "source": "./plugin"
     }
   ]
 }
